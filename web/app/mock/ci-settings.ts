@@ -318,6 +318,9 @@ export function handleCiSettings(
     const sub = what.slice("billing/".length);
     if (what === "billing" && method === "GET") {
       const daily = dailySpend(owner);
+      const now = new Date();
+      const startMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+      const endMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
       json(res, 200, {
         card: hasCard(owner) ? (owner === "octo-labs" ? { brand: null, last4: null, exp_month: null, exp_year: null } : { brand: "visa", last4: "4242", exp_month: 8, exp_year: 2029 }) : null,
         daily,
@@ -328,6 +331,8 @@ export function handleCiSettings(
         capDollars: billing.capDollars,
         minCapDollars: 50,
         maxCapDollars: 10_000,
+        periodStart: startMs,
+        periodEnd: endMs,
         running: concurrencyNow(owner).running,
         maxRunning: concurrencyNow(owner).limit,
       });

@@ -601,8 +601,10 @@ fn tenants_are_found_by_id_and_runs_by_delivery() {
 pub(super) fn subscribe(db: &TestDb, id: &str, status: &str) {
     db.run(
         "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
-         cancel_at_period_end, modified_at, updated_at) \
-         VALUES ($1, 't1', $2, 'c', 'p', false, 't', 0)",
+         current_period_start, current_period_end, cancel_at_period_end, modified_at, \
+         updated_at) \
+         VALUES ($1, 't1', $2, 'c', 'p', '2026-10-01T00:00:00Z', '2026-11-01T00:00:00Z', \
+         false, '2026-10-01T00:00:00Z', 0)",
         &params![id, status],
     );
 }
@@ -995,6 +997,8 @@ fn standing_counts_this_month_and_running_jobs() {
             card: false,
             subscribed: false,
             cap_micros: default_cap,
+            window_start: month,
+            window_end: month + 31 * DAY,
             seconds_by_template: vec![
                 ("removed-label".into(), 60),
                 ("ubuntu-26.04-4core".into(), 180),
@@ -1059,6 +1063,124 @@ fn standing_counts_this_month_and_running_jobs() {
         .unwrap();
     assert_eq!(empty.seconds_by_template.len(), 0);
     assert_eq!(empty.units, 0);
+}
+
+/// One billed attempt of `seconds` for tenant t1, ended at `ended`.
+fn record_usage(db: &TestDb, job: u64, seconds: u64, ended: u64) {
+    db.run(
+        "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
+         ended_at) VALUES ($1, 1, 't1', 'ubuntu-latest', $2, $2, $3)",
+        &params![job, seconds, ended],
+    );
+}
+
+/// The subscription `id` of tenant t1 over `start` to `end`.
+fn subscribe_period(
+    db: &TestDb,
+    id: &str,
+    status: &str,
+    start: &str,
+    end: Option<&str>,
+    modified: &str,
+) {
+    db.run(
+        "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
+         current_period_start, current_period_end, cancel_at_period_end, modified_at, \
+         updated_at) \
+         VALUES ($1, 't1', $2, 'c', 'p', $3, $4, false, $5, 0)",
+        &params![id, status, start, end, modified],
+    );
+}
+
+#[test]
+fn standing_counts_the_subscription_period() {
+    let db = setup();
+    let month = 1_790_812_800_000_u64;
+    // An older canceled subscription does not move the window.
+    subscribe_period(
+        &db,
+        "s0",
+        "canceled",
+        "2026-09-01T00:00:00Z",
+        Some("2026-10-01T00:00:00Z"),
+        "2026-09-01T00:00:00Z",
+    );
+    subscribe_period(
+        &db,
+        "s1",
+        "active",
+        "2026-10-15T00:00:00Z",
+        Some("2026-11-15T00:00:00Z"),
+        "2026-10-15T00:00:00Z",
+    );
+    // Before the period: left out of the cap.
+    record_usage(&db, 1, 600, month + 13 * DAY + 12 * 3_600_000);
+    // At and after the period start: counted.
+    record_usage(&db, 2, 300, month + 14 * DAY);
+    record_usage(&db, 3, 120, month + 19 * DAY);
+    let standing = db
+        .wait(tenant_standing(db.db(), "t1", month + 19 * DAY, 50_000_000))
+        .unwrap()
+        .unwrap();
+    assert!(standing.subscribed);
+    assert_eq!(standing.window_start, month + 14 * DAY);
+    assert_eq!(standing.window_end, month + 45 * DAY);
+    assert_eq!(standing.units, 420);
+    assert_eq!(
+        standing.seconds_by_template,
+        [("ubuntu-latest".to_owned(), 420)]
+    );
+    let days = db
+        .wait(daily_usage(db.db(), "t1", standing.window_start))
+        .unwrap();
+    let shown: Vec<_> = days
+        .iter()
+        .map(|day| (day.day.as_str(), day.seconds, day.units))
+        .collect();
+    assert_eq!(shown, [("2026-10-15", 300, 300), ("2026-10-20", 120, 120)]);
+}
+
+#[test]
+fn standing_restarts_at_the_period_end_when_the_renewal_is_late() {
+    let db = setup();
+    let month = 1_790_812_800_000_u64;
+    subscribe_period(
+        &db,
+        "s1",
+        "active",
+        "2026-10-15T00:00:00Z",
+        Some("2026-11-15T00:00:00Z"),
+        "2026-10-15T00:00:00Z",
+    );
+    record_usage(&db, 1, 300, month + 19 * DAY);
+    record_usage(&db, 2, 120, month + 46 * DAY);
+    let standing = db
+        .wait(tenant_standing(db.db(), "t1", month + 46 * DAY, 50_000_000))
+        .unwrap()
+        .unwrap();
+    assert_eq!(standing.window_start, month + 45 * DAY);
+    assert_eq!(standing.window_end, month + 45 * DAY + 31 * DAY);
+    assert_eq!(standing.units, 120);
+    assert_eq!(
+        standing.seconds_by_template,
+        [("ubuntu-latest".to_owned(), 120)]
+    );
+}
+
+#[test]
+fn standing_without_a_subscription_keeps_the_calendar_month() {
+    let db = setup();
+    let month = 1_790_812_800_000_u64;
+    record_usage(&db, 1, 60, month - 1);
+    record_usage(&db, 2, 90, month + 13 * DAY);
+    let standing = db
+        .wait(tenant_standing(db.db(), "t1", month + 19 * DAY, 50_000_000))
+        .unwrap()
+        .unwrap();
+    assert!(!standing.subscribed);
+    assert_eq!(standing.window_start, month);
+    assert_eq!(standing.window_end, month + 31 * DAY);
+    assert_eq!(standing.units, 90);
 }
 
 #[test]

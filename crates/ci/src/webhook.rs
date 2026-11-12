@@ -2737,8 +2737,10 @@ mod tests {
     fn subscribe(db: &TestDb, status: &str) {
         db.run(
             "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
-             cancel_at_period_end, modified_at, updated_at) \
-             VALUES ('s1', 't1', $1, 'c', 'p', false, 't', 0)",
+             current_period_start, current_period_end, cancel_at_period_end, modified_at, \
+             updated_at) \
+             VALUES ('s1', 't1', $1, 'c', 'p', '2026-10-01T00:00:00Z', '2026-11-01T00:00:00Z', \
+             false, '2026-10-01T00:00:00Z', 0)",
             &params![status],
         );
     }

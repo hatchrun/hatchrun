@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! What a tenant has used this month and what that costs, from the
-//! [`Standing`] the store reads. The prices live in
+//! What a tenant has used over its spend cap window and what that
+//! costs, from the [`Standing`] the store reads. The prices live in
 //! `hatchrun_workflow::templates`.
 
 use hatchrun_cloud::polar::{Card, Order};
@@ -30,7 +30,46 @@ pub fn month_start(now_ms: u64) -> u64 {
     u64::try_from(first).unwrap_or(0) * DAY_MS
 }
 
-/// Billing units used this month, as priced when each job completed.
+/// The start of the UTC calendar month after the one `now_ms` is in,
+/// in Unix milliseconds.
+#[must_use]
+pub fn next_month_start(now_ms: u64) -> u64 {
+    let days = i64::try_from(now_ms / DAY_MS).unwrap_or(i64::MAX / 2);
+    let (year, month) = year_month(days);
+    let (year, month) = match month {
+        12 => (year + 1, 1),
+        month => (year, month + 1),
+    };
+    u64::try_from(days_from_civil(year, month)).unwrap_or(0) * DAY_MS
+}
+
+/// The year and month of `days` since 1970-01-01.
+fn year_month(days: i64) -> (i64, u32) {
+    // Civil date from days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let month = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).unwrap_or(1);
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month)
+}
+
+/// Days since 1970-01-01 of the first of `month` of `year`.
+fn days_from_civil(year: i64, month: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (i64::from(month) + 9) % 12;
+    let doy = (153 * mp + 2) / 5;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Billing units used over the window, as priced when each job
+/// completed.
 /// A later template price change or a removed template does not alter
 /// them. Changing [`templates::UNIT_PRICE_MICROS_PER_MINUTE`] is the
 /// exception: it reprices every unit already recorded.
@@ -39,7 +78,7 @@ pub fn units(standing: &Standing) -> u64 {
     standing.units
 }
 
-/// What this month's usage costs, in micros.
+/// What the window's usage costs, in micros.
 #[must_use]
 pub fn spend_micros(standing: &Standing) -> u64 {
     templates::spend_micros(units(standing))
@@ -76,25 +115,31 @@ impl CardView {
 pub struct BillingView {
     /// The card on file, `None` when the tenant has none.
     pub card: Option<CardView>,
-    /// Billed runner seconds this month, of every template; every
-    /// attempt counts at least 60.
+    /// Billed runner seconds over the spend cap window, of every
+    /// template; every attempt counts at least 60.
     pub seconds: u64,
-    /// Billing units used this month; one unit is one 2 vCPU second at
-    /// the amd64 rate.
+    /// Billing units used over the window; one unit is one 2 vCPU
+    /// second at the amd64 rate.
     pub units: u64,
-    /// What this month's usage costs, in cents.
+    /// What the window's usage costs, in cents.
     pub spend_cents: u64,
-    /// The monthly spend cap, in whole dollars.
+    /// The spend cap, in whole dollars.
     pub cap_dollars: u64,
     /// The least the cap can be set to, in whole dollars.
     pub min_cap_dollars: u64,
     /// The most the cap can be set to, in whole dollars.
     pub max_cap_dollars: u64,
+    /// The spend cap window's start, in milliseconds: the licensed
+    /// subscription's period start, or the UTC calendar month start.
+    pub period_start: u64,
+    /// The window's end, in milliseconds: the subscription's period
+    /// end, or the next calendar month start.
+    pub period_end: u64,
     /// Jobs running now.
     pub running: u32,
     /// The most jobs that run at once.
     pub max_running: u32,
-    /// What each day of this month used, oldest first.
+    /// What each UTC day of the window used, oldest first.
     pub daily: Vec<Daily>,
     /// The newest invoices, newest first.
     pub invoices: Vec<Invoice>,
@@ -176,6 +221,8 @@ pub fn view(
         cap_dollars: standing.cap_micros / MICROS_PER_DOLLAR,
         min_cap_dollars: templates::MIN_SPEND_CAP_MICROS / MICROS_PER_DOLLAR,
         max_cap_dollars: templates::MAX_SPEND_CAP_MICROS / MICROS_PER_DOLLAR,
+        period_start: standing.window_start,
+        period_end: standing.window_end,
         running: standing.running,
         max_running: templates::MAX_RUNNING_JOBS,
     }
@@ -213,7 +260,7 @@ pub const HOLD_RECHECK_MS: u64 = 30_000;
 pub enum Hold {
     /// The tenant has no card.
     Card,
-    /// This month's spend reached the tenant's cap.
+    /// This window's spend reached the tenant's cap.
     SpendCap,
     /// The tenant already runs [`templates::MAX_RUNNING_JOBS`] jobs.
     Concurrency,
@@ -238,7 +285,8 @@ impl Hold {
                 format!("Waiting for a card. Add one for {org} at {app_url}/o/{org}/ci.")
             }
             Self::SpendCap => format!(
-                "Waiting: {org} reached its {} monthly spend cap. Raise it at {app_url}/o/{org}/ci.",
+                "Waiting: {org} reached its {} spend cap for this billing period. Raise it at \
+                 {app_url}/o/{org}/ci.",
                 templates::dollars(cap_micros)
             ),
             Self::Concurrency => format!(
@@ -280,6 +328,8 @@ mod tests {
             card: true,
             subscribed: true,
             cap_micros: templates::DEFAULT_SPEND_CAP_MICROS,
+            window_start: 1_790_812_800_000,
+            window_end: 1_793_491_200_000,
             seconds_by_template: seconds.iter().map(|(l, s)| ((*l).into(), *s)).collect(),
             units,
             running: 0,
@@ -359,6 +409,8 @@ mod tests {
                 cap_dollars: 50,
                 min_cap_dollars: 50,
                 max_cap_dollars: 10_000,
+                period_start: 1_790_812_800_000,
+                period_end: 1_793_491_200_000,
                 running: 0,
                 max_running: 5,
             }
@@ -366,6 +418,8 @@ mod tests {
         let json = serde_json::to_value(&v).unwrap();
         assert_eq!(json["seconds"], 30_000);
         assert_eq!(json["spendCents"], 240);
+        assert_eq!(json["periodStart"], 1_790_812_800_000_i64);
+        assert_eq!(json["periodEnd"], 1_793_491_200_000_i64);
         assert!(json.get("freeUnits").is_none());
         assert!(json.get("minutes").is_none());
         assert_eq!(json["maxRunning"], 5);
@@ -387,6 +441,19 @@ mod tests {
         assert_eq!(month_start(1_790_812_800_000), 1_790_812_800_000);
         assert_eq!(month_start(1_790_812_799_999), 1_788_220_800_000);
         assert_eq!(month_start(0), 0);
+    }
+
+    #[test]
+    fn next_month_start_is_utc() {
+        assert_eq!(next_month_start(1_792_022_400_000), 1_793_491_200_000);
+        assert_eq!(next_month_start(1_790_812_800_000), 1_793_491_200_000);
+        assert_eq!(next_month_start(1_793_491_199_999), 1_793_491_200_000);
+        // Across the year boundary.
+        assert_eq!(next_month_start(1_797_292_800_000), 1_798_761_600_000);
+        assert_eq!(next_month_start(1_798_761_600_000), 1_801_440_000_000);
+        // February of the 2028 leap year has 29 days.
+        assert_eq!(next_month_start(1_833_753_600_000), 1_835_481_600_000);
+        assert_eq!(next_month_start(0), 2_678_400_000);
     }
 
     #[test]
@@ -429,7 +496,7 @@ mod tests {
         );
         assert_eq!(
             Hold::SpendCap.message("acme", app, 50_000_000),
-            "Waiting: acme reached its $50.00 monthly spend cap. Raise it at \
+            "Waiting: acme reached its $50.00 spend cap for this billing period. Raise it at \
              https://app.hatchrun.io/o/acme/ci."
         );
         assert_eq!(

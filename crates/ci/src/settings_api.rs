@@ -398,17 +398,18 @@ async fn billing_view(cx: &Cx<'_>, org: &str) -> Result<Served> {
         Ok(tenant) => tenant,
         Err(stop) => return Ok(Err(stop)),
     };
+    let now = now_ms();
     let standing = store::tenant_standing(
         cx.db,
         &tenant.id,
-        billing::month_start(now_ms()),
+        now,
         hatchrun_workflow::templates::DEFAULT_SPEND_CAP_MICROS,
     )
     .await?;
     let Some(standing) = standing else {
         return Ok(stop(404, "not found"));
     };
-    let daily = store::daily_usage(cx.db, &tenant.id, billing::month_start(now_ms()))
+    let daily = store::daily_usage(cx.db, &tenant.id, standing.window_start)
         .await?
         .into_iter()
         .map(|day| billing::Daily::new(day.day, day.seconds, day.units))

@@ -19,13 +19,14 @@ import type { OrgPageProps } from "./types";
 const CAP = "rounded-md border border-control bg-panel";
 const HEAD = "border-b border-control px-3.5 py-2";
 
-/** Settings, Billing (also /settings): this month's CI spend, the spend cap and the card. */
+/** Settings, Billing (also /settings): this period's CI spend, the spend cap and the card. */
 export function Billing({ org, tenant }: OrgPageProps) {
   const returning = new URLSearchParams(window.location.search).has("checkout");
   const [billing, reload] = useLoad(() => getCiBilling(org), org, returning);
-  const now = new Date();
-  // The server bills by UTC month, so the page reads the month in UTC too.
-  const month = now.toLocaleDateString("en-US", { month: "long", timeZone: "UTC" });
+  const range =
+    billing.state === "ready"
+      ? `usage from ${shortDate(billing.data.periodStart)} to ${shortDate(billing.data.periodEnd)}`
+      : "billed per second";
   const card = billing.state === "ready" && billing.data.card !== null;
   const tries = useRef(0);
   useEffect(() => {
@@ -43,28 +44,38 @@ export function Billing({ org, tenant }: OrgPageProps) {
     return () => window.clearInterval(timer);
   }, [returning, card, reload]);
   return (
-    <Page title="Billing" nav={<SettingsNav org={org} current="billing" admin={tenant.role === "admin"} />} meta={`${org} · billed per second · 1 to ${now.getUTCDate()} ${now.toLocaleDateString("en-US", { month: "short", timeZone: "UTC" })}`} narrow>
+    <Page title="Billing" nav={<SettingsNav org={org} current="billing" admin={tenant.role === "admin"} />} meta={`${org} · billed per second · ${range}`} narrow>
       <Await loaded={billing} retry={reload}>
-        {(data) => <BillingBody org={org} billing={data} month={month} now={now} reload={reload} />}
+        {(data) => <BillingBody org={org} billing={data} reload={reload} />}
       </Await>
     </Page>
   );
 }
 
-function BillingBody({ org, billing, month, now, reload }: { org: string; billing: CiBilling; month: string; now: Date; reload: () => void }) {
+/** "Nov 14", in UTC. */
+function shortDate(ms: number): string {
+  return new Date(ms).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+}
+
+function BillingBody({ org, billing, reload }: { org: string; billing: CiBilling; reload: () => void }) {
   const spent = billing.spendCents / 100;
-  const daysInMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0)).getUTCDate();
-  const projected = (spent / now.getUTCDate()) * daysInMonth;
+  const now = new Date();
+  const start = shortDate(billing.periodStart);
+  const end = shortDate(billing.periodEnd);
+  const dayMs = 86_400_000;
+  const elapsedDays = Math.max(1, (now.getTime() - billing.periodStart) / dayMs);
+  const windowDays = Math.max(1, (billing.periodEnd - billing.periodStart) / dayMs);
+  const projected = (spent / elapsedDays) * windowDays;
   const percent = billing.capDollars > 0 ? Math.min(100, Math.round((spent / billing.capDollars) * 100)) : 0;
   const reached = spent >= billing.capDollars;
 
   return (
     <>
-      <section aria-label="This month" className={cn(CAP, "flex flex-wrap")}>
-        <Figure label="Month to date" className="flex-[1_1_200px]">
+      <section aria-label={`usage from ${start} to ${end}`} className={cn(CAP, "flex flex-wrap")}>
+        <Figure label="Spent to date" className="flex-[1_1_200px]">
           <span className="font-mono text-[26px] leading-8 font-bold">{dollars(spent, true)}</span>
         </Figure>
-        <Figure label={`Projected for ${month}`} className="flex-[1_1_200px] border-l border-control">
+        <Figure label={`Projected to ${end}`} className="flex-[1_1_200px] border-l border-control">
           <span className="font-mono text-[26px] leading-8 font-bold">{dollars(projected)}</span>
           <span className="font-mono text-xs text-fg-3">at the current daily rate</span>
         </Figure>
@@ -76,11 +87,11 @@ function BillingBody({ org, billing, month, now, reload }: { org: string; billin
         </Figure>
       </section>
 
-      <DailyChart days={billing.daily} now={now} month={month} />
+      <DailyChart days={billing.daily} startMs={billing.periodStart} endMs={billing.periodEnd} start={start} end={end} />
 
       <section aria-label="Line items" className={cn(CAP, "overflow-hidden")}>
         <div className={cn(HEAD, "bg-panel")}>
-          <span className="cap">Line items, {month}</span>
+          <span className="cap">Line items, usage from {start} to {end}</span>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full min-w-[560px] border-collapse">
@@ -101,7 +112,7 @@ function BillingBody({ org, billing, month, now, reload }: { org: string; billin
               </tr>
               <tr className="border-t border-control bg-panel">
                 <td colSpan={3} className="cap px-3.5 py-2.5 text-fg">
-                  Total month to date
+                  Total to date
                 </td>
                 <td className="px-3.5 py-2.5 text-right font-mono text-[13px] font-bold">{dollars(spent, true)}</td>
               </tr>
@@ -129,7 +140,7 @@ function BillingBody({ org, billing, month, now, reload }: { org: string; billin
             </div>
             <div
               role="progressbar"
-              aria-label="CI spend this month against the cap"
+              aria-label="CI spend this period against the cap"
               aria-valuemin={0}
               aria-valuemax={100}
               aria-valuenow={percent}
@@ -142,7 +153,7 @@ function BillingBody({ org, billing, month, now, reload }: { org: string; billin
                 ? "A card is required. New CI jobs wait until one is added."
                 : reached
                   ? "Cap reached. New CI jobs queue until you raise it."
-                  : "New CI jobs start until the month reaches the cap."}
+                  : "New CI jobs start until the period reaches the cap."}
             </p>
           </div>
           <SpendCapForm key={billing.capDollars} org={org} current={billing.capDollars} min={billing.minCapDollars} max={billing.maxCapDollars} onSaved={reload} />
@@ -175,10 +186,11 @@ function cardText(card: CiCard): string {
 
 const CHART = { width: 900, height: 250, left: 48, right: 890, base: 205 };
 
-/** Spend per UTC day of this month: a bar per day, dashed outlines for days to come. */
-function DailyChart({ days, now, month }: { days: CiDay[]; now: Date; month: string }) {
-  const count = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0)).getUTCDate();
-  const byDay = new Map(days.map((day) => [Number(day.day.slice(8, 10)), day]));
+/** Spend per UTC day of the spend cap window: a bar per day with usage, dashed outlines for days without any. */
+function DailyChart({ days, startMs, endMs, start, end }: { days: CiDay[]; startMs: number; endMs: number; start: string; end: string }) {
+  const dayMs = 86_400_000;
+  const count = Math.max(1, Math.round((endMs - startMs) / dayMs));
+  const byDay = new Map(days.map((day) => [day.day, day]));
   const peak = Math.max(100, ...days.map((day) => day.cents));
   // A round top for the scale: $1, $2, $5, $10 ... above the peak.
   const unit = 10 ** Math.floor(Math.log10(peak / 100));
@@ -187,11 +199,11 @@ function DailyChart({ days, now, month }: { days: CiDay[]; now: Date; month: str
   const width = slot * 0.68;
   const height = (cents: number) => (cents / top) * (CHART.base - 24);
   const total = days.reduce((sum, day) => sum + day.cents, 0);
-  const label = `Daily spend in dollars for ${month}, hatchrun CI: ${dollars(total / 100, true)} over ${days.length} days, peak ${dollars(peak / 100, true)}`;
+  const label = `Daily spend in dollars from ${start} to ${end}, hatchrun CI: ${dollars(total / 100, true)} over ${days.length} days, peak ${dollars(peak / 100, true)}`;
   return (
     <section aria-label="Daily spend" className={cn(CAP, "bg-panel")}>
       <div className={cn(HEAD, "flex flex-wrap items-baseline justify-between gap-2")}>
-        <span className="cap">Spend per day, {month}</span>
+        <span className="cap">Spend per day, usage from {start} to {end}</span>
         <span className="font-mono text-xs text-fg-2">
           <span aria-hidden="true" className="mr-1.5 inline-block size-2.5 rounded-[1px] bg-control" />
           hatchrun CI
@@ -211,12 +223,13 @@ function DailyChart({ days, now, month }: { days: CiDay[]; now: Date; month: str
             );
           })}
           {Array.from({ length: count }, (_, n) => {
-            const day = byDay.get(n + 1);
+            const at = new Date(startMs + n * dayMs);
+            const day = byDay.get(at.toISOString().slice(0, 10));
             const x = CHART.left + n * slot + (slot - width) / 2;
             const h = day ? height(day.cents) : 0;
             const tip = day
-              ? `${month} ${n + 1}: ${dollars(day.cents / 100, true)}, ${(day.seconds / 3600).toFixed(1)} runner hours`
-              : `${month} ${n + 1}: not yet`;
+              ? `${shortDate(at.getTime())}: ${dollars(day.cents / 100, true)}, ${(day.seconds / 3600).toFixed(1)} runner hours`
+              : `${shortDate(at.getTime())}: no usage yet`;
             return (
               <g key={n}>
                 <title>{tip}</title>
@@ -227,7 +240,7 @@ function DailyChart({ days, now, month }: { days: CiDay[]; now: Date; month: str
                 )}
                 {(n === 0 || (n + 1) % 5 === 0 || n + 1 === count) && (
                   <text x={x + width / 2} y={226} textAnchor="middle" fontSize={12} className="fill-fg-3 font-mono">
-                    {n + 1}
+                    {at.getUTCDate()}
                   </text>
                 )}
               </g>
@@ -235,14 +248,14 @@ function DailyChart({ days, now, month }: { days: CiDay[]; now: Date; month: str
           })}
           <line x1={CHART.left} x2={CHART.right} y1={CHART.base} y2={CHART.base} className="stroke-control" />
           <text x={(CHART.left + CHART.right) / 2} y={244} textAnchor="middle" fontSize={12} className="fill-fg-3 font-mono">
-            DAY OF {month.toUpperCase()} (UTC)
+            DAY (UTC)
           </text>
           <text x={CHART.right} y={16} textAnchor="end" fontSize={12} className="fill-fg-2 font-mono">
             peak {dollars(peak / 100, true)} / day
           </text>
         </svg>
       </div>
-      <p className="m-0 border-t border-control px-3.5 py-2 font-mono text-xs text-fg-3">Hover a bar for the day. Dashed outlines are days that have not happened yet.</p>
+      <p className="m-0 border-t border-control px-3.5 py-2 font-mono text-xs text-fg-3">Hover a bar for the day. Dashed outlines are days without any usage.</p>
     </section>
   );
 }
@@ -256,7 +269,7 @@ function Invoices({ invoices }: { invoices: CiInvoice[] }) {
         <span className="cap">Invoices</span>
       </div>
       {invoices.length === 0 ? (
-        <p className="m-0 px-3.5 py-4 font-mono text-[13px] text-fg-3">No invoices yet. The first one is issued after the month closes.</p>
+        <p className="m-0 px-3.5 py-4 font-mono text-[13px] text-fg-3">No invoices yet. The first one is issued after the period closes.</p>
       ) : (
         <div className="max-h-[520px] overflow-auto">
           <table className="w-full min-w-[640px] border-collapse">

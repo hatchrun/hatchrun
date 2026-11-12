@@ -410,7 +410,7 @@ export interface CiCard {
   exp_year: number | null;
 }
 
-/** One day of the month's spend. */
+/** One day of the window's spend. */
 export interface CiDay {
   /** UTC date, YYYY-MM-DD. */
   day: string;
@@ -433,20 +433,24 @@ export interface CiInvoice {
 export interface CiBilling {
   /** The card on file; null when there is none. */
   card: CiCard | null;
-  /** This month, one entry per UTC day up to today. */
+  /** One entry per UTC day of the spend cap window with usage, oldest first. */
   daily: CiDay[];
   invoices: CiInvoice[];
-  /** Billed runner seconds this month, every attempt at least 60. */
+  /** Billed runner seconds over the window, every attempt at least 60. */
   seconds: number;
-  /** Billing units this month; one unit is one 2 vCPU second. */
+  /** Billing units over the window; one unit is one 2 vCPU second. */
   units: number;
-  /** This month's cost, in cents. */
+  /** The window's cost, in cents. */
   spendCents: number;
-  /** The monthly spend cap, in whole dollars. */
+  /** The spend cap, in whole dollars. */
   capDollars: number;
   /** The range the cap can be set within, in whole dollars. */
   minCapDollars: number;
   maxCapDollars: number;
+  /** The spend cap window's start, Unix ms: the subscription's period start, or the UTC calendar month start. */
+  periodStart: number;
+  /** The window's end, Unix ms: the subscription's period end, or the next calendar month start. */
+  periodEnd: number;
   running: number;
   maxRunning: number;
 }

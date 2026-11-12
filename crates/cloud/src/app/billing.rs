@@ -133,14 +133,16 @@ pub(crate) async fn portal(ctx: &Ctx<'_>, org: &str) -> Answer {
 
 /// Writes a subscription of an existing tenant, unless the row holds a
 /// newer delivery. Binds the subscription id, tenant, status, customer,
-/// product, period end or NULL, cancel at period end, Polar's modified
-/// time and the time in milliseconds.
+/// product, period start, period end or NULL, cancel at period end,
+/// Polar's modified time and the time in milliseconds.
 const UPSERT_SUBSCRIPTION: &str = "INSERT INTO subscriptions (id, tenant_id, status, \
-    customer_id, product_id, current_period_end, cancel_at_period_end, modified_at, updated_at) \
-    SELECT $1::text, id, $3::text, $4::text, $5::text, $6::text, $7::boolean, $8::text, \
-    $9::bigint FROM tenants WHERE id = $2 \
+    customer_id, product_id, current_period_start, current_period_end, \
+    cancel_at_period_end, modified_at, updated_at) \
+    SELECT $1::text, id, $3::text, $4::text, $5::text, $6::text, $7::text, $8::boolean, \
+    $9::text, $10::bigint FROM tenants WHERE id = $2 \
     ON CONFLICT (id) DO UPDATE SET status = excluded.status, \
     customer_id = excluded.customer_id, product_id = excluded.product_id, \
+    current_period_start = excluded.current_period_start, \
     current_period_end = excluded.current_period_end, \
     cancel_at_period_end = excluded.cancel_at_period_end, \
     modified_at = excluded.modified_at, updated_at = excluded.updated_at \
@@ -196,6 +198,7 @@ pub(crate) async fn webhook(mut req: Request, env: &Env) -> Result<Response> {
                 subscription.status.as_str(),
                 subscription.customer_id.as_str(),
                 subscription.product_id.as_str(),
+                subscription.current_period_start.as_str(),
                 subscription.current_period_end.as_deref(),
                 subscription.cancel_at_period_end,
                 subscription.modified_at.as_str(),
@@ -265,6 +268,7 @@ mod tests {
         id: &str,
         tenant: &str,
         status: &str,
+        period_start: &str,
         period_end: Option<&str>,
         cancel: bool,
         modified_at: &str,
@@ -275,6 +279,7 @@ mod tests {
             status,
             "cus_1",
             "prod_1",
+            period_start,
             period_end,
             cancel,
             modified_at,
@@ -296,6 +301,7 @@ mod tests {
                 "sub_1",
                 "t1",
                 "active",
+                "2026-10-16T00:00:00Z",
                 Some("2026-11-16T00:00:00Z"),
                 true,
                 "2026-10-16T10:00:00Z",
@@ -314,6 +320,7 @@ mod tests {
             status: status.into(),
             customer_id: "cus_1".into(),
             product_id: "prod_1".into(),
+            current_period_start: "2026-10-16T00:00:00Z".into(),
             current_period_end: None,
             cancel_at_period_end: false,
             modified_at: "2026-10-16T10:00:00Z".into(),
@@ -378,21 +385,35 @@ mod tests {
             "sub_1",
             "t1",
             "canceled",
+            "2026-10-16T00:00:00Z",
             None,
             false,
             "2026-10-16T11:00:00Z",
         );
-        let older = delivery("sub_1", "t1", "active", None, false, "2026-10-16T10:00:00Z");
+        let older = delivery(
+            "sub_1",
+            "t1",
+            "active",
+            "2026-10-01T00:00:00Z",
+            None,
+            false,
+            "2026-10-16T10:00:00Z",
+        );
         assert_eq!(db.run(UPSERT_SUBSCRIPTION, &newer), 1);
         assert_eq!(db.run(UPSERT_SUBSCRIPTION, &older), 0);
         let row = subscription(&db, "t1").unwrap();
         assert_eq!(row.status, "canceled");
         let kept = db
             .rows(
-                "SELECT current_period_end, cancel_at_period_end FROM subscriptions",
+                "SELECT current_period_start, current_period_end, cancel_at_period_end \
+                 FROM subscriptions",
                 &[],
             )
             .unwrap();
+        assert_eq!(
+            kept[0]["current_period_start"].as_str(),
+            Some("2026-10-16T00:00:00Z")
+        );
         assert!(kept[0]["current_period_end"].is_null());
         assert_eq!(kept[0]["cancel_at_period_end"], false);
     }
@@ -406,6 +427,7 @@ mod tests {
                 "sub_1",
                 "gone",
                 "active",
+                "2026-10-16T00:00:00Z",
                 None,
                 false,
                 "2026-10-16T10:00:00Z",
@@ -424,7 +446,15 @@ mod tests {
         ] {
             db.run(
                 UPSERT_SUBSCRIPTION,
-                &delivery(id, "t1", status, None, false, modified_at),
+                &delivery(
+                    id,
+                    "t1",
+                    status,
+                    "2026-10-01T00:00:00Z",
+                    None,
+                    false,
+                    modified_at,
+                ),
             );
         }
         assert_eq!(subscription(&db, "t1").unwrap().status, "active");
@@ -434,6 +464,7 @@ mod tests {
                 "sub_1",
                 "t1",
                 "revoked",
+                "2026-10-01T00:00:00Z",
                 None,
                 false,
                 "2026-10-03T00:00:00Z",
