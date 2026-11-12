@@ -23,6 +23,8 @@
 #
 # - a push to main runs build then test, both pass, and the log and
 #   step index land in R2;
+# - the same push delivery sent twice at once makes exactly one set of
+#   runs;
 # - a push to fail runs a job that fails;
 # - a re-run request for the failed job runs it again;
 # - a push to slow runs a job the script cancels;
@@ -375,13 +377,35 @@ deliver() {
   cat "$tmp/answer"
 }
 
-# Pushes $2 to branch $1 and prints the run id.
+# Posts the delivery $2 of event $1, signed, with id $3, and prints the
+# status. Used to send copies of one delivery.
+deliver_raw() {
+  local event=$1 body=$2 guid=$3
+  local signature status
+  signature="sha256=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -r | cut -d' ' -f1)"
+  status="$(printf '%s' "$body" | curl -sS -o /dev/null -w '%{http_code}' \
+    -X POST "$CI/github/webhook" \
+    -H "Content-Type: application/json" \
+    -H "X-GitHub-Event: $event" \
+    -H "X-GitHub-Delivery: $guid" \
+    -H "X-Hub-Signature-256: $signature" \
+    --data-binary @-)"
+  echo "$status"
+}
+
+# Pushes $2 to branch $1 and prints the run id. The intake answers 202
+# before any run exists, so this waits for the queued delivery's run.
 push() {
   local branch=$1 sha=$2 body run
   body="$(jq -c --arg ref "refs/heads/$branch" --arg sha "$sha" \
     '.ref = $ref | .after = $sha' "$fixtures/push.json")"
-  run="$(deliver push "$body" 202 | jq -r '.runs[0] // empty')"
-  [[ -n "$run" ]] || die "the push to $branch started no run"
+  deliver push "$body" 202 >/dev/null
+  local deadline=$((SECONDS + POLL_SECS))
+  until run="$(psql_run -At -c "SELECT id FROM ci_runs WHERE sha = '$sha' ORDER BY id DESC LIMIT 1")" &&
+    [[ -n "$run" ]]; do
+    ((SECONDS < deadline)) || die "the push to $branch started no run"
+    sleep 1
+  done
   echo "$run"
 }
 
@@ -467,6 +491,27 @@ test_job="$(jq -r '.jobs[] | select(.name == "test") | .id' "$tmp/run.json")"
 curl -fsS --compressed "$CI/api/ci/jobs/$test_job/log" | grep -qx "build said success" ||
   die "the test job did not see build's result"
 log "main: both jobs passed, the log and index are in R2"
+
+# Scenario: the same push delivery sent twice at once makes exactly one
+# set of runs. One copy is accepted and the other is a duplicate.
+dup_sha="$(printf 'd1%.0s' $(seq 20))"
+dup_body="$(jq -c --arg ref "refs/heads/main" --arg sha "$dup_sha" \
+  '.ref = $ref | .after = $sha' "$fixtures/push.json")"
+dup_guid="$(openssl rand -hex 16)"
+deliver_raw push "$dup_body" "$dup_guid" >"$tmp/dup-first" 2>/dev/null &
+deliver_raw push "$dup_body" "$dup_guid" >"$tmp/dup-second" 2>/dev/null &
+wait
+dup_statuses="$(sort "$tmp/dup-first" "$tmp/dup-second" | tr '\n' ' ')"
+[[ "$dup_statuses" == "200 202 " ]] || die "the duplicated delivery answered: $dup_statuses"
+dup_deadline=$((SECONDS + POLL_SECS))
+until [[ "$(psql_run -At -c "SELECT count(*) FROM ci_runs WHERE sha = '$dup_sha'")" == 1 ]]; do
+  ((SECONDS < dup_deadline)) || die "the duplicated delivery made no run"
+  sleep 1
+done
+wait_checks "$dup_sha" 2 'all(.status == "completed" and .conclusion == "success")'
+dup_runs="$(psql_run -At -c "SELECT count(*) FROM ci_runs WHERE sha = '$dup_sha'")"
+[[ "$dup_runs" == 1 ]] || die "the duplicated delivery planned $dup_runs runs"
+log "duplicate: one delivery sent twice made one run"
 
 # Scenario: a push to fail runs a job that fails.
 fail_sha="$(printf 'b%.0s' $(seq 40))"
@@ -889,15 +934,13 @@ tenant_push() {
   ' "$fixtures/push.json"
 }
 lapsed_sha="$(printf '1%.0s' $(seq 40))"
-deliver push "$(tenant_push 43 e2e2 2 2001 "$lapsed_sha")" 202 | jq -e '.runs == []' >/dev/null ||
-  die "the lapsed tenant's push started a run: $(cat "$tmp/answer")"
+deliver push "$(tenant_push 43 e2e2 2 2001 "$lapsed_sha")" 202 >/dev/null
 wait_checks "$lapsed_sha" 1 \
   'all(.name == "hatchrun / billing" and .status == "completed" and .conclusion == "action_required")'
 runs_2001="$(psql_run -At -c "SELECT count(*) FROM ci_runs WHERE repo_id = 2001")"
 [[ "$runs_2001" == 0 ]] || die "the lapsed tenant has $runs_2001 runs"
 never_sha="$(printf '2%.0s' $(seq 40))"
-deliver push "$(tenant_push 44 e2e3 3 3001 "$never_sha")" 202 | jq -e '.runs == []' >/dev/null ||
-  die "the never subscribed tenant's push started a run: $(cat "$tmp/answer")"
+deliver push "$(tenant_push 44 e2e3 3 3001 "$never_sha")" 202 >/dev/null
 wait_checks "$never_sha" 1 \
   'all(.name == "hatchrun / billing" and .status == "completed" and .conclusion == "action_required")'
 runs_3001="$(psql_run -At -c "SELECT count(*) FROM ci_runs WHERE repo_id = 3001")"
@@ -969,11 +1012,11 @@ cancel_run "$r2_run"
 wait_checks "$r2_sha" 1 'all(.status == "completed" and .conclusion == "cancelled")'
 log "concurrency: cancel-in-progress cancelled the running run and the new one started"
 
-# Twenty-three instances: build, test, broken twice, sleeper, arm-hello,
-# bad-ok-hello, the six naps, deploy-a, the two oidc jobs, the serial leg
-# that ran, the two soft jobs and the four sits that ran. Wait for the
-# last agent to exit.
-launches=23
+# Twenty-five instances: build, test, the duplicated push's build and
+# test, broken twice, sleeper, arm-hello, bad-ok-hello, the six naps,
+# deploy-a, the two oidc jobs, the serial leg that ran, the two soft
+# jobs and the four sits that ran. Wait for the last agent to exit.
+launches=25
 deadline=$((SECONDS + 60))
 until curl -fsS "$LAUNCHER/_events" | jq -e --argjson n "$launches" '[.[] | select(startswith("exit "))] | length >= $n' >/dev/null; do
   ((SECONDS < deadline)) || die "agents still running: $(curl -fsS "$LAUNCHER/_events")"
@@ -1000,8 +1043,8 @@ jq -e '[.[] | select(startswith("exit ")) | split(" ")[2]] | all(. == "0" or . =
   "$tmp/events.json" >/dev/null || die "an agent exited badly: $(cat "$tmp/events.json")"
 [[ "$(jq '[.[] | select(startswith("launch "))] | length' "$tmp/events.json")" == "$launches" ]] ||
   die "expected $launches launches: $(cat "$tmp/events.json")"
-jq -e '[.[] | select(endswith(" 0") and startswith("exit "))] | length == 14' "$tmp/events.json" >/dev/null ||
-  die "expected the fourteen passing jobs to exit 0: $(cat "$tmp/events.json")"
+jq -e '[.[] | select(endswith(" 0") and startswith("exit "))] | length == 16' "$tmp/events.json" >/dev/null ||
+  die "expected the sixteen passing jobs to exit 0: $(cat "$tmp/events.json")"
 # The App's permissions are read once per installation and kept in KV,
 # so the claims did not each read them.
 reads="$(curl -fsS "$GITHUB/_state" | jq '[.installation_reads[] | select(. == 42)] | length')"

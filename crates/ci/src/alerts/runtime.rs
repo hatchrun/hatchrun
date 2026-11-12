@@ -367,6 +367,46 @@ pub(crate) async fn launches_failed(
     Ok(())
 }
 
+/// Records failed deliveries from the dead-letter queue, as
+/// `(message id, error)`, and fires their alert like failed launches.
+/// Errors are returned when they could not be recorded; the alert's
+/// are logged.
+pub(crate) async fn deliveries_failed(
+    env: &Env,
+    db: &Db,
+    now: u64,
+    unknown: &[(String, String)],
+) -> Result<(), String> {
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let statements: Vec<(&str, Vec<Param>)> = unknown
+        .iter()
+        .map(|(message, error)| {
+            (
+                RECORD_UNREADABLE,
+                params![message.as_str(), error.as_str(), now],
+            )
+        })
+        .collect();
+    let recorded = db.batch(&statements).await.map_err(text)?;
+    if recorded.iter().all(|changed| *changed == 0) {
+        return Ok(());
+    }
+    // Unreadable failures leave the alert as it is.
+    let read = async || {
+        let seen = match logged("failed launches", recent_failures(db, now).await) {
+            Some(failed) => failed_launches(&failed),
+            None => Seen::Unknown,
+        };
+        vec![(Key::LaunchFailed, seen)]
+    };
+    for err in settle(&Kept(db), &Inbox::new(env), now, read, false).await {
+        console_error!("alerts: {err}");
+    }
+    Ok(())
+}
+
 /// Notes the installations a step's or launch's GitHub calls found low
 /// on requests. Errors are logged.
 pub(crate) async fn note_rate_limits(db: &Db, calls: &Counted, now: u64) {

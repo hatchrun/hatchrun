@@ -201,10 +201,21 @@ fn sweep_deletes_expired_runs_and_old_deliveries() {
         .unwrap()
         .unwrap();
     let now = 1_000 + 31 * DAY;
-    db.wait(record_delivery(db.db(), "old", "push", 1_000))
-        .unwrap();
-    db.wait(record_delivery(db.db(), "fresh", "push", now - DAY))
-        .unwrap();
+    let payload = b"{}";
+    assert!(
+        db.wait(accept_delivery(db.db(), "old", "push", payload, 1_000))
+            .unwrap()
+    );
+    assert!(
+        db.wait(accept_delivery(
+            db.db(),
+            "fresh",
+            "push",
+            payload,
+            now - DAY
+        ))
+        .unwrap()
+    );
     let gone = db.wait(sweep(db.db(), now)).unwrap();
     assert_eq!(gone, vec![old.id]);
     db.wait(delete_runs(db.db(), &gone)).unwrap();
@@ -214,8 +225,16 @@ fn sweep_deletes_expired_runs_and_old_deliveries() {
         .column("SELECT COUNT(*) AS n FROM ci_jobs", &[], "n")
         .unwrap();
     assert_eq!(jobs, 0);
-    assert!(!db.wait(delivery_seen(db.db(), "old")).unwrap());
-    assert!(db.wait(delivery_seen(db.db(), "fresh")).unwrap());
+    // The sweep deletes delivery ids older than 30 days: storing `old`
+    // again is new, while `fresh` is still stored.
+    assert!(
+        db.wait(accept_delivery(db.db(), "old", "push", payload, now))
+            .unwrap()
+    );
+    assert!(
+        !db.wait(accept_delivery(db.db(), "fresh", "push", payload, now))
+            .unwrap()
+    );
 }
 
 #[test]
@@ -683,12 +702,16 @@ fn tenant_row_reads_the_billing_state() {
 }
 
 #[test]
-fn deliveries_are_recorded_once() {
+fn deliveries_are_stored_once() {
     let db = setup();
-    assert!(!db.wait(delivery_seen(db.db(), "g")).unwrap());
-    db.wait(record_delivery(db.db(), "g", "push", 1)).unwrap();
-    db.wait(record_delivery(db.db(), "g", "push", 2)).unwrap();
-    assert!(db.wait(delivery_seen(db.db(), "g")).unwrap());
+    assert!(
+        db.wait(accept_delivery(db.db(), "g", "push", b"{}", 1))
+            .unwrap()
+    );
+    assert!(
+        !db.wait(accept_delivery(db.db(), "g", "push", b"{}", 2))
+            .unwrap()
+    );
 }
 
 #[test]

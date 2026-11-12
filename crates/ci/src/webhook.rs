@@ -50,14 +50,21 @@ fn fail(message: impl Into<String>) -> worker::Error {
     worker::Error::RustError(message.into())
 }
 
-/// How a delivery ends.
-enum Outcome {
-    /// Answered 200 `{"ignored": reason}`.
+/// How planning a delivery ends. The queue consumer finishes the
+/// stored delivery from it: [`Outcome::Done`] and [`Outcome::Ignored`]
+/// are done, [`Outcome::Retry`] is released back to `received` for the
+/// queue to deliver again after 5 s, and [`Outcome::Failed`] is done
+/// as failed and never sent again.
+pub(crate) enum Outcome {
+    /// Nothing runs for the delivery.
     Ignored(String),
-    /// Answered 202 `{"runs": ids}`.
+    /// The runs started.
     Done(Vec<u64>),
-    /// Answered 503: try again shortly. The delivery is not recorded.
+    /// Try again shortly, such as a rerun that raced the run object.
     Retry,
+    /// The delivery or the plan is unusable, and trying again would
+    /// not help.
+    Failed(String),
 }
 
 /// The commit of a release's tag, or the outcome when the tag is gone: a
@@ -287,22 +294,14 @@ fn gate(tenant: Option<TenantRow>) -> std::result::Result<TenantRow, &'static st
     }
 }
 
-fn reply(outcome: &Outcome) -> Result<Response> {
-    match outcome {
-        Outcome::Ignored(reason) => Response::from_json(&json!({ "ignored": reason })),
-        Outcome::Done(ids) => Ok(Response::from_json(&json!({ "runs": ids }))?.with_status(202)),
-        Outcome::Retry => {
-            let mut response =
-                Response::from_json(&json!({ "error": "try again shortly" }))?.with_status(503);
-            response.headers_mut().set("Retry-After", "5")?;
-            Ok(response)
-        }
-    }
-}
-
-/// Handles one delivery. The signature is checked on the raw body
-/// before anything reads it. Any failure answers 500, so GitHub records
-/// the delivery as failed.
+/// Handles one delivery: verifies the signature, stores the
+/// delivery and answers 202 before anything reads it. Only storing can
+/// fail the request, with a 503; planning happens later in the queue
+/// consumer (see [`crate::deliveries`]), so the request makes no GitHub
+/// call and inserts no run.
+///
+/// A duplicate delivery is answered 200: it is already stored, and the
+/// consumer plans it once.
 ///
 /// # Errors
 ///
@@ -328,36 +327,132 @@ pub async fn handle(mut req: Request, env: &Env) -> Result<Response> {
     if guid.is_empty() {
         return Response::error("no X-GitHub-Delivery", 400);
     }
-    match process(env, &kind, &guid, &body).await {
-        Ok(response) => Ok(response),
+    let db = match Db::connect(env).await {
+        Ok(db) => db,
+        Err(err) => {
+            worker::console_error!("webhook {kind} {guid}: database: {err}");
+            return retry_later();
+        }
+    };
+    match intake(&db, &QueueSender { env }, &guid, &kind, &body, now_ms()).await {
+        Ok(Intake::Duplicate) => Response::from_json(&json!({ "duplicate": guid })),
+        Ok(Intake::Accepted) => {
+            Ok(Response::from_json(&json!({ "accepted": guid }))?.with_status(202))
+        }
         Err(err) => {
             worker::console_error!("webhook {kind} {guid}: {err}");
-            Response::error("webhook failed", 500)
+            retry_later()
         }
     }
 }
 
-/// Handles one webhook delivery: drops duplicates, parses the event and starts the matching runs.
-async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Response> {
-    let db = Db::connect(env).await?;
-    if store::delivery_seen(&db, guid).await? {
-        return Response::from_json(&json!({ "duplicate": guid }));
+/// Answers 503: the delivery is not stored, so GitHub or the operator
+/// sends it again.
+fn retry_later() -> Result<Response> {
+    let mut response =
+        Response::from_json(&json!({ "error": "try again shortly" }))?.with_status(503);
+    response.headers_mut().set("Retry-After", "5")?;
+    Ok(response)
+}
+
+/// What storing a delivery found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Intake {
+    /// Already stored: the consumer plans it once.
+    Duplicate,
+    /// Stored and sent to the queue.
+    Accepted,
+}
+
+/// The queue the intake sends a stored delivery to. A trait, so tests
+/// store into the test database with a fake queue.
+pub(crate) trait Enqueue {
+    /// Sends the delivery for planning. Errors are logged and the
+    /// delivery is still accepted: the reconciler sends it again.
+    async fn send_delivery(&self, guid: &str) -> Result<(), String>;
+}
+
+/// The `CI_DELIVERIES` queue of the Worker's environment.
+struct QueueSender<'a> {
+    env: &'a Env,
+}
+
+impl Enqueue for QueueSender<'_> {
+    async fn send_delivery(&self, guid: &str) -> Result<(), String> {
+        self.env
+            .queue(crate::deliveries::BINDING)
+            .map_err(|err| err.to_string())?
+            .send(crate::deliveries::DeliveryMessage {
+                guid: guid.to_owned(),
+            })
+            .await
+            .map_err(|err| err.to_string())
     }
+}
+
+/// Stores one verified delivery and sends it for planning: the first
+/// statement inserts it as `received`, so concurrent copies store it
+/// once. A duplicate stores nothing. A queue send that fails is logged
+/// and still accepted: the reconciler sends the stored delivery again.
+///
+/// # Errors
+///
+/// Postgres refused the insert: the Worker is down for this delivery.
+pub(crate) async fn intake(
+    db: &Db,
+    queue: &impl Enqueue,
+    guid: &str,
+    event: &str,
+    payload: &[u8],
+    now: u64,
+) -> Result<Intake, String> {
+    if !store::accept_delivery(db, guid, event, payload, now)
+        .await
+        .map_err(|err| err.to_string())?
+    {
+        return Ok(Intake::Duplicate);
+    }
+    if let Err(err) = queue.send_delivery(guid).await {
+        log_send_error(event, guid, &err);
+    }
+    Ok(Intake::Accepted)
+}
+
+/// Logs a failed queue send. The delivery is still accepted: the
+/// reconciler sends the stored delivery again.
+fn log_send_error(event: &str, guid: &str, err: &str) {
+    // `console_error!` aborts outside the Worker, so tests write to
+    // stderr instead.
+    #[cfg(test)]
+    eprintln!("webhook {event} {guid}: queue: {err}");
+    #[cfg(not(test))]
+    worker::console_error!("webhook {event} {guid}: queue: {err}");
+}
+
+/// Plans one stored webhook delivery: parses the event and starts the
+/// matching runs. The queue consumer calls this after claiming the
+/// delivery, and finishes it from the outcome.
+pub(crate) async fn plan_delivery(
+    env: &Env,
+    db: &Db,
+    kind: &str,
+    guid: &str,
+    body: &[u8],
+) -> Result<Outcome> {
     let trigger = match intake::parse(kind, body) {
         Ok(trigger) => trigger,
         Err(err) => {
             // The payload is signed but unreadable, and a redelivery
-            // would be the same bytes: record it and answer 400.
+            // would be the same bytes: never ask for it again.
             worker::console_error!("webhook {kind} {guid}: bad payload: {err}");
-            store::record_delivery(&db, guid, kind, now_ms()).await?;
-            return Response::error("bad payload", 400);
+            return Ok(Outcome::Failed(format!("bad payload: {err}")));
         }
     };
     if let Trigger::InstallationRepositories { installation_id } = &trigger {
-        return installation_changed(env, &db, *installation_id, guid, kind).await;
+        return installation_changed(env, db, *installation_id).await;
     }
     let (installation_id, repo) = match &trigger {
-        Trigger::Ignored(reason) => return reply(&Outcome::Ignored(reason.clone())),
+        Trigger::Ignored(reason) => return Ok(Outcome::Ignored(reason.clone())),
         Trigger::InstallationRepositories { .. } => unreachable!("answered above"),
         Trigger::Push(p) => (p.installation_id, &p.repo),
         Trigger::PullRequest(p) => (p.installation_id, &p.repo),
@@ -371,19 +466,19 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
         Trigger::ApproveFork(a) => (a.installation_id, &a.repo),
         Trigger::Repository(r) => (r.installation_id, &r.repo),
     };
-    let found = store::tenant_for_installation(&db, installation_id).await?;
+    let found = store::tenant_for_installation(db, installation_id).await?;
     // A visibility change is recorded even for a tenant without CI: the
     // read API shows runs left from before, by the recorded visibility.
     let tenant = match (&trigger, found) {
         (Trigger::Repository(_), Some(tenant)) => tenant,
         (_, found) => match gate(found) {
             Ok(tenant) => tenant,
-            Err(reason) => return reply(&Outcome::Ignored(reason.to_owned())),
+            Err(reason) => return Ok(Outcome::Ignored(reason.to_owned())),
         },
     };
     let now = now_ms();
     store::upsert_repo(
-        &db,
+        db,
         &RepoRow {
             id: repo.id,
             tenant_id: tenant.id.clone(),
@@ -397,7 +492,7 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
     .await?;
     if let Trigger::Repository(_) = &trigger {
         store::touch_installation_repo(
-            &db,
+            db,
             &tenant.id,
             repo.id,
             &repo.full_name,
@@ -406,9 +501,8 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
             now,
         )
         .await?;
-    } else if !store::repo_enabled(&db, &tenant.id, repo.id).await? {
-        store::record_delivery(&db, guid, kind, now).await?;
-        return reply(&Outcome::Ignored("repository is not enabled".to_owned()));
+    } else if !store::repo_enabled(db, &tenant.id, repo.id).await? {
+        return Ok(Outcome::Ignored("repository is not enabled".to_owned()));
     }
     let settings = Settings::read(env).map_err(fail)?;
     let github = Counted::default();
@@ -424,7 +518,7 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
     );
     let cx = Cx {
         env,
-        db: &db,
+        db,
         settings: &settings,
         tokens: &tokens,
         tenant: &tenant.id,
@@ -433,34 +527,27 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
     };
     let result = cx.run(&trigger).await;
     // The calls made are noted even when the delivery failed.
-    alerts::note_rate_limits(&db, &github, now).await;
-    let outcome = result?;
-    if !matches!(outcome, Outcome::Retry) {
-        store::record_delivery(&db, guid, kind, now).await?;
-    }
-    reply(&outcome)
+    alerts::note_rate_limits(db, &github, now).await;
+    result
 }
 
 /// Reads the installation's repositories again after
 /// `installation_repositories` said they changed. A tenant with no
 /// installation of that id has nothing to update.
-async fn installation_changed(
+pub(crate) async fn installation_changed(
     env: &Env,
     db: &Db,
     installation_id: u64,
-    guid: &str,
-    kind: &str,
-) -> Result<Response> {
+) -> Result<Outcome> {
     let Some(tenant) = store::tenant_for_installation(db, installation_id).await? else {
-        return reply(&Outcome::Ignored(
+        return Ok(Outcome::Ignored(
             "no tenant for this installation".to_owned(),
         ));
     };
     let settings = Settings::read(env).map_err(fail)?;
     let now = now_ms();
     installation::sync(env, db, &settings, &tenant.id, installation_id, now).await?;
-    store::record_delivery(db, guid, kind, now).await?;
-    reply(&Outcome::Done(Vec::new()))
+    Ok(Outcome::Done(Vec::new()))
 }
 
 /// A delivery that starts workflows on a commit it does not name itself:
@@ -1098,6 +1185,9 @@ impl Cx<'_> {
             Outcome::Ignored(reason) if ids.is_empty() => return Ok(Outcome::Ignored(reason)),
             Outcome::Ignored(_) => {}
             Outcome::Retry => return Ok(Outcome::Retry),
+            // The head's own planning never fails this way; only a
+            // stored delivery's parse does.
+            Outcome::Failed(reason) => return Ok(Outcome::Failed(reason)),
         }
         Ok(Outcome::Done(ids))
     }
@@ -2220,8 +2310,9 @@ impl Cx<'_> {
                             );
                             refusals.push(chatops::refusal_reply(&reason).to_owned());
                         }
-                        // The make calls never ask for a retry.
-                        Outcome::Retry => {}
+                        // The make calls never ask for a retry, and
+                        // never fail this way.
+                        Outcome::Retry | Outcome::Failed(_) => {}
                     }
                 }
                 if !target_decision.remake.is_empty()
@@ -2746,6 +2837,99 @@ mod tests {
     fn found(db: &TestDb) -> Option<TenantRow> {
         db.wait(store::tenant_for_installation(db.db(), 99))
             .unwrap()
+    }
+
+    /// A queue that records what it was sent, and fails when told to.
+    struct FakeQueue {
+        sent: std::cell::RefCell<Vec<String>>,
+        fail: bool,
+    }
+
+    impl FakeQueue {
+        fn working() -> Self {
+            FakeQueue {
+                sent: std::cell::RefCell::new(Vec::new()),
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            FakeQueue {
+                sent: std::cell::RefCell::new(Vec::new()),
+                fail: true,
+            }
+        }
+    }
+
+    impl Enqueue for FakeQueue {
+        async fn send_delivery(&self, guid: &str) -> Result<(), String> {
+            std::future::ready(()).await;
+            if self.fail {
+                return Err("the queue is down".to_owned());
+            }
+            self.sent.borrow_mut().push(guid.to_owned());
+            Ok(())
+        }
+    }
+
+    fn counts(db: &TestDb) -> (i64, i64) {
+        let runs: i64 = db
+            .column("SELECT COUNT(*) AS n FROM ci_runs", &[], "n")
+            .unwrap();
+        let repos: i64 = db
+            .column("SELECT COUNT(*) AS n FROM ci_repos", &[], "n")
+            .unwrap();
+        (runs, repos)
+    }
+
+    #[test]
+    fn intake_accepts_without_reads_or_runs() {
+        let db = TestDb::new();
+        let queue = FakeQueue::working();
+        // The intake takes no GitHub client: it stores the delivery and
+        // answers, and any call would not compile.
+        let github = Counted::default();
+        let payload = br#"{"zen":"keep it logically awesome"}"#;
+        assert_eq!(
+            db.wait(intake(db.db(), &queue, "g1", "push", payload, 1_000))
+                .unwrap(),
+            Intake::Accepted
+        );
+        assert_eq!(*queue.sent.borrow(), vec!["g1".to_owned()]);
+        // No GitHub read and no run insert at intake: nothing runs yet.
+        assert_eq!(github.sent(), 0);
+        assert_eq!(counts(&db), (0, 0));
+        let limits: i64 = db
+            .column("SELECT COUNT(*) AS n FROM ci_rate_limits", &[], "n")
+            .unwrap();
+        assert_eq!(limits, 0);
+        // The same delivery twice stores once and sends once.
+        assert_eq!(
+            db.wait(intake(db.db(), &queue, "g1", "push", payload, 1_001))
+                .unwrap(),
+            Intake::Duplicate
+        );
+        assert_eq!(*queue.sent.borrow(), vec!["g1".to_owned()]);
+        assert_eq!(counts(&db), (0, 0));
+    }
+
+    #[test]
+    fn intake_accepts_when_the_queue_send_fails() {
+        let db = TestDb::new();
+        let queue = FakeQueue::failing();
+        assert_eq!(
+            db.wait(intake(db.db(), &queue, "g2", "push", b"{}", 2_000))
+                .unwrap(),
+            Intake::Accepted
+        );
+        assert!(queue.sent.borrow().is_empty());
+        assert_eq!(counts(&db), (0, 0));
+        // Still stored: the reconciler sends it again.
+        assert_eq!(
+            db.wait(intake(db.db(), &queue, "g2", "push", b"{}", 2_001))
+                .unwrap(),
+            Intake::Duplicate
+        );
     }
 
     #[test]

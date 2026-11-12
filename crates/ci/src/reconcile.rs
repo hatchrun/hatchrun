@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The reconciler, which the Cron Trigger runs every minute under a
-//! lease on `ci_reconciler` (see [`run`]). A pass does eight things, in
+//! lease on `ci_reconciler` (see [`run`]). A pass does nine things, in
 //! order, and an error in one is logged and does not stop the next:
 //!
 //! 1. fires the `on: schedule` workflows of the minutes since the last
@@ -11,13 +11,16 @@
 //! 2. sends the launches that stalled again, and fails the ones that
 //!    never finished, and sends the cancel of a superseded run again;
 //! 3. fails the jobs whose runner went quiet;
-//! 4. terminates instances that no job needs;
-//! 5. keeps the warm pool of each runner template at the size the last
+//! 4. fails the stored webhook deliveries past their claims and
+//!    resends, and sends the ones that no consumer planned, or whose
+//!    claim ran out, to the queue again;
+//! 5. terminates instances that no job needs;
+//! 6. keeps the warm pool of each runner template at the size the last
 //!    hour's claims ask for ([`crate::pool`]);
-//! 6. deletes expired runs and purges their objects, and deletes the
+//! 7. deletes expired runs and purges their objects, and deletes the
 //!    cache entries nobody restored for 7 days;
-//! 7. sends metered usage to Polar;
-//! 8. re-seals secrets that an old key still seals.
+//! 8. sends metered usage to Polar;
+//! 9. re-seals secrets that an old key still seals.
 //!
 //! Then the pass is added to the history in `ci_reconciler` and the
 //! alerts are checked (see [`crate::alerts`]).
@@ -60,6 +63,7 @@ use worker::{Env, Method, RequestInit, console_error, console_log};
 use crate::alerts;
 use crate::cache;
 use crate::concurrency;
+use crate::deliveries::{self, DeliveryMessage};
 use crate::env::{Settings, run_stub};
 use crate::intake::Repo;
 use crate::launcher::Backend;
@@ -535,6 +539,11 @@ async fn steps(env: &Env, db: &Db, now: u64) -> u32 {
             .await
             .map_err(|err| err.to_string()),
     );
+    tally(
+        &mut errors,
+        "deliveries",
+        resend_deliveries(env, db, &Budget::new(DELIVERY_RESENDS), now).await,
+    );
     if let Ok(backend) = &backend
         && let Err(err) = end_orphans(db, backend, &Budget::new(share.orphans), now).await
     {
@@ -864,6 +873,62 @@ async fn fix_stalled(
         if let Err(err) = result {
             console_error!("reconcile: job {id}: {err}");
             failed += 1;
+        }
+    }
+    Ok(failed)
+}
+
+/// How many stale deliveries one pass sends again, one subrequest
+/// each. Apart from [`BUDGET`]: the pass keeps them inside the Worker's
+/// headroom below its limit.
+const DELIVERY_RESENDS: u32 = 50;
+
+/// Step 4. Fails the stored deliveries past their claims and resends,
+/// and sends the ones that no consumer planned, or whose claim ran
+/// out, to the queue again, at most [`DELIVERY_RESENDS`]. Each resend
+/// counts toward [`store::MAX_ATTEMPTS`], so a delivery whose queue
+/// sends never reach a consumer fails instead of resending every
+/// minute. Returns how many sends failed.
+async fn resend_deliveries(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<u32, String> {
+    let capped = store::fail_capped_deliveries(db, now)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !capped.is_empty() {
+        alerts::deliveries_failed(env, db, now, &capped)
+            .await
+            .map_err(|err| format!("capped deliveries: {err}"))?;
+    }
+    let guids = store::stale_deliveries(db, now, DELIVERY_RESENDS)
+        .await
+        .map_err(|e| e.to_string())?;
+    if guids.is_empty() {
+        return Ok(0);
+    }
+    let queue = env.queue(deliveries::BINDING).map_err(|e| e.to_string())?;
+    let mut failed = 0;
+    for guid in guids {
+        if !budget.take(1) {
+            console_error!("reconcile: delivery budget spent, the rest wait");
+            break;
+        }
+        // Count the resend first: a consumer that claimed the delivery
+        // since is not sent to, and a send that fails still counts.
+        match store::note_resend(db, &guid, now).await {
+            Err(err) => {
+                console_error!("reconcile: delivery {guid}: {err}");
+                failed += 1;
+            }
+            Ok(false) => {}
+            Ok(true) => {
+                if let Err(err) = queue
+                    .send(DeliveryMessage { guid: guid.clone() })
+                    .await
+                    .map_err(|err| err.to_string())
+                {
+                    console_error!("reconcile: delivery {guid}: {err}");
+                    failed += 1;
+                }
+            }
         }
     }
     Ok(failed)
