@@ -38,8 +38,8 @@ use crate::env::Settings;
 /// instances and of the subnets they start in.
 pub const TENANT: &str = "hatchrun-ci";
 
-/// The launch template of CI instances, named by
-/// deploy/cloudformation/ci-account.yaml.
+/// The launch template of CI instances, defined by the Terraform module
+/// terraform-aws-hatchrun.
 pub const LAUNCH_TEMPLATE: &str = "hatchrun-ci-runner";
 
 /// The built-in hatchrun.io profile `template` launches:

@@ -3,23 +3,20 @@ name: deploy-ci
 # Deploys crates/ci, the hatchrun-ci Worker at ci.hatchrun.io that runs
 # hatchrun CI jobs, from main. It shares the database with hatchrun-cloud,
 # so this workflow applies the migrations too, as the owner role in
-# DATABASE_MIGRATE_URL, and it sets the 30 and 90 day retention of the
-# hatchrun-ci-logs bucket. The account comes from the
+# DATABASE_MIGRATE_URL. The account comes from the
 # CLOUDFLARE_ACCOUNT_ID secret.
 #
-# The API token cannot create Workers, and deploy-cloud.yml binds to
-# hatchrun-ci, so the first deploy is by hand, in this order:
-#   1. Create the R2 bucket hatchrun-ci-logs and the queues
-#      hatchrun-ci-launches and hatchrun-ci-launches-dlq.
-#   2. Apply the lifecycle: `npx wrangler r2 bucket lifecycle set
-#      hatchrun-ci-logs --file r2-lifecycle.json` from crates/ci.
-#   3. Add the secret ci-secrets-key-2026-10 (scope workers, base64 of
+# The queues hatchrun-ci-launches (+dlq), the R2 bucket
+# hatchrun-ci-logs with its lifecycle rules, and the AWS CI runner
+# account are managed with Terraform outside this repository. The API token cannot create Workers,
+# and deploy-cloud.yml binds to hatchrun-ci, so the first deploy is by
+# hand, in this order:
+#   1. Add the secret ci-secrets-key-2026-10 (scope workers, base64 of
 #      32 random bytes) to the account's Secrets Store.
-#   4. Create the stack in deploy/cloudformation/ci-account.yaml.
-#   5. Deploy the Worker once: `npx wrangler deploy` from crates/ci.
-#   6. Set the Worker's CI_ROLE_ARN secret to the stack's RoleArn
-#      output: `npx wrangler secret put CI_ROLE_ARN` from crates/ci.
-#      Deploys leave it alone. This workflow takes over from then on.
+#   2. Deploy the Worker once: `npx wrangler deploy` from crates/ci.
+#   3. Set the Worker's CI_ROLE_ARN secret to the LauncherRole ARN:
+#      `npx wrangler secret put CI_ROLE_ARN` from crates/ci. Deploys leave it alone. This workflow takes over from
+#      then on.
 
 on:
   push:
@@ -93,15 +90,6 @@ jobs:
           test -n "$DATABASE_MIGRATE_URL"
           ../cloud/scripts/migrate.sh
 
-      # Objects under logs/ and state/ expire after 30 or 90 days, by the
-      # prefix of the tenant's tier (logs/30d/, logs/90d/). The rules
-      # replace the bucket's whole lifecycle, so r2-lifecycle.json is
-      # all of it.
-      - name: Set the log retention
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: npx --yes "$WRANGLER" r2 bucket lifecycle set hatchrun-ci-logs --file r2-lifecycle.json
 
       # APP_WEBHOOK_SECRET and CI_OIDC_SIGNING_KEY are required: the
       # deploy fails without them. The other secrets set in the

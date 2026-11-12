@@ -11,9 +11,9 @@ name: deploy-cloud
 #
 # This Worker forwards push, pull_request, check_run, repository, release, create, delete, merge_group and repository_dispatch
 # deliveries to hatchrun-ci over the CI service binding, so hatchrun-ci has to exist
-# before this deploy lands. Deploy hatchrun-ci first (deploy-ci.yml,
-# by hand the first time); until then a deploy here fails on the
-# missing binding target.
+# before this deploy lands. Deploy hatchrun-ci first (deploy-ci.yml
+# documents its manual first deploy); until then a deploy here fails on
+# the missing binding target.
 
 on:
   push:
