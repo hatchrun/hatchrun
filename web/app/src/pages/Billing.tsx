@@ -189,7 +189,9 @@ const CHART = { width: 900, height: 250, left: 48, right: 890, base: 205 };
 /** Spend per UTC day of the spend cap window: a bar per day with usage, dashed outlines for days without any. */
 function DailyChart({ days, startMs, endMs, start, end }: { days: CiDay[]; startMs: number; endMs: number; start: string; end: string }) {
   const dayMs = 86_400_000;
-  const count = Math.max(1, Math.round((endMs - startMs) / dayMs));
+  // Every UTC date the window touches, the partial first and last ones included.
+  const firstDay = Math.floor(startMs / dayMs) * dayMs;
+  const count = Math.max(1, Math.ceil((endMs - firstDay) / dayMs));
   const byDay = new Map(days.map((day) => [day.day, day]));
   const peak = Math.max(100, ...days.map((day) => day.cents));
   // A round top for the scale: $1, $2, $5, $10 ... above the peak.
@@ -223,7 +225,7 @@ function DailyChart({ days, startMs, endMs, start, end }: { days: CiDay[]; start
             );
           })}
           {Array.from({ length: count }, (_, n) => {
-            const at = new Date(startMs + n * dayMs);
+            const at = new Date(firstDay + n * dayMs);
             const day = byDay.get(at.toISOString().slice(0, 10));
             const x = CHART.left + n * slot + (slot - width) / 2;
             const h = day ? height(day.cents) : 0;

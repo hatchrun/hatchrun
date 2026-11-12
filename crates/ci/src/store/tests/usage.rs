@@ -1168,6 +1168,31 @@ fn standing_restarts_at_the_period_end_when_the_renewal_is_late() {
 }
 
 #[test]
+fn standing_moves_past_every_period_the_renewals_missed() {
+    let db = setup();
+    let month = 1_790_812_800_000_u64;
+    subscribe_period(
+        &db,
+        "s1",
+        "active",
+        "2026-10-15T00:00:00Z",
+        Some("2026-11-15T00:00:00Z"),
+        "2026-10-15T00:00:00Z",
+    );
+    // In the second missed period: left out.
+    record_usage(&db, 1, 300, month + 50 * DAY);
+    // In the third period, which holds now: counted.
+    record_usage(&db, 2, 120, month + 78 * DAY);
+    let standing = db
+        .wait(tenant_standing(db.db(), "t1", month + 80 * DAY, 50_000_000))
+        .unwrap()
+        .unwrap();
+    assert_eq!(standing.window_start, month + 76 * DAY);
+    assert_eq!(standing.window_end, month + 107 * DAY);
+    assert_eq!(standing.units, 120);
+}
+
+#[test]
 fn standing_without_a_subscription_keeps_the_calendar_month() {
     let db = setup();
     let month = 1_790_812_800_000_u64;

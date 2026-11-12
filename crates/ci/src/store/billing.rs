@@ -14,11 +14,10 @@ use worker::Result;
 /// month start, all in milliseconds.
 ///
 /// The window starts at the latest active or trialing subscription's
-/// period start, or at its period end when now is at or past it (the
-/// renewal webhook is late); a tenant with no such subscription keeps
-/// the calendar month. The window ends at the period end, or one
-/// period length past it when the renewal is late, or at the next
-/// calendar month start.
+/// period start. When now is at or past its period end (the renewal
+/// webhook is late), the window moves forward in steps of one period
+/// length until it holds now. A tenant with no such subscription keeps
+/// the calendar month, which ends at the next calendar month start.
 const STANDING: &str = "SELECT tenants.id AS tenant_id, tenants.org_login, \
        (tenants.beta OR EXISTS (SELECT 1 FROM subscriptions \
          WHERE subscriptions.tenant_id = tenants.id \
@@ -41,20 +40,22 @@ const STANDING: &str = "SELECT tenants.id AS tenant_id, tenants.org_login, \
          WHERE ci_runs.tenant_id = tenants.id \
          AND ci_jobs.status IN ('launching', 'launched', 'running'))::bigint AS running \
      FROM tenants LEFT JOIN LATERAL (SELECT CASE WHEN one.rolled \
-         THEN one.end_ms ELSE one.start_ms END AS start_ms, \
-         CASE WHEN one.rolled THEN one.end_ms + (one.end_ms - one.start_ms) \
-           ELSE one.end_ms END AS end_ms FROM (SELECT \
+         THEN one.start_ms + (($2 - one.start_ms) / one.len) * one.len \
+         ELSE one.start_ms END AS start_ms, \
+         CASE WHEN one.rolled \
+         THEN one.start_ms + (($2 - one.start_ms) / one.len + 1) * one.len \
+         ELSE one.end_ms END AS end_ms \
+         FROM (SELECT raw.start_ms, raw.end_ms, \
+           GREATEST(raw.end_ms - raw.start_ms, 1) AS len, \
+           raw.end_ms IS NOT NULL AND $2 >= raw.end_ms AS rolled FROM (SELECT \
          (EXTRACT(epoch FROM s.current_period_start::timestamptz) * 1000)::bigint \
            AS start_ms, \
          CASE WHEN s.current_period_end IS NULL THEN NULL \
            ELSE (EXTRACT(epoch FROM s.current_period_end::timestamptz) * 1000)::bigint \
-           END AS end_ms, \
-         s.current_period_end IS NOT NULL \
-           AND $2 >= (EXTRACT(epoch FROM s.current_period_end::timestamptz) * 1000)::bigint \
-           AS rolled \
+           END AS end_ms \
          FROM subscriptions s WHERE s.tenant_id = tenants.id \
          AND s.status IN ('active', 'trialing') \
-         ORDER BY s.modified_at DESC LIMIT 1) AS one) AS period ON true \
+         ORDER BY s.modified_at DESC LIMIT 1) AS raw) AS one) AS period ON true \
      WHERE {owner}";
 
 /// [`STANDING`]'s `{owner}` for the tenant of job `$1`.
