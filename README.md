@@ -8,9 +8,9 @@ own AWS account.
 This repository holds:
 
 - **hatchrun-ci** ([`crates/ci`](crates/ci)): the Cloudflare Worker that
-  runs workflows. It takes the hatchrun GitHub App's webhooks, plans
-  runs, launches an instance per job and keeps logs, artifacts, caches,
-  secrets and billing usage.
+  runs workflows. It stores the hatchrun GitHub App's webhook
+  deliveries, plans runs from its queue, launches an instance per job
+  and keeps logs, artifacts, caches, secrets and billing usage.
 - **hatchrun.io** ([`crates/cloud`](crates/cloud)): the Cloudflare
   Worker in front of it. It owns the webhook endpoint, sign-in with
   GitHub, the organization and billing API of app.hatchrun.io and the
@@ -109,7 +109,9 @@ npx wrangler@4.143.0 deploy
 hatchrun.io. `POST /github/webhook` takes the hatchrun GitHub App's
 deliveries: push, pull_request, check_run, repository, release, create,
 delete, merge_group and repository_dispatch go on to `hatchrun-ci` as they came; `installation` events
-link a tenant to its installation or unlink it. Everything under
+link a tenant to its installation or unlink it. `hatchrun-ci` stores
+each verified delivery, answers 202 and plans it from its queue.
+Everything under
 `/api/ci/` on app.hatchrun.io is forwarded to `hatchrun-ci` too.
 `GET /healthz` answers 200 while the database does and `hatchrun-ci` is
 healthy.

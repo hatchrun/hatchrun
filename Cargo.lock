@@ -1226,6 +1226,7 @@ dependencies = [
  "hatchrun-cloud",
  "hatchrun-scaler-core",
  "hatchrun-workflow",
+ "hex",
  "hmac",
  "js-sys",
  "serde",

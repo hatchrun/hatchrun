@@ -85,8 +85,9 @@ async fn forward_api(env: &Env, req: Request) -> Result<Response> {
 
 /// Sends the delivery on to `hatchrun-ci` as it came: the same body and
 /// the signature, event and delivery headers. Its answer goes back
-/// unchanged, so a failure there is a failed delivery that GitHub or the
-/// redelivery pass asks for again.
+/// unchanged: `hatchrun-ci` answers 202 once it stores the delivery and
+/// plans it from its queue, and a 503 means the delivery is not stored,
+/// so GitHub sends it again.
 async fn forward(env: &Env, req: &mut Request) -> Result<Response> {
     let Ok(ci) = env.service(CI) else {
         return Ok(

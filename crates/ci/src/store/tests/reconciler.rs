@@ -165,10 +165,21 @@ fn a_thirty_day_month_drops_on_time_while_ninety_day_stays() {
     assert_eq!(kept.retention_days, 90);
     db.wait(insert_jobs(db.db(), kept.id, &[new_job("build")], october))
         .unwrap();
-    db.wait(record_delivery(db.db(), "old", "push", october))
-        .unwrap();
-    db.wait(record_delivery(db.db(), "fresh", "push", DECEMBER - DAY))
-        .unwrap();
+    let payload = b"{}";
+    assert!(
+        db.wait(accept_delivery(db.db(), "old", "push", payload, october))
+            .unwrap()
+    );
+    assert!(
+        db.wait(accept_delivery(
+            db.db(),
+            "fresh",
+            "push",
+            payload,
+            DECEMBER - DAY
+        ))
+        .unwrap()
+    );
 
     // November keeps both: October ended less than 30 days ago. Older
     // empty months from the fixtures may drop.
@@ -212,8 +223,22 @@ fn a_thirty_day_month_drops_on_time_while_ninety_day_stays() {
         .column("SELECT COUNT(*) AS n FROM ci_jobs", &[], "n")
         .unwrap();
     assert_eq!(jobs, 1);
-    assert!(!db.wait(delivery_seen(db.db(), "old")).unwrap());
-    assert!(db.wait(delivery_seen(db.db(), "fresh")).unwrap());
+    // Delivery ids older than 30 days go: storing `old` again is new,
+    // while `fresh` is still stored.
+    assert!(
+        db.wait(accept_delivery(db.db(), "old", "push", payload, DECEMBER))
+            .unwrap()
+    );
+    assert!(
+        !db.wait(accept_delivery(
+            db.db(),
+            "fresh",
+            "push",
+            payload,
+            DECEMBER
+        ))
+        .unwrap()
+    );
     // Dropping again changes nothing.
     assert_eq!(
         db.wait(drop_expired_partitions(

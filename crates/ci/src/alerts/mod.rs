@@ -37,7 +37,7 @@ mod runtime;
 mod tests;
 
 pub(crate) use health::{HEALTH, HealthRow, health};
-pub(crate) use runtime::{after_pass, launches_failed, note_rate_limits};
+pub(crate) use runtime::{after_pass, deliveries_failed, launches_failed, note_rate_limits};
 
 /// The `send_email` binding in `wrangler.toml`.
 const BINDING: &str = "ALERTS";
