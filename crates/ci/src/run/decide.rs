@@ -1113,6 +1113,24 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
         // A rerun from another delivery still starts attempt 3.
         let second = rerun_once(&run, &mut g, 2, "d2", &ctx).unwrap();
         assert_eq!(second.reset, vec![(2, 3)]);
+        run.note_rerun("d2");
+        // 25 more deliveries rerun it, attempts 4 to 28, and then the
+        // queue plans d1 again: it still resets nothing.
+        for n in 3..28u32 {
+            let _ = g.advance(&ctx);
+            g.running(1);
+            let _ = g.finished(1, failed(), &ctx);
+            let delivery = format!("d{n}");
+            let rerun = rerun_once(&run, &mut g, 2, &delivery, &ctx).unwrap();
+            assert_eq!(rerun.reset, vec![(2, n + 1)]);
+            run.note_rerun(&delivery);
+        }
+        let _ = g.advance(&ctx);
+        g.running(1);
+        let _ = g.finished(1, failed(), &ctx);
+        let ended = attempts(&g);
+        assert!(rerun_once(&run, &mut g, 2, "d1", &ctx).is_none());
+        assert_eq!(attempts(&g), ended);
     }
 
     #[test]
