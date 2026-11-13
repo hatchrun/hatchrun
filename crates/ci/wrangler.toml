@@ -91,9 +91,10 @@ queue = "hatchrun-ci-deliveries"
 
 # Small batches, sent after a second at most, so a delivery's planning
 # does not wait for other deliveries. Messages that fail max_retries
-# times go to the dead-letter queue, whose consumer finishes them as
-# failed and emails the failed delivery alert (crates/ci/src/alerts);
-# the reconciler sends a stored delivery that no consumer planned again.
+# times go to the dead-letter queue. The reconciler sends a stored
+# delivery that no consumer planned again, and fails it after 50 claims
+# and resends, which emails the failed delivery alert
+# (crates/ci/src/alerts).
 [[queues.consumers]]
 queue = "hatchrun-ci-deliveries"
 max_batch_size = 5
@@ -102,9 +103,9 @@ max_retries = 8
 max_concurrency = 10
 dead_letter_queue = "hatchrun-ci-deliveries-dlq"
 
-# Delivery messages that ran out of retries. This Worker records each
-# one in ci_failed_launches and emails the failed delivery alert
-# (crates/ci/src/alerts).
+# Delivery messages that ran out of retries. This Worker logs each one
+# and acks it; the delivery stays waiting in ci_deliveries for the
+# reconciler.
 [[queues.consumers]]
 queue = "hatchrun-ci-deliveries-dlq"
 max_batch_size = 10

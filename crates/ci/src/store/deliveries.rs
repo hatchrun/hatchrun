@@ -42,8 +42,12 @@ pub const RECEIVED_STALE_MS: u64 = 2 * 60_000;
 pub const MAX_ATTEMPTS: u64 = 50;
 
 /// Stores delivery `guid` of `event` with `payload`, as `received`.
-/// Returns whether it is new: a duplicate stores nothing. The payload
-/// goes in hex, since the statements bind text.
+/// Returns whether it is to be planned: a new delivery, or a failed one
+/// sent again, which GitHub does when an operator redelivers it. That
+/// one starts over with the payload that came and no error, and the
+/// cap counts its tries from there.
+/// A copy of a delivery that waits, plans or is done stores nothing.
+/// The payload goes in hex, since the statements bind text.
 ///
 /// # Errors
 ///
@@ -55,13 +59,18 @@ pub async fn accept_delivery(
     payload: &[u8],
     now: u64,
 ) -> Result<bool> {
+    #[derive(Deserialize)]
+    struct Row {
+        #[allow(dead_code)]
+        guid: String,
+    }
     Ok(db
-        .run(
+        .first::<Row>(
             ACCEPT_DELIVERY,
             &params![guid, event, hex::encode(payload), now],
         )
         .await?
-        == 1)
+        .is_some())
 }
 
 /// A claimed delivery: what the consumer plans from. `attempts` is
@@ -240,13 +249,23 @@ pub async fn stale_deliveries(db: &Db, now: u64, limit: u32) -> Result<Vec<Strin
 }
 
 /// Stores delivery `$1` of event `$2` with payload `decode($3,
-/// 'hex')`, received at `$4`, unless its guid is stored already: one
-/// row written means it is new. Hex, not base64: `encode` wraps base64
-/// every 76 characters.
+/// 'hex')`, received at `$4`. A stored guid is left alone unless it
+/// failed: then it starts over as `received`. A row returned means the
+/// delivery is to be planned; concurrent copies return it once, since
+/// the conflicting insert waits for the first and sees it `received`.
+/// `attempts` keeps growing, so no claim token from before can match a
+/// new claim; `attempts_before` takes its value, so the cap counts the
+/// new tries only.
+/// Hex, not base64: `encode` wraps base64 every 76 characters.
 const ACCEPT_DELIVERY: &str = "INSERT INTO ci_deliveries \
      (guid, event, payload, state, received_at) \
      VALUES ($1, $2, decode($3, 'hex'), 'received', $4) \
-     ON CONFLICT (guid) DO NOTHING";
+     ON CONFLICT (guid) DO UPDATE SET event = excluded.event, payload = excluded.payload, \
+       state = 'received', received_at = excluded.received_at, \
+       attempts_before = ci_deliveries.attempts, \
+       lease_until = NULL, error = NULL, failed_at = NULL \
+     WHERE ci_deliveries.state = 'failed' \
+     RETURNING guid";
 
 /// Claims delivery `$1` until `$2` when it is `received`, or
 /// `planning` with its lease out before `$3`.
@@ -273,7 +292,7 @@ const RELEASE_DELIVERY: &str = "UPDATE ci_deliveries SET state = 'received', lea
 /// than `$4` times: `received` from before `$2` and past its queue
 /// retry at `$3`, or `planning` with its lease out before `$3`.
 const NOTE_RESEND: &str = "UPDATE ci_deliveries SET attempts = attempts + 1 WHERE guid = $1 \
-     AND attempts < $4 \
+     AND attempts - attempts_before < $4 \
      AND ((state = 'received' AND received_at < $2 \
        AND (lease_until IS NULL OR lease_until < $3)) \
      OR (state = 'planning' AND lease_until IS NOT NULL AND lease_until < $3))";
@@ -286,7 +305,7 @@ const NOTE_RESEND: &str = "UPDATE ci_deliveries SET attempts = attempts + 1 WHER
 const FAIL_CAPPED_DELIVERIES: &str = "UPDATE ci_deliveries \
      SET state = 'failed', error = 'the delivery was resent too often: ' || guid, \
      lease_until = NULL, failed_at = $2 \
-     WHERE attempts >= $3 \
+     WHERE attempts - attempts_before >= $3 \
      AND ((state = 'received' AND received_at < $1 \
        AND (lease_until IS NULL OR lease_until < $2)) \
      OR (state = 'planning' AND lease_until IS NOT NULL AND lease_until < $2)) \
@@ -297,7 +316,7 @@ const FAIL_CAPPED_DELIVERIES: &str = "UPDATE ci_deliveries \
 /// before `$2`, claimed fewer than
 /// `$3` times, at most `$4`, oldest first.
 const STALE_DELIVERIES: &str = "SELECT guid FROM ci_deliveries \
-     WHERE attempts < $3 \
+     WHERE attempts - attempts_before < $3 \
      AND ((state = 'received' AND received_at < $1 \
        AND (lease_until IS NULL OR lease_until < $2)) \
      OR (state = 'planning' AND lease_until IS NOT NULL AND lease_until < $2)) \
