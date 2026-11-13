@@ -8,6 +8,12 @@
 pub(crate) const FAILED_SINCE: &str = "SELECT job_id, job_name, error, attempts, failed_at \
      FROM ci_failed_launches WHERE failed_at >= $1 ORDER BY failed_at DESC LIMIT $2";
 
+/// Webhook deliveries that failed since `$1`, newest first, at most
+/// `$2`.
+pub(crate) const FAILED_DELIVERIES_SINCE: &str = "SELECT guid, event, error, attempts, \
+     failed_at FROM ci_deliveries WHERE state = 'failed' AND failed_at >= $1 \
+     ORDER BY failed_at DESC LIMIT $2";
+
 /// Installations whose rate limit was low since `$1`, at most `$2`.
 pub(crate) const LOW_SINCE: &str = "SELECT installation_id, remaining, limited \
      FROM ci_rate_limits WHERE seen_at >= $1 ORDER BY seen_at DESC LIMIT $2";

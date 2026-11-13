@@ -8,8 +8,8 @@ use hatchrun_cloud::time;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CONNECTIONS_PERCENT, FAILED_LAUNCHES_FOR, FAILING_PASSES, GB, Key, LISTED, MINUTE,
-    RATE_LIMITS_FOR, Seen,
+    CONNECTIONS_PERCENT, FAILED_DELIVERIES_FOR, FAILED_LAUNCHES_FOR, FAILING_PASSES, GB, Key,
+    LISTED, MINUTE, RATE_LIMITS_FOR, Seen,
 };
 
 /// One pass, as the `ci_reconciler` row remembers it.
@@ -42,6 +42,16 @@ pub(crate) struct FailedLaunch {
     pub failed_at: u64,
 }
 
+/// A failed row of `ci_deliveries`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct FailedDelivery {
+    pub guid: String,
+    pub event: String,
+    pub error: Option<String>,
+    pub attempts: u64,
+    pub failed_at: u64,
+}
+
 /// A row of `ci_rate_limits`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub(crate) struct LowRateLimit {
@@ -68,6 +78,7 @@ pub(crate) struct Facts {
     pub history: Option<Vec<PassRecord>>,
     pub database: Option<Database>,
     pub failed: Option<Vec<FailedLaunch>>,
+    pub failed_deliveries: Option<Vec<FailedDelivery>>,
     pub rate_limits: Option<Vec<LowRateLimit>>,
 }
 
@@ -99,6 +110,13 @@ pub(crate) fn check(facts: &Facts) -> Vec<(Key, Seen)> {
             .failed
             .as_deref()
             .map_or(Seen::Unknown, failed_launches),
+    ));
+    seen.push((
+        Key::DeliveryFailed,
+        facts
+            .failed_deliveries
+            .as_deref()
+            .map_or(Seen::Unknown, failed_deliveries),
     ));
     seen.push((
         Key::RateLimit,
@@ -178,6 +196,36 @@ pub(super) fn failed_launches(failed: &[FailedLaunch]) -> Seen {
         "Launch messages reached hatchrun-ci-launches-dlq in the last {} min{}:\n{}\n\n\
          The reconciler sends queued jobs again and fails launches that stalled; the error says why the queue could not.",
         FAILED_LAUNCHES_FOR / MINUTE,
+        if more { ", the latest of them" } else { "" },
+        lines.join("\n")
+    ))
+}
+
+/// The failed delivery alert, from the latest failures, newest first.
+/// One more than [`LISTED`] says there are more than the detail lists.
+pub(super) fn failed_deliveries(failed: &[FailedDelivery]) -> Seen {
+    if failed.is_empty() {
+        return Seen::Clear;
+    }
+    let more = failed.len() > LISTED as usize;
+    let failed = &failed[..failed.len().min(LISTED as usize)];
+    let lines: Vec<String> = failed
+        .iter()
+        .map(|delivery| {
+            format!(
+                "delivery {} ({}), {} attempts, at {}: {}",
+                delivery.guid,
+                delivery.event,
+                delivery.attempts,
+                time::format(delivery.failed_at),
+                delivery.error.as_deref().unwrap_or("no error recorded")
+            )
+        })
+        .collect();
+    Seen::Firing(format!(
+        "Webhook deliveries failed in the last {} min{}:\n{}\n\n\
+         Their runs were not planned; the error says why. The payload stays in ci_deliveries.",
+        FAILED_DELIVERIES_FOR / MINUTE,
         if more { ", the latest of them" } else { "" },
         lines.join("\n")
     ))

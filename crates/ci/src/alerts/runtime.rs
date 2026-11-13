@@ -12,16 +12,18 @@ use hatchrun_cloud::github::RateLimit;
 use serde::Deserialize;
 use worker::{Env, SendEmail, SendEmailBuilder, console_error};
 
-use super::checks::{Database, Facts, FailedLaunch, PassRecord, check, failed_launches};
+use super::checks::{
+    Database, Facts, FailedDelivery, FailedLaunch, PassRecord, check, failed_launches,
+};
 use super::health::{HealthRow, history};
 use super::queries::{
-    DATABASE, DELETE_FAILED, DELETE_RATE_LIMITS, FAILED_SINCE, LOW_SINCE, NOTE_RATE_LIMIT,
-    RECORD_FAILED, RECORD_UNREADABLE,
+    DATABASE, DELETE_FAILED, DELETE_RATE_LIMITS, FAILED_DELIVERIES_SINCE, FAILED_SINCE, LOW_SINCE,
+    NOTE_RATE_LIMIT, RECORD_FAILED, RECORD_UNREADABLE,
 };
 use super::{
-    Alert, BINDING, DELETE_BATCH, Email, FAILED_LAUNCH_MEMORY, FAILED_LAUNCHES_FOR, FROM, HISTORY,
-    Key, LISTED, Mail, RATE_LIMIT_MEMORY, RATE_LIMITS_FOR, Seen, State, Store, TO, settle,
-    settle_pass,
+    Alert, BINDING, DELETE_BATCH, Email, FAILED_DELIVERIES_FOR, FAILED_LAUNCH_MEMORY,
+    FAILED_LAUNCHES_FOR, FROM, HISTORY, Key, LISTED, Mail, RATE_LIMIT_MEMORY, RATE_LIMITS_FOR,
+    Seen, State, Store, TO, settle, settle_pass,
 };
 
 /// Every alert.
@@ -270,6 +272,16 @@ pub(crate) async fn after_pass(env: &Env, db: &Db, now: u64, errors: u32) {
                     .and_then(|row| row.ok_or_else(|| "no row".to_owned())),
             ),
             failed: logged("failed launches", recent_failures(db, now).await),
+            failed_deliveries: logged(
+                "failed deliveries",
+                since::<FailedDelivery>(
+                    db,
+                    FAILED_DELIVERIES_SINCE,
+                    now.saturating_sub(FAILED_DELIVERIES_FOR),
+                    LISTED + 1,
+                )
+                .await,
+            ),
             rate_limits: logged(
                 "rate limits",
                 since(db, LOW_SINCE, now.saturating_sub(RATE_LIMITS_FOR), LISTED).await,
@@ -349,46 +361,6 @@ pub(crate) async fn launches_failed(
             params![message.as_str(), error.as_str(), now],
         )
     }));
-    let recorded = db.batch(&statements).await.map_err(text)?;
-    if recorded.iter().all(|changed| *changed == 0) {
-        return Ok(());
-    }
-    // Unreadable failures leave the alert as it is.
-    let read = async || {
-        let seen = match logged("failed launches", recent_failures(db, now).await) {
-            Some(failed) => failed_launches(&failed),
-            None => Seen::Unknown,
-        };
-        vec![(Key::LaunchFailed, seen)]
-    };
-    for err in settle(&Kept(db), &Inbox::new(env), now, read, false).await {
-        console_error!("alerts: {err}");
-    }
-    Ok(())
-}
-
-/// Records failed deliveries from the dead-letter queue, as
-/// `(message id, error)`, and fires their alert like failed launches.
-/// Errors are returned when they could not be recorded; the alert's
-/// are logged.
-pub(crate) async fn deliveries_failed(
-    env: &Env,
-    db: &Db,
-    now: u64,
-    unknown: &[(String, String)],
-) -> Result<(), String> {
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    let statements: Vec<(&str, Vec<Param>)> = unknown
-        .iter()
-        .map(|(message, error)| {
-            (
-                RECORD_UNREADABLE,
-                params![message.as_str(), error.as_str(), now],
-            )
-        })
-        .collect();
     let recorded = db.batch(&statements).await.map_err(text)?;
     if recorded.iter().all(|changed| *changed == 0) {
         return Ok(());

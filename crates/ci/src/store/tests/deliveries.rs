@@ -49,7 +49,7 @@ fn two_claims_of_one_delivery_one_wins() {
     );
     // Done: nothing to claim either.
     assert!(
-        db.wait(finish_delivery(db.db(), "g", token, "done", None))
+        db.wait(finish_delivery(db.db(), "g", token, "done", None, 1_002))
             .unwrap()
     );
     assert!(
@@ -64,6 +64,12 @@ fn two_claims_of_one_delivery_one_wins() {
         "p",
     );
     assert!(matches!(payload, Some(None)));
+    let failed_at: Option<Option<i64>> = db.column(
+        "SELECT failed_at AS t FROM ci_deliveries WHERE guid = 'g'",
+        &[],
+        "t",
+    );
+    assert_eq!(failed_at, Some(None));
 }
 
 #[test]
@@ -84,7 +90,7 @@ fn a_failed_plan_retries_from_the_stored_payload() {
         .unwrap();
     assert_eq!(first.payload, payload);
     assert!(
-        db.wait(release_delivery(db.db(), "g", first.attempts))
+        db.wait(release_delivery(db.db(), "g", first.attempts, 1_001))
             .unwrap()
     );
     let second = db
@@ -101,7 +107,8 @@ fn a_failed_plan_retries_from_the_stored_payload() {
             "g",
             second.attempts,
             "failed",
-            Some("boom")
+            Some("boom"),
+            1_003,
         ))
         .unwrap()
     );
@@ -117,6 +124,12 @@ fn a_failed_plan_retries_from_the_stored_payload() {
         "e",
     );
     assert_eq!(error.as_deref(), Some("boom"));
+    let failed_at: Option<i64> = db.column(
+        "SELECT failed_at AS t FROM ci_deliveries WHERE guid = 'g'",
+        &[],
+        "t",
+    );
+    assert_eq!(failed_at, Some(1_003));
     assert!(
         db.wait(claim_delivery(db.db(), "g", 1_003))
             .unwrap()
@@ -196,7 +209,7 @@ fn stale_deliveries_cover_received_and_expired_leases_within_the_cap() {
             .attempts;
         let state = if guid == "done" { "done" } else { "failed" };
         assert!(
-            db.wait(finish_delivery(db.db(), guid, token, state, None))
+            db.wait(finish_delivery(db.db(), guid, token, state, None, now))
                 .unwrap()
         );
     }
@@ -245,13 +258,19 @@ fn a_stale_consumer_changes_nothing_after_another_claim() {
             "g",
             stale.attempts,
             "failed",
-            Some("stale")
+            Some("stale"),
+            1_003 + LEASE_MS,
         ))
         .unwrap()
     );
     assert!(
-        !db.wait(release_delivery(db.db(), "g", stale.attempts))
-            .unwrap()
+        !db.wait(release_delivery(
+            db.db(),
+            "g",
+            stale.attempts,
+            1_003 + LEASE_MS
+        ))
+        .unwrap()
     );
     let row: Option<String> = db.column(
         "SELECT state AS s FROM ci_deliveries WHERE guid = 'g'",
@@ -267,108 +286,65 @@ fn a_stale_consumer_changes_nothing_after_another_claim() {
     assert_eq!(attempts, Some(2));
     // The live token still ends it.
     assert!(
-        db.wait(finish_delivery(db.db(), "g", live.attempts, "done", None))
-            .unwrap()
+        db.wait(finish_delivery(
+            db.db(),
+            "g",
+            live.attempts,
+            "done",
+            None,
+            1_003 + LEASE_MS
+        ))
+        .unwrap()
     );
 }
 
 #[test]
-fn the_dead_letter_only_finishes_deliveries_that_wait() {
+fn a_released_delivery_waits_for_its_own_retry() {
     let db = setup();
-    for guid in ["waiting", "planning", "done", "failed"] {
-        db.wait(accept_delivery(db.db(), guid, "push", b"{}", 1_000))
-            .unwrap();
+    let now = 10_000_000u64;
+    db.wait(accept_delivery(
+        db.db(),
+        "g",
+        "push",
+        b"{}",
+        now - RECEIVED_STALE_MS - 1,
+    ))
+    .unwrap();
+    let claim = db.wait(claim_delivery(db.db(), "g", now)).unwrap().unwrap();
+    // The plan failed and the queue sends the message again in 5 min.
+    let retry_at = now + 300_000;
+    assert!(
+        db.wait(release_delivery(db.db(), "g", claim.attempts, retry_at))
+            .unwrap()
+    );
+    // Until that retry is past, the reconciler sends nothing: one
+    // message is on its way already.
+    for at in [now + 1, retry_at, retry_at + RECEIVED_STALE_MS - 1] {
+        assert_eq!(
+            db.wait(stale_deliveries(db.db(), at, 10)).unwrap(),
+            Vec::<String>::new(),
+            "{at}"
+        );
+        assert!(!db.wait(note_resend(db.db(), "g", at)).unwrap(), "{at}");
     }
-    let planning = db
-        .wait(claim_delivery(db.db(), "planning", 1_001))
+    // The retry message still claims it.
+    let retried = db
+        .wait(claim_delivery(db.db(), "g", retry_at))
         .unwrap()
         .unwrap();
-    let done = db
-        .wait(claim_delivery(db.db(), "done", 1_001))
-        .unwrap()
-        .unwrap();
+    assert_eq!(retried.attempts, 2);
+    // Released again and its last retry never came: the message ran out
+    // of retries. The reconciler sends it once the retry is past.
     assert!(
-        db.wait(finish_delivery(
-            db.db(),
-            "done",
-            done.attempts,
-            "done",
-            None
-        ))
-        .unwrap()
-    );
-    assert!(
-        db.wait(finish_delivery(
-            db.db(),
-            "failed",
-            db.wait(claim_delivery(db.db(), "failed", 1_001))
-                .unwrap()
-                .unwrap()
-                .attempts,
-            "failed",
-            Some("boom"),
-        ))
-        .unwrap()
-    );
-    // Still waiting: finished as failed, keeping the payload.
-    assert!(
-        db.wait(finish_dead_letter(db.db(), "waiting", "late: waiting"))
+        db.wait(release_delivery(db.db(), "g", retried.attempts, retry_at))
             .unwrap()
     );
-    assert!(
-        db.wait(finish_dead_letter(db.db(), "planning", "late: planning"))
-            .unwrap()
-    );
-    // Already decided: nothing changes and no alert goes out for them.
-    assert!(
-        !db.wait(finish_dead_letter(db.db(), "done", "late"))
-            .unwrap()
-    );
-    assert!(
-        !db.wait(finish_dead_letter(db.db(), "failed", "late"))
-            .unwrap()
-    );
-    assert!(
-        !db.wait(finish_dead_letter(db.db(), "missing", "late"))
-            .unwrap()
-    );
-    let rows: Vec<(String, String)> = ["done", "failed", "planning", "waiting"]
-        .into_iter()
-        .map(|guid| {
-            let state: Option<String> = db.column(
-                "SELECT state AS s FROM ci_deliveries WHERE guid = $1",
-                &params![guid],
-                "s",
-            );
-            (guid.to_owned(), state.unwrap())
-        })
-        .collect();
-    assert_eq!(planning.attempts, 1);
+    let past = retry_at + RECEIVED_STALE_MS + 1;
     assert_eq!(
-        rows,
-        vec![
-            ("done".to_owned(), "done".to_owned()),
-            ("failed".to_owned(), "failed".to_owned()),
-            ("planning".to_owned(), "failed".to_owned()),
-            ("waiting".to_owned(), "failed".to_owned()),
-        ]
+        db.wait(stale_deliveries(db.db(), past, 10)).unwrap(),
+        vec!["g".to_owned()]
     );
-    // The done delivery still drops its payload; the failed ones keep
-    // theirs, and the done one's error stays empty.
-    let payloads: i64 = db
-        .column(
-            "SELECT COUNT(*) AS n FROM ci_deliveries WHERE payload IS NOT NULL",
-            &[],
-            "n",
-        )
-        .unwrap();
-    assert_eq!(payloads, 3);
-    let error: Option<String> = db.column(
-        "SELECT error AS e FROM ci_deliveries WHERE guid = 'failed'",
-        &[],
-        "e",
-    );
-    assert_eq!(error.as_deref(), Some("boom"));
+    assert!(db.wait(note_resend(db.db(), "g", past)).unwrap());
 }
 
 #[test]
@@ -421,12 +397,47 @@ fn resends_count_toward_the_cap_and_capped_deliveries_fail() {
         "e",
     );
     assert_eq!(state.as_deref(), Some("failed"));
+    let failed_at: Option<i64> = db.column(
+        "SELECT failed_at AS t FROM ci_deliveries WHERE guid = 'old'",
+        &[],
+        "t",
+    );
+    assert_eq!(failed_at, Some(i64::try_from(now).unwrap()));
     assert!(
         error
             .as_deref()
             .is_some_and(|error| error.contains("resent too often")),
         "{error:?}"
     );
+    // At the cap, a delivery whose queue retry or lease is still live
+    // fails only once it is past: a message may still plan it.
+    for (guid, state) in [("retrying", "received"), ("leased", "planning")] {
+        db.wait(accept_delivery(
+            db.db(),
+            guid,
+            "push",
+            b"{}",
+            now - RECEIVED_STALE_MS - 1,
+        ))
+        .unwrap();
+        db.run(
+            "UPDATE ci_deliveries SET state = $2, attempts = $3, lease_until = $4 \
+             WHERE guid = $1",
+            &params![guid, state, MAX_ATTEMPTS, now + 60_000],
+        );
+    }
+    assert_eq!(
+        db.wait(fail_capped_deliveries(db.db(), now)).unwrap(),
+        Vec::<(String, String)>::new()
+    );
+    let mut capped: Vec<String> = db
+        .wait(fail_capped_deliveries(db.db(), now + 60_001))
+        .unwrap()
+        .into_iter()
+        .map(|(guid, _)| guid)
+        .collect();
+    capped.sort();
+    assert_eq!(capped, vec!["leased".to_owned(), "retrying".to_owned()]);
     // Failed rows resend and fail no more.
     assert!(!db.wait(note_resend(db.db(), "old", now)).unwrap());
     assert_eq!(
