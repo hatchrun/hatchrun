@@ -33,8 +33,10 @@ checks `X-Hub-Signature-256` against `GITHUB_WEBHOOK_SECRET`, then:
 - `installation` events link a tenant to its installation, or unlink it
   when the App is uninstalled or suspended.
 
-The answer is `hatchrun-ci`'s, so a failed delivery can be redelivered
-by GitHub.
+The answer is `hatchrun-ci`'s: 202 once the delivery is stored, 200 for
+a copy of one already stored, and 503 when it could not be stored, so
+GitHub or the operator sends it again. A delivery whose planning failed
+can be redelivered from GitHub and is planned again.
 
 ## Health
 

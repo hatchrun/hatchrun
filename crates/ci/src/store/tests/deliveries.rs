@@ -10,7 +10,9 @@ fn concurrent_copies_of_one_delivery_store_once() {
     // Long enough that base64 would wrap it every 76 characters: the
     // payload must come back whole.
     let payload: Vec<u8> = (0..=u8::MAX).cycle().take(500).collect();
-    // Both copies arrive at once: exactly one stores.
+    // Both copies on one connection: exactly one stores. The overlap
+    // of two connections is in
+    // copies_on_two_connections_store_claim_and_restart_once.
     let (first, second) = db.wait(async {
         futures_util::join!(
             accept_delivery(db.db(), "g", "push", &payload, 1_000),
@@ -18,7 +20,7 @@ fn concurrent_copies_of_one_delivery_store_once() {
         )
     });
     assert_ne!(first.unwrap(), second.unwrap());
-    // Both consumers claim at once: exactly one plans.
+    // Both consumers claim: exactly one plans.
     let (first, second) = db.wait(async {
         futures_util::join!(
             claim_delivery(db.db(), "g", 1_002),
@@ -444,4 +446,84 @@ fn resends_count_toward_the_cap_and_capped_deliveries_fail() {
         db.wait(fail_capped_deliveries(db.db(), now)).unwrap(),
         Vec::<(String, String)>::new()
     );
+}
+
+/// Runs `second` on `other` while `db` holds an open transaction, which
+/// commits after 200 ms. Returns what `second` gave and how long it
+/// took: at least the 200 ms when it waited on the transaction's row.
+fn overlapped<T>(
+    db: &TestDb,
+    second: impl std::future::Future<Output = T>,
+) -> (T, std::time::Duration) {
+    db.wait(async {
+        let started = std::time::Instant::now();
+        let (out, ()) = futures_util::join!(
+            async {
+                let out = second.await;
+                (out, started.elapsed())
+            },
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                db.db().run("COMMIT", &[]).await.unwrap();
+            }
+        );
+        out
+    })
+}
+
+#[test]
+fn copies_on_two_connections_store_claim_and_restart_once() {
+    let db = setup();
+    let config: tokio_postgres::Config = hatchrun_cloud::testdb::url().parse().unwrap();
+    let other = db.connect(&config);
+    let waited = std::time::Duration::from_millis(150);
+
+    // Two copies arrive: the second waits for the first's insert and
+    // stores nothing.
+    db.run("BEGIN", &[]);
+    assert!(
+        db.wait(accept_delivery(db.db(), "g", "push", b"{}", 1_000))
+            .unwrap()
+    );
+    let (copy, took) = overlapped(&db, accept_delivery(&other, "g", "push", b"{}", 1_001));
+    assert!(!copy.unwrap());
+    assert!(took >= waited, "{took:?}");
+
+    // Two consumers claim it: the second waits for the first's claim
+    // and gets nothing.
+    db.run("BEGIN", &[]);
+    let claim = db
+        .wait(claim_delivery(db.db(), "g", 1_002))
+        .unwrap()
+        .unwrap();
+    let (second, took) = overlapped(&db, claim_delivery(&other, "g", 1_002));
+    assert!(second.unwrap().is_none());
+    assert!(took >= waited, "{took:?}");
+
+    // It fails, and two redeliveries arrive: it starts over once.
+    assert!(
+        db.wait(finish_delivery(
+            db.db(),
+            "g",
+            claim.attempts,
+            "failed",
+            Some("boom"),
+            1_003
+        ))
+        .unwrap()
+    );
+    db.run("BEGIN", &[]);
+    assert!(
+        db.wait(accept_delivery(db.db(), "g", "push", b"{}", 1_004))
+            .unwrap()
+    );
+    let (copy, took) = overlapped(&db, accept_delivery(&other, "g", "push", b"{}", 1_004));
+    assert!(!copy.unwrap());
+    assert!(took >= waited, "{took:?}");
+    let state: Option<String> = db.column(
+        "SELECT state AS s FROM ci_deliveries WHERE guid = 'g'",
+        &[],
+        "s",
+    );
+    assert_eq!(state.as_deref(), Some("received"));
 }

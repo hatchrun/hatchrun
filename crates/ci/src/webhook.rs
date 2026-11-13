@@ -301,11 +301,12 @@ fn gate(tenant: Option<TenantRow>) -> std::result::Result<TenantRow, &'static st
 /// call and inserts no run.
 ///
 /// A duplicate delivery is answered 200: it is already stored, and the
-/// consumer plans it once.
+/// consumer plans it once. A failed delivery sent again is planned
+/// again from the payload that came.
 ///
 /// # Errors
 ///
-/// The body cannot be read at all.
+/// A response cannot be built.
 pub async fn handle(mut req: Request, env: &Env) -> Result<Response> {
     let secret = match env.secret(WEBHOOK_SECRET) {
         Ok(secret) => secret.to_string(),
@@ -314,13 +315,28 @@ pub async fn handle(mut req: Request, env: &Env) -> Result<Response> {
             String::new()
         }
     };
+    // Without the secret nothing can be verified: the Worker is down for
+    // every delivery, and GitHub or the operator sends them again.
     if secret.is_empty() {
-        return Response::error("no GITHUB_WEBHOOK_SECRET", 500);
+        return retry_later();
     }
-    let signature = req.headers().get("X-Hub-Signature-256")?;
-    let kind = req.headers().get("X-GitHub-Event")?.unwrap_or_default();
-    let guid = req.headers().get("X-GitHub-Delivery")?.unwrap_or_default();
-    let body = req.bytes().await?;
+    let header = |name: &str| req.headers().get(name);
+    let (Ok(signature), Ok(kind), Ok(guid)) = (
+        header("X-Hub-Signature-256"),
+        header("X-GitHub-Event"),
+        header("X-GitHub-Delivery"),
+    ) else {
+        worker::console_error!("webhook: the headers did not read");
+        return retry_later();
+    };
+    let (kind, guid) = (kind.unwrap_or_default(), guid.unwrap_or_default());
+    let body = match req.bytes().await {
+        Ok(body) => body,
+        Err(err) => {
+            worker::console_error!("webhook {kind} {guid}: body: {err}");
+            return retry_later();
+        }
+    };
     if !verify(secret.as_bytes(), &body, signature.as_deref()) {
         return Response::error("bad signature", 401);
     }
@@ -358,9 +374,10 @@ fn retry_later() -> Result<Response> {
 /// What storing a delivery found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Intake {
-    /// Already stored: the consumer plans it once.
+    /// Already stored and not failed: the consumer plans it once.
     Duplicate,
-    /// Stored and sent to the queue.
+    /// Stored, or a failed delivery started over, and sent to the
+    /// queue.
     Accepted,
 }
 
@@ -392,7 +409,8 @@ impl Enqueue for QueueSender<'_> {
 
 /// Stores one verified delivery and sends it for planning: the first
 /// statement inserts it as `received`, so concurrent copies store it
-/// once. A duplicate stores nothing. A queue send that fails is logged
+/// once. A duplicate stores nothing, unless the stored delivery failed:
+/// a redelivery of it starts over and is planned again. A queue send that fails is logged
 /// and still accepted: the reconciler sends the stored delivery again.
 ///
 /// # Errors
@@ -2927,6 +2945,82 @@ mod tests {
         // Still stored: the reconciler sends it again.
         assert_eq!(
             db.wait(intake(db.db(), &queue, "g2", "push", b"{}", 2_001))
+                .unwrap(),
+            Intake::Duplicate
+        );
+    }
+
+    #[test]
+    fn a_failed_delivery_sent_again_is_planned_again() {
+        let db = TestDb::new();
+        let queue = FakeQueue::working();
+        db.wait(intake(db.db(), &queue, "g3", "push", b"{}", 3_000))
+            .unwrap();
+        let claim = db
+            .wait(store::claim_delivery(db.db(), "g3", 3_001))
+            .unwrap()
+            .unwrap();
+        assert!(
+            db.wait(store::finish_delivery(
+                db.db(),
+                "g3",
+                claim.attempts,
+                "failed",
+                Some("boom"),
+                3_002,
+            ))
+            .unwrap()
+        );
+        // The operator redelivers it from GitHub, twice at once: it
+        // starts over once, with the payload that came.
+        let (first, second) = db.wait(async {
+            futures_util::join!(
+                intake(db.db(), &queue, "g3", "push", br#"{"again":1}"#, 3_003),
+                intake(db.db(), &queue, "g3", "push", br#"{"again":1}"#, 3_003),
+            )
+        });
+        let mut answers = vec![first.unwrap(), second.unwrap()];
+        answers.sort_by_key(|answer| *answer == Intake::Accepted);
+        assert_eq!(answers, vec![Intake::Duplicate, Intake::Accepted]);
+        assert_eq!(*queue.sent.borrow(), vec!["g3".to_owned(), "g3".to_owned()]);
+        let again = db
+            .wait(store::claim_delivery(db.db(), "g3", 3_004))
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.payload, br#"{"again":1}"#);
+        // The token keeps growing: the failed claim's cannot end this one.
+        assert_eq!(again.attempts, claim.attempts + 1);
+        assert!(
+            !db.wait(store::finish_delivery(
+                db.db(),
+                "g3",
+                claim.attempts,
+                "failed",
+                Some("stale"),
+                3_004,
+            ))
+            .unwrap()
+        );
+        let error: Option<Option<String>> = db.column(
+            "SELECT error AS e FROM ci_deliveries WHERE guid = 'g3'",
+            &[],
+            "e",
+        );
+        assert_eq!(error, Some(None));
+        // A done delivery sent again stays done.
+        assert!(
+            db.wait(store::finish_delivery(
+                db.db(),
+                "g3",
+                again.attempts,
+                "done",
+                None,
+                3_005,
+            ))
+            .unwrap()
+        );
+        assert_eq!(
+            db.wait(intake(db.db(), &queue, "g3", "push", b"{}", 3_006))
                 .unwrap(),
             Intake::Duplicate
         );
