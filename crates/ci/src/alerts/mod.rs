@@ -73,6 +73,8 @@ const FAILING_PASSES: usize = 5;
 const STALE: u64 = 5 * MINUTE;
 /// How long a failed launch keeps its alert firing.
 const FAILED_LAUNCHES_FOR: u64 = 60 * MINUTE;
+/// How long a failed delivery keeps its alert firing.
+const FAILED_DELIVERIES_FOR: u64 = 60 * MINUTE;
 /// How long a low rate limit keeps its alert firing. GitHub's limit
 /// resets every hour.
 const RATE_LIMITS_FOR: u64 = 15 * MINUTE;
@@ -94,6 +96,9 @@ pub(crate) enum Key {
     ReconcilerFailing,
     /// A launch message reached the dead-letter queue.
     LaunchFailed,
+    /// A stored webhook delivery failed: its planning said it cannot
+    /// succeed, or it ran out of claims and resends.
+    DeliveryFailed,
     /// GitHub refused a request for the rate limit, or an installation
     /// has little left.
     RateLimit,
@@ -109,6 +114,7 @@ impl Key {
         match self {
             Key::ReconcilerFailing => "ci_reconciler_failing",
             Key::LaunchFailed => "ci_launch_failed",
+            Key::DeliveryFailed => "ci_delivery_failed",
             Key::RateLimit => "ci_github_rate_limit",
             Key::DatabaseConnections => "ci_database_connections",
         }
@@ -120,6 +126,7 @@ fn title(key: &str) -> &str {
     match key {
         "ci_reconciler_failing" => "CI reconciler failing",
         "ci_launch_failed" => "CI launch failed for good",
+        "ci_delivery_failed" => "CI webhook delivery failed",
         "ci_github_rate_limit" => "CI GitHub rate limit",
         "ci_database_connections" => "Database connections near the limit",
         other => other,

@@ -24,6 +24,7 @@ flate2 = { version = "1.1.10", default-features = false, features = ["rust_backe
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 hatchrun-cloud = { path = "../cloud", default-features = false }
 hatchrun-scaler-core = { path = "../scaler-core" }
+hex = "0.4.3"
 hatchrun-workflow = { path = "../workflow" }
 hmac = "0.13.0"
 js-sys = "0.3.106"

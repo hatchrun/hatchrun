@@ -12,16 +12,18 @@ use hatchrun_cloud::github::RateLimit;
 use serde::Deserialize;
 use worker::{Env, SendEmail, SendEmailBuilder, console_error};
 
-use super::checks::{Database, Facts, FailedLaunch, PassRecord, check, failed_launches};
+use super::checks::{
+    Database, Facts, FailedDelivery, FailedLaunch, PassRecord, check, failed_launches,
+};
 use super::health::{HealthRow, history};
 use super::queries::{
-    DATABASE, DELETE_FAILED, DELETE_RATE_LIMITS, FAILED_SINCE, LOW_SINCE, NOTE_RATE_LIMIT,
-    RECORD_FAILED, RECORD_UNREADABLE,
+    DATABASE, DELETE_FAILED, DELETE_RATE_LIMITS, FAILED_DELIVERIES_SINCE, FAILED_SINCE, LOW_SINCE,
+    NOTE_RATE_LIMIT, RECORD_FAILED, RECORD_UNREADABLE,
 };
 use super::{
-    Alert, BINDING, DELETE_BATCH, Email, FAILED_LAUNCH_MEMORY, FAILED_LAUNCHES_FOR, FROM, HISTORY,
-    Key, LISTED, Mail, RATE_LIMIT_MEMORY, RATE_LIMITS_FOR, Seen, State, Store, TO, settle,
-    settle_pass,
+    Alert, BINDING, DELETE_BATCH, Email, FAILED_DELIVERIES_FOR, FAILED_LAUNCH_MEMORY,
+    FAILED_LAUNCHES_FOR, FROM, HISTORY, Key, LISTED, Mail, RATE_LIMIT_MEMORY, RATE_LIMITS_FOR,
+    Seen, State, Store, TO, settle, settle_pass,
 };
 
 /// Every alert.
@@ -270,6 +272,16 @@ pub(crate) async fn after_pass(env: &Env, db: &Db, now: u64, errors: u32) {
                     .and_then(|row| row.ok_or_else(|| "no row".to_owned())),
             ),
             failed: logged("failed launches", recent_failures(db, now).await),
+            failed_deliveries: logged(
+                "failed deliveries",
+                since::<FailedDelivery>(
+                    db,
+                    FAILED_DELIVERIES_SINCE,
+                    now.saturating_sub(FAILED_DELIVERIES_FOR),
+                    LISTED + 1,
+                )
+                .await,
+            ),
             rate_limits: logged(
                 "rate limits",
                 since(db, LOW_SINCE, now.saturating_sub(RATE_LIMITS_FOR), LISTED).await,

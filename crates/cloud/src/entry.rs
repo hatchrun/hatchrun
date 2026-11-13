@@ -85,23 +85,26 @@ async fn forward_api(env: &Env, req: Request) -> Result<Response> {
 
 /// Sends the delivery on to `hatchrun-ci` as it came: the same body and
 /// the signature, event and delivery headers. Its answer goes back
-/// unchanged, so a failure there is a failed delivery that GitHub or the
-/// redelivery pass asks for again.
+/// unchanged: `hatchrun-ci` answers 202 once it stores the delivery and
+/// plans it from its queue, and a 503 means the delivery is not stored,
+/// so GitHub sends it again.
 async fn forward(env: &Env, req: &mut Request) -> Result<Response> {
     let Ok(ci) = env.service(CI) else {
-        return Ok(
-            Response::from_json(&serde_json::json!({ "ignored": "no CI service" }))?
-                .with_status(202),
-        );
+        return error("no CI service", 503);
     };
     let headers = Headers::new();
     for name in ["X-Hub-Signature-256", "X-GitHub-Event", "X-GitHub-Delivery"] {
-        if let Some(value) = req.headers().get(name)? {
+        let Ok(value) = req.headers().get(name) else {
+            return error("the headers did not read", 503);
+        };
+        if let Some(value) = value {
             headers.set(name, &value)?;
         }
     }
     headers.set("Content-Type", "application/json")?;
-    let body = req.bytes().await?;
+    let Ok(body) = req.bytes().await else {
+        return error("the body did not read", 503);
+    };
     let mut init = worker::RequestInit::new();
     init.with_method(Method::Post)
         .with_headers(headers)
@@ -225,19 +228,31 @@ const INSTALLED: &str =
     "UPDATE tenants SET installation_id = $1, updated_at = $3 WHERE org_id = $2";
 
 async fn github_webhook(mut req: Request, env: Env) -> Result<Response> {
-    if forwarded(&req.headers().get("X-GitHub-Event")?.unwrap_or_default()) {
+    let Ok(event) = req.headers().get("X-GitHub-Event") else {
+        return error("the headers did not read", 503);
+    };
+    if forwarded(&event.unwrap_or_default()) {
         return forward(&env, &mut req).await;
     }
     let secret = env
         .secret(WEBHOOK_SECRET)
         .map(|secret| secret.to_string())
         .unwrap_or_default();
+    // Without the secret nothing can be verified: down for every
+    // delivery, so GitHub or the operator sends them again.
     if secret.is_empty() {
-        return error("no GITHUB_WEBHOOK_SECRET", 500);
+        return error("no GITHUB_WEBHOOK_SECRET", 503);
     }
-    let signature = req.headers().get("X-Hub-Signature-256")?;
-    let kind = req.headers().get("X-GitHub-Event")?.unwrap_or_default();
-    let body = req.bytes().await?;
+    let (Ok(signature), Ok(kind)) = (
+        req.headers().get("X-Hub-Signature-256"),
+        req.headers().get("X-GitHub-Event"),
+    ) else {
+        return error("the headers did not read", 503);
+    };
+    let kind = kind.unwrap_or_default();
+    let Ok(body) = req.bytes().await else {
+        return error("the body did not read", 503);
+    };
     if !webhook::verify(secret.as_bytes(), &body, signature.as_deref()) {
         return error("bad signature", 401);
     }

@@ -64,6 +64,9 @@ use crate::store::{self, Claim, GateStatus, JobRow, Standing};
 use crate::token::{self, Claims};
 use crate::trust::Trust;
 
+/// The queue in `wrangler.toml`.
+pub const QUEUE: &str = "hatchrun-ci-launches";
+
 /// The dead-letter queue in `wrangler.toml`.
 pub const DEAD_LETTERS: &str = "hatchrun-ci-launches-dlq";
 
@@ -199,8 +202,10 @@ fn now_ms() -> u64 {
 
 /// The consumer of `hatchrun-ci-launches`: launches a batch's jobs side
 /// by side, acking each message once the job's launch is decided and
-/// retrying it when nothing was.
-pub async fn consume(batch: MessageBatch<LaunchMessage>, env: Env) {
+/// retrying it when nothing was. A message that does not read as a
+/// launch is retried: it runs out of retries into the dead-letter
+/// queue, which records it.
+pub async fn consume(batch: MessageBatch<Value>, env: Env) {
     let messages = match batch.messages() {
         Ok(messages) => messages,
         Err(err) => {
@@ -217,25 +222,43 @@ pub async fn consume(batch: MessageBatch<LaunchMessage>, env: Env) {
             return;
         }
     };
-    let results = join_all(
-        messages
-            .iter()
-            .map(|message| launch(&env, &settings, &backend, *message.body())),
-    )
+    let decoded: Vec<Option<LaunchMessage>> = messages
+        .iter()
+        .map(
+            |message| match serde_json::from_value(message.body().clone()) {
+                Ok(inner) => Some(inner),
+                Err(err) => {
+                    console_error!("launch queue: unreadable message {}: {err}", message.id());
+                    None
+                }
+            },
+        )
+        .collect();
+    let results = join_all(decoded.iter().map(|decoded| async {
+        match decoded {
+            Some(message) => launch(&env, &settings, &backend, *message).await,
+            // Retried below; the dead-letter consumer records it.
+            None => Err(String::new()),
+        }
+    }))
     .await;
     let delay = redeliver_delay();
-    for (message, result) in messages.iter().zip(results) {
+    for (message, (decoded, result)) in messages.iter().zip(decoded.iter().zip(results.iter())) {
+        let Some(inner) = decoded else {
+            message.retry_with_options(&delay);
+            continue;
+        };
         match result {
             Ok(()) => message.ack(),
             // A second message for a job that is mid-launch is normal: a
             // wake and the original, or a reconciler requeue. It waits
             // its turn and is not an error.
             Err(err) if err == STILL_LAUNCHING => {
-                console_log!("launch queue: job {}: {err}", message.body().job_id);
+                console_log!("launch queue: job {}: {err}", inner.job_id);
                 message.retry_with_options(&delay);
             }
             Err(err) => {
-                console_error!("launch queue: job {}: {err}", message.body().job_id);
+                console_error!("launch queue: job {}: {err}", inner.job_id);
                 message.retry_with_options(&delay);
             }
         }
@@ -1034,63 +1057,65 @@ pub(crate) async fn end_job(env: &Env, db: &Db, job: &JobRow, message: &str) -> 
 /// and left unacked, which the queue counts as done, since no job can be
 /// named; a job that cannot be ended is retried, and so is the whole
 /// batch when the failures cannot be recorded.
-pub async fn dead_letters(batch: MessageBatch<LaunchMessage>, env: Env) {
-    let mut messages = Vec::new();
-    let mut unreadable = Vec::new();
-    for raw in batch.raw_iter() {
-        let id = raw.id();
-        let raw_body = raw.body();
-        match worker::Message::<LaunchMessage>::try_from(raw) {
-            Ok(message) => messages.push(message),
+pub async fn dead_letters(batch: MessageBatch<Value>, env: Env) {
+    let raw = match batch.messages() {
+        Ok(messages) => messages,
+        Err(err) => {
+            console_error!("launch dead letters: unreadable batch: {err}");
+            batch.retry_all();
+            return;
+        }
+    };
+    let mut messages: Vec<(worker::Message<Value>, LaunchMessage)> = Vec::new();
+    let mut unreadable: Vec<(String, String)> = Vec::new();
+    for message in raw {
+        match serde_json::from_value::<LaunchMessage>(message.body().clone()) {
+            Ok(inner) => messages.push((message, inner)),
             Err(err) => {
-                let body = js_sys::JSON::stringify(&raw_body)
-                    .ok()
-                    .and_then(|text| text.as_string())
-                    .unwrap_or_default();
-                console_error!("launch dead letters: unreadable message {id}: {err}");
-                unreadable.push((id, alerts::unreadable(&err.to_string(), &body)));
+                let body = message.body().to_string();
+                console_error!(
+                    "launch dead letters: unreadable message {}: {err}",
+                    message.id()
+                );
+                unreadable.push((message.id(), alerts::unreadable(&err.to_string(), &body)));
             }
         }
     }
-    if let Err(err) = record_failures(&env, &messages, &unreadable).await {
+    let failed: Vec<(String, u64)> = messages
+        .iter()
+        .map(|(message, inner)| (message.id(), inner.job_id))
+        .collect();
+    if let Err(err) = record_failures(&env, &failed, &unreadable).await {
         // Nothing is acked, so the queue delivers the batch again and
         // the alert still gets its chance.
         console_error!("launch dead letters: alert: {err}");
         batch.retry_all();
         return;
     }
-    let results = join_all(
-        messages
-            .iter()
-            .map(|message| dead_letter(&env, *message.body())),
-    )
-    .await;
-    for (message, result) in messages.iter().zip(results) {
+    let results = join_all(messages.iter().map(|(_, inner)| dead_letter(&env, *inner))).await;
+    for ((message, inner), result) in messages.iter().zip(results) {
         match result {
             Ok(()) => message.ack(),
             Err(err) => {
-                console_error!("launch dead letters: job {}: {err}", message.body().job_id);
+                console_error!("launch dead letters: job {}: {err}", inner.job_id);
                 message.retry();
             }
         }
     }
 }
 
-/// Records the launches of `messages` and the `unreadable` ones, and
-/// fires the failed launch alert before the jobs are ended, so the job's
-/// error is still the launch's. A failure to record is returned: the
-/// batch is then retried, since acking it would lose the alert.
+/// Records the launches of `failed`, as `(message id, job id)`, and
+/// the `unreadable` ones, and fires the failed launch alert before the
+/// jobs are ended, so the job's error is still the launch's. A failure
+/// to record is returned: the batch is then retried, since acking it
+/// would lose the alert.
 async fn record_failures(
     env: &Env,
-    messages: &[worker::Message<LaunchMessage>],
+    failed: &[(String, u64)],
     unreadable: &[(String, String)],
 ) -> Result<(), String> {
-    let failed: Vec<(String, u64)> = messages
-        .iter()
-        .map(|message| (message.id(), message.body().job_id))
-        .collect();
     let db = Db::connect(env).await.map_err(|err| err.to_string())?;
-    alerts::launches_failed(env, &db, now_ms(), &failed, unreadable).await
+    alerts::launches_failed(env, &db, now_ms(), failed, unreadable).await
 }
 
 async fn dead_letter(env: &Env, message: LaunchMessage) -> Result<(), String> {

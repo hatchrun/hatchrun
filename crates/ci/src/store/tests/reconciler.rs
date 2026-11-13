@@ -84,17 +84,36 @@ fn sweep_returns_expired_runs_and_keeps_them_until_deleted() {
         .unwrap()
         .unwrap();
     let now = 1_000 + 31 * DAY;
-    db.wait(record_delivery(db.db(), "old", "push", 1_000))
-        .unwrap();
-    db.wait(record_delivery(db.db(), "fresh", "push", now - DAY))
-        .unwrap();
+    let payload = b"{}";
+    assert!(
+        db.wait(accept_delivery(db.db(), "old", "push", payload, 1_000))
+            .unwrap()
+    );
+    assert!(
+        db.wait(accept_delivery(
+            db.db(),
+            "fresh",
+            "push",
+            payload,
+            now - DAY
+        ))
+        .unwrap()
+    );
     // A run nobody deleted is returned again.
     for _ in 0..2 {
         assert_eq!(db.wait(sweep(db.db(), now)).unwrap(), vec![old.id]);
         assert!(db.wait(run(db.db(), old.id)).unwrap().is_some());
     }
-    assert!(!db.wait(delivery_seen(db.db(), "old")).unwrap());
-    assert!(db.wait(delivery_seen(db.db(), "fresh")).unwrap());
+    // The sweep deletes delivery ids older than 30 days: storing `old`
+    // again is new, while `fresh` is still stored.
+    assert!(
+        db.wait(accept_delivery(db.db(), "old", "push", payload, now))
+            .unwrap()
+    );
+    assert!(
+        !db.wait(accept_delivery(db.db(), "fresh", "push", payload, now))
+            .unwrap()
+    );
     db.wait(delete_runs(db.db(), &[old.id])).unwrap();
     assert!(db.wait(run(db.db(), old.id)).unwrap().is_none());
     assert!(db.wait(run(db.db(), fresh.id)).unwrap().is_some());

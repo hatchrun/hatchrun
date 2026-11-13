@@ -17,6 +17,7 @@ mod billing;
 mod browse;
 mod cache;
 mod concurrency;
+mod deliveries;
 mod environments;
 mod forks;
 mod installation;
@@ -52,6 +53,10 @@ pub use self::concurrency::{
     Blocker, NewSlot, Slot, Victim, blocker, enter, leave, register, slots, unfinished_superseded,
     victims, wake_targets,
 };
+pub use self::deliveries::{
+    DeliveryClaim, LEASE_MS, MAX_ATTEMPTS, RECEIVED_STALE_MS, accept_delivery, claim_delivery,
+    fail_capped_deliveries, finish_delivery, note_resend, release_delivery, stale_deliveries,
+};
 pub use self::environments::{
     EnvironmentRow, JobEnvironment, OrgEnvironment, PutEnvironment, decide_approval,
     delete_environment, environment, environments, job_environment, org_environments,
@@ -84,7 +89,7 @@ pub use self::reconciler::{
     SWEEP_LIMIT, ScheduleRow, defer_runs, delete_runs, last_minute, lease, replace_schedules,
     schedules, schedules_after, set_last_minute, stalled_jobs, sweep,
 };
-pub use self::repos::{RepoRow, delivery_seen, record_delivery, repo, repo_by_name, upsert_repo};
+pub use self::repos::{RepoRow, repo, repo_by_name, upsert_repo};
 pub use self::runs::{
     After, Bucket, Chat, CommentCommand, GateStatus, ListedRun, NewRun, RunCounts, RunFilter,
     RunRow, RunStatus, active_comment_runs, activity, finish_run, insert_run, job_load,
@@ -100,17 +105,14 @@ pub use self::tenants::{
     CiBilling, TenantRow, has_card, tenant, tenant_by_org_id, tenant_for_installation,
 };
 
-use hatchrun_cloud::db::{Db, Param};
+#[cfg(test)]
+use hatchrun_cloud::db::Db;
+#[cfg(test)]
 use worker::Result;
 
 /// `sql` with its `{columns}` filled in.
 fn with_columns(sql: &str, columns: &str) -> String {
     sql.replace("{columns}", columns)
-}
-
-/// Whether a one-column `seen` query found a row.
-async fn exists(db: &Db, sql: &str, params: &[Param]) -> Result<bool> {
-    Ok(db.rows(sql, params).await?.into_iter().next().is_some())
 }
 
 #[cfg(test)]
