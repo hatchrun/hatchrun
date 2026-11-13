@@ -700,19 +700,26 @@ until api "runs/$wide_run" | jq -e --arg id "$held" \
 done
 wait_checks "$wide_sha" 6 'all(.status == "completed" and .conclusion == "success")'
 log "wide: all six passed"
-# Each completed job's billed seconds go to Polar, keyed by job and attempt,
-# on a reconciler pass.
-usage_ids="$(api "runs/$wide_run" | jq -c '[.jobs[] | "ci:\(.id):1"]')"
-deadline=$((SECONDS + 60))
-until curl -fsS "$GITHUB/_state" | jq -e --argjson ids "$usage_ids" --arg tenant "$TENANT" '
-  [.polar_events[] | select(.name == "ci.usage" and .external_customer_id == $tenant
-    and .metadata.template == "ubuntu-latest" and .metadata.seconds >= 60 and .metadata.units == .metadata.seconds) | .external_id] as $sent
-  | all($ids[]; . as $id | $sent | index([$id]))
-' >/dev/null; do
-  ((SECONDS < deadline)) || die "Polar lacks usage for $usage_ids: $(curl -fsS "$GITHUB/_state" | jq -c .polar_events)"
+# A window closes only after its slot ends plus 2 min of grace, so
+# move the tenant's open rows back in time, then pass the reconciler
+# until it bills every one of the tenant's usage rows.
+psql_run -c "UPDATE ci_usage SET ended_at = ended_at - 1800000 \
+  WHERE tenant_id = '$TENANT' AND window_id IS NULL AND sent_at IS NULL"
+deadline=$((SECONDS + 120))
+until [[ "$(psql_run -At -c "SELECT count(*) FROM ci_usage \
+  WHERE tenant_id = '$TENANT' AND sent_at IS NULL")" == 0 ]]; do
+  ((SECONDS < deadline)) || die "usage of $TENANT never billed: $(curl -fsS "$GITHUB/_state" | jq -c .polar_events)"
   curl -fsS -o /dev/null "$CI/__scheduled?cron=*+*+*+*+*" || die "the reconciler pass failed"
   sleep 2
 done
+# One event per tenant window, each billed once, for the rows' units.
+units="$(psql_run -At -c "SELECT COALESCE(SUM(units), 0) FROM ci_usage WHERE tenant_id = '$TENANT'")"
+curl -fsS "$GITHUB/_state" | jq -e --arg tenant "$TENANT" --argjson units "$units" '
+  [.polar_events[] | select(.name == "ci.usage" and .external_customer_id == $tenant)] as $events
+  | ($events | length > 0)
+  and (($events | map(.external_id) | unique | length) == ($events | length))
+  and ([$events[].metadata.units] | add == $units)
+' >/dev/null || die "Polar lacks $units units of $TENANT: $(curl -fsS "$GITHUB/_state" | jq -c .polar_events)"
 log "wide: Polar has the usage of all six"
 
 # Scenario: a push to serial runs a matrix of three legs with

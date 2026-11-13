@@ -60,6 +60,7 @@ pub mod tenant;
 pub mod testdb;
 pub mod time;
 pub mod tokens;
+pub mod usage;
 pub mod webcrypto;
 pub mod webhook;
 

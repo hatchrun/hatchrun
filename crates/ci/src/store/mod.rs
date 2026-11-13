@@ -34,8 +34,8 @@ pub use self::artifacts::{
 };
 pub use self::audit::{Action, AuditRow, NewAudit, audit_page, record_audit};
 pub use self::billing::{
-    DayUsage, Standing, UnsentUsage, daily_usage, set_spend_cap, standing, tenant_standing,
-    unsent_usage, usage_rejected, usage_sent,
+    DayUsage, Standing, UnsentWindow, close_windows, daily_usage, set_spend_cap, standing,
+    tenant_standing, unsent_windows, windows_rejected, windows_sent,
 };
 pub use self::browse::{
     BranchAfter, BranchRow, NewPull, PullAfter, PullHead, PullRow, PullWrite, RepoCounts,
