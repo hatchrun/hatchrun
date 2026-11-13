@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::checks::{MAX_TOTAL_ANNOTATIONS, Outbox, StepView};
 use crate::github::{self, CheckRun, Output};
-use crate::graph::{Graph, Node, State as NodeState};
+use crate::graph::{Action, Graph, Node, State as NodeState};
 use crate::logs::LogWriter;
 
 use super::{
@@ -416,6 +416,38 @@ pub(crate) fn again_work(rows: &[u64], attempt: u32) -> Vec<super::Work> {
 /// Each job's row id and attempt.
 pub(super) fn attempts(graph: &Graph) -> Vec<(u64, u32)> {
     graph.jobs.iter().map(|n| (n.id, n.attempt)).collect()
+}
+
+/// What a rerun did to the graph: the actions it asked for, the jobs'
+/// attempts before it and the jobs it reset with their new attempt.
+pub(crate) struct Rerun {
+    pub actions: Vec<Action>,
+    pub before: Vec<(u64, u32)>,
+    pub reset: Vec<(u64, u32)>,
+}
+
+/// Reruns `job` for webhook delivery `delivery`. `None` when it resets
+/// nothing: the delivery's rerun reset jobs already, so a replay of it
+/// leaves the graph as it is, or no job of the run could be reset. The
+/// caller records the delivery in the run's info with the reset.
+pub(crate) fn rerun_once(
+    info: &RunInfo,
+    graph: &mut Graph,
+    job: u64,
+    delivery: &str,
+    github_ctx: &Value,
+) -> Option<Rerun> {
+    if info.reran_for(delivery) {
+        return None;
+    }
+    let before = attempts(graph);
+    let actions = graph.rerun(job, github_ctx);
+    let reset = reset_jobs(&before, graph);
+    (!reset.is_empty()).then_some(Rerun {
+        actions,
+        before,
+        reset,
+    })
 }
 
 /// The jobs whose attempt grew since `before`, with the new attempt.
@@ -1050,6 +1082,37 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
         let before = attempts(&g);
         let _ = g.rerun(2, &ctx);
         assert_eq!(reset_jobs(&before, &g), vec![(2, 2)]);
+    }
+
+    #[test]
+    fn a_replayed_rerun_delivery_resets_nothing() {
+        let mut g = graph();
+        let mut run = info();
+        let ctx = json!({ "ref": "refs/heads/main", "event": {} });
+        let failed = || JobResult {
+            conclusion: Conclusion::Failure,
+            outputs: std::collections::BTreeMap::new(),
+            steps: vec![],
+            annotations: vec![],
+            environment_url: None,
+        };
+        let _ = g.advance(&ctx);
+        g.running(1);
+        let _ = g.finished(1, failed(), &ctx);
+        // Delivery d1 reruns the failed run: job 2 starts attempt 2.
+        let first = rerun_once(&run, &mut g, 2, "d1", &ctx).unwrap();
+        assert_eq!(first.reset, vec![(2, 2)]);
+        run.note_rerun("d1");
+        // Attempt 2 ends, and the queue plans d1 again.
+        let _ = g.advance(&ctx);
+        g.running(1);
+        let _ = g.finished(1, failed(), &ctx);
+        let ended = attempts(&g);
+        assert!(rerun_once(&run, &mut g, 2, "d1", &ctx).is_none());
+        assert_eq!(attempts(&g), ended);
+        // A rerun from another delivery still starts attempt 3.
+        let second = rerun_once(&run, &mut g, 2, "d2", &ctx).unwrap();
+        assert_eq!(second.reset, vec![(2, 3)]);
     }
 
     #[test]

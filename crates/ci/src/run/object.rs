@@ -37,10 +37,10 @@ use crate::launches::{self, LaunchMessage};
 use crate::store;
 
 use super::decide::{
-    Delivery, Failed, Flushed, Gate, JobToken, again_work, apply_batch, apply_held, apply_result,
-    arm_chains, arm_todo, attempts, bounded_event, delivery, due, file_annotations, gate,
+    Delivery, Failed, Flushed, Gate, JobToken, Rerun, again_work, apply_batch, apply_held,
+    apply_result, arm_chains, arm_todo, bounded_event, delivery, due, file_annotations, gate,
     github_context, gives_up, job_document, left_out_work, minimal_check, next_alarm,
-    plan_is_current, record_flush, reschedule, reset_jobs, run_state, running_for,
+    plan_is_current, record_flush, rerun_once, reschedule, run_state, running_for,
     should_write_heartbeat, snapshot_ready, steps_json, take_drain,
 };
 use super::log::{events_message, log_keys, log_prefix, mark_upload_due, tail_key};
@@ -1699,21 +1699,21 @@ impl<'a> Cx<'a> {
             let Some(mut run) = self.loaded().await? else {
                 return answer(404);
             };
-            if run.info.reran_for(delivery) {
-                return answer(204);
-            }
             // A job a rerun left out of its matrix is no part of the run.
             if run.graph.node(job).is_some_and(|n| n.stale) {
                 return answer(409);
             }
             let ctx = self.github_ctx(&run.info).await?;
-            let before = attempts(&run.graph);
             self.load_vars(&mut run, job).await?;
-            let actions = run.graph_mut().rerun(job, &ctx);
-            let reset = reset_jobs(&before, &run.graph);
-            if reset.is_empty() {
+            let info = run.info.clone();
+            let Some(Rerun {
+                actions,
+                before,
+                reset,
+            }) = rerun_once(&info, run.graph_mut(), job, delivery, &ctx)
+            else {
                 return answer(204);
-            }
+            };
             // The jobs a matrix was read into leave the graph when their
             // producer runs again: a log of theirs that is not in R2 yet
             // would be lost.
