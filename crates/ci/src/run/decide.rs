@@ -756,21 +756,18 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_rerun_delivery_is_remembered_and_the_oldest_forgotten() {
+    fn a_rerun_delivery_is_remembered_however_many_follow() {
         let mut run = info();
         assert!(!run.reran_for("d0"));
         run.note_rerun("d0");
         assert!(run.reran_for("d0"));
-        for n in 1..=super::super::RERUN_DELIVERIES_KEPT {
+        // Many reruns later, a replay of the first still resets nothing.
+        for n in 1..=100 {
             run.note_rerun(&format!("d{n}"));
         }
-        assert_eq!(
-            run.rerun_deliveries.len(),
-            super::super::RERUN_DELIVERIES_KEPT
-        );
-        assert!(!run.reran_for("d0"));
-        assert!(run.reran_for("d1"));
-        assert!(run.reran_for(&format!("d{}", super::super::RERUN_DELIVERIES_KEPT)));
+        assert!(run.reran_for("d0"));
+        assert!(run.reran_for("d100"));
+        assert!(!run.reran_for("d101"));
         // A run stored before the field has none.
         let mut stored = serde_json::to_value(info()).unwrap();
         stored.as_object_mut().unwrap().remove("rerun_deliveries");
