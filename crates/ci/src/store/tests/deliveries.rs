@@ -527,3 +527,43 @@ fn copies_on_two_connections_store_claim_and_restart_once() {
     );
     assert_eq!(state.as_deref(), Some("received"));
 }
+
+#[test]
+fn a_delivery_at_the_cap_is_not_claimed_again() {
+    let db = setup();
+    db.wait(accept_delivery(db.db(), "g", "push", b"{}", 1_000))
+        .unwrap();
+    db.run(
+        "UPDATE ci_deliveries SET attempts = $1 WHERE guid = 'g'",
+        &[(MAX_ATTEMPTS - 1).into()],
+    );
+    // The last claim the cap allows, then a release for a queue retry.
+    let last = db
+        .wait(claim_delivery(db.db(), "g", 1_001))
+        .unwrap()
+        .unwrap();
+    assert_eq!(last.attempts, MAX_ATTEMPTS);
+    assert!(
+        db.wait(release_delivery(db.db(), "g", last.attempts, 1_002))
+            .unwrap()
+    );
+    // The retry message finds nothing to claim.
+    assert!(
+        db.wait(claim_delivery(db.db(), "g", 1_003))
+            .unwrap()
+            .is_none()
+    );
+    // Restarted after it failed, it is claimed again: the cap counts
+    // from the restart.
+    let now = 1_002 + RECEIVED_STALE_MS + RECEIVED_STALE_MS + 1;
+    assert_eq!(
+        db.wait(fail_capped_deliveries(db.db(), now)).unwrap().len(),
+        1
+    );
+    assert!(
+        db.wait(accept_delivery(db.db(), "g", "push", b"{}", now))
+            .unwrap()
+    );
+    let again = db.wait(claim_delivery(db.db(), "g", now)).unwrap().unwrap();
+    assert_eq!(again.attempts, MAX_ATTEMPTS + 1);
+}

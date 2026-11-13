@@ -2516,13 +2516,22 @@ impl Cx<'_> {
             }
             return Ok(Outcome::Ignored(reason.to_owned()));
         }
-        let url = format!(
-            "https://run/rerun?job={}&run={}&tenant={}&days={}",
-            job.id, run.id, run.tenant_id, run.retention_days
-        );
+        // The delivery goes along: the run resets nothing for one it
+        // reset jobs for already, should the queue plan it again.
+        let url = worker::Url::parse_with_params(
+            "https://run/rerun",
+            &[
+                ("job", job.id.to_string()),
+                ("run", run.id.to_string()),
+                ("tenant", run.tenant_id.clone()),
+                ("days", run.retention_days.to_string()),
+                ("delivery", self.delivery.to_owned()),
+            ],
+        )
+        .map_err(|err| fail(err.to_string()))?;
         let mut init = RequestInit::new();
         init.with_method(Method::Post);
-        let request = worker::Request::new_with_init(&url, &init)?;
+        let request = worker::Request::new_with_init(url.as_str(), &init)?;
         let response = run_stub(self.env, run.id)?
             .fetch_with_request(request)
             .await?;

@@ -92,9 +92,9 @@ pub struct DeliveryClaim {
 /// Claims delivery `guid` for planning: it becomes `planning` with a
 /// lease until `now + LEASE_MS`, and `attempts` grows by one. Only a
 /// `received` delivery, or a `planning` one whose lease ran out before
-/// `now`, can be claimed, so two consumers never plan one delivery.
-/// Returns `None` when there is nothing to claim. The payload comes
-/// back base64 as stored.
+/// `now`, can be claimed, so two consumers never plan one delivery. A
+/// delivery at [`MAX_ATTEMPTS`] is not claimed again: the reconciler
+/// fails it. Returns `None` when there is nothing to claim.
 ///
 /// # Errors
 ///
@@ -107,7 +107,10 @@ pub async fn claim_delivery(db: &Db, guid: &str, now: u64) -> Result<Option<Deli
         attempts: u64,
     }
     let row: Option<Row> = db
-        .first(CLAIM_DELIVERY, &params![guid, now + LEASE_MS, now])
+        .first(
+            CLAIM_DELIVERY,
+            &params![guid, now + LEASE_MS, now, MAX_ATTEMPTS],
+        )
         .await?;
     row.map(|row| {
         hex::decode(row.payload.unwrap_or_default())
@@ -268,10 +271,12 @@ const ACCEPT_DELIVERY: &str = "INSERT INTO ci_deliveries \
      RETURNING guid";
 
 /// Claims delivery `$1` until `$2` when it is `received`, or
-/// `planning` with its lease out before `$3`.
+/// `planning` with its lease out before `$3`, and claimed and resent
+/// fewer than `$4` times since it last started over.
 const CLAIM_DELIVERY: &str = "UPDATE ci_deliveries SET state = 'planning', lease_until = $2, \
      attempts = attempts + 1 WHERE guid = $1 \
      AND (state = 'received' OR (state = 'planning' AND lease_until < $3)) \
+     AND attempts - attempts_before < $4 \
      RETURNING event, encode(payload, 'hex') AS payload, attempts";
 
 /// Ends delivery `$1` as `$2` with error `$3` at `$5`, dropping the

@@ -430,8 +430,16 @@ impl<'a> Cx<'a> {
                 let Some(ident) = ident else {
                     return Response::error("a run and a tenant are needed", 400);
                 };
+                let delivery = req
+                    .url()?
+                    .query_pairs()
+                    .find(|(key, _)| key == "delivery")
+                    .map(|(_, value)| value.into_owned());
+                let Some(delivery) = delivery.filter(|d| !d.is_empty()) else {
+                    return Response::error("a delivery is needed", 400);
+                };
                 match self.restore_if_needed(&ident).await? {
-                    Held::Run => self.rerun(job).await,
+                    Held::Run => self.rerun(job, &delivery).await,
                     Held::Missing => answer(404),
                     Held::Other => answer(409),
                 }
@@ -1675,7 +1683,11 @@ impl<'a> Cx<'a> {
     /// A rerun starts every reset job's attempt from nothing: a new
     /// state (so its batches count from 1 again), its old token revoked,
     /// its log chunks dropped and its row set up for the new attempt.
-    async fn rerun(&self, job: u64) -> Result<Response> {
+    /// `delivery` is the webhook delivery that asked: one that reset jobs
+    /// before resets nothing again, since the delivery queue plans a
+    /// delivery again when its consumer stopped before finishing it. The
+    /// delivery is recorded with the reset, in the same commit.
+    async fn rerun(&self, job: u64, delivery: &str) -> Result<Response> {
         // A log that is not in R2 yet is uploaded first: the reset
         // deletes its chunks and its job row names its key.
         if let Err(err) = self.upload_logs(true).await {
@@ -1687,6 +1699,9 @@ impl<'a> Cx<'a> {
             let Some(mut run) = self.loaded().await? else {
                 return answer(404);
             };
+            if run.info.reran_for(delivery) {
+                return answer(204);
+            }
             // A job a rerun left out of its matrix is no part of the run.
             if run.graph.node(job).is_some_and(|n| n.stale) {
                 return answer(409);
@@ -1723,7 +1738,9 @@ impl<'a> Cx<'a> {
             }
             let attempt = run.info.run_attempt + 1;
             run.todo_mut().push(Work::ReopenRun { attempt });
-            run.info_mut().run_attempt = attempt;
+            let info = run.info_mut();
+            info.run_attempt = attempt;
+            info.note_rerun(delivery);
             let deadlines = run.deadlines_mut();
             deadlines.purge_at = None;
             deadlines.escalate_at = None;

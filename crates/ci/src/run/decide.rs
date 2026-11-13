@@ -751,7 +751,31 @@ pub(super) mod tests {
             warnings: Vec::new(),
             check_sha: None,
             command: None,
+            rerun_deliveries: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_rerun_delivery_is_remembered_and_the_oldest_forgotten() {
+        let mut run = info();
+        assert!(!run.reran_for("d0"));
+        run.note_rerun("d0");
+        assert!(run.reran_for("d0"));
+        for n in 1..=super::super::RERUN_DELIVERIES_KEPT {
+            run.note_rerun(&format!("d{n}"));
+        }
+        assert_eq!(
+            run.rerun_deliveries.len(),
+            super::super::RERUN_DELIVERIES_KEPT
+        );
+        assert!(!run.reran_for("d0"));
+        assert!(run.reran_for("d1"));
+        assert!(run.reran_for(&format!("d{}", super::super::RERUN_DELIVERIES_KEPT)));
+        // A run stored before the field has none.
+        let mut stored = serde_json::to_value(info()).unwrap();
+        stored.as_object_mut().unwrap().remove("rerun_deliveries");
+        let stored: RunInfo = serde_json::from_value(stored).unwrap();
+        assert_eq!(stored.rerun_deliveries, Vec::<String>::new());
     }
 
     pub(in crate::run) fn graph() -> Graph {

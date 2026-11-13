@@ -354,6 +354,7 @@ mod tests {
             warnings: Vec::new(),
             check_sha: None,
             command: None,
+            rerun_deliveries: Vec::new(),
         }
     }
 
