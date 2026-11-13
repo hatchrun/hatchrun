@@ -248,11 +248,12 @@ VALUES ('$TENANT', 1, 'e2e', $INSTALLATION, $now_ms, $now_ms),
        ('$LAPSED_TENANT', 2, 'e2e2', 43, $now_ms, $now_ms),
        ('$NEVER_TENANT', 3, 'e2e3', 44, $now_ms, $now_ms);
 INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id,
-                           cancel_at_period_end, modified_at, updated_at)
-VALUES ('sub-e2e', '$TENANT', 'active', 'cus-e2e', 'e2e-product', false,
-        '2026-01-01T00:00:00Z', $now_ms),
-       ('sub-e2e2', '$LAPSED_TENANT', 'canceled', 'cus-e2e2', 'e2e-product', false,
-        '2026-01-01T00:00:00Z', $now_ms);
+                           current_period_start, cancel_at_period_end, modified_at,
+                           updated_at)
+VALUES ('sub-e2e', '$TENANT', 'active', 'cus-e2e', 'e2e-product',
+        '2026-01-01T00:00:00Z', false, '2026-01-01T00:00:00Z', $now_ms),
+       ('sub-e2e2', '$LAPSED_TENANT', 'canceled', 'cus-e2e2', 'e2e-product',
+        '2026-01-01T00:00:00Z', false, '2026-01-01T00:00:00Z', $now_ms);
 SQL
 
 # 2. Binaries and keys.

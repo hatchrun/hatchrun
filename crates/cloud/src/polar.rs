@@ -394,6 +394,8 @@ pub struct Subscription {
     pub customer_id: String,
     /// The product subscribed to.
     pub product_id: String,
+    /// When the current period started, ISO 8601.
+    pub current_period_start: String,
     /// When the current period ends, ISO 8601.
     pub current_period_end: Option<String>,
     /// Whether it ends with the current period.
@@ -433,6 +435,7 @@ struct Data {
     status: String,
     customer_id: String,
     product_id: String,
+    current_period_start: String,
     current_period_end: Option<String>,
     #[serde(default)]
     cancel_at_period_end: bool,
@@ -477,6 +480,7 @@ pub fn parse(body: &[u8]) -> Result<Event, serde_json::Error> {
         status: data.status,
         customer_id: data.customer_id,
         product_id: data.product_id,
+        current_period_start: data.current_period_start,
         current_period_end: data.current_period_end,
         cancel_at_period_end: data.cancel_at_period_end,
         modified_at: data.modified_at.unwrap_or(data.created_at),
@@ -559,6 +563,7 @@ mod tests {
     fn reads_subscriptions() {
         let body = br#"{"type":"subscription.updated","timestamp":"2026-10-14T10:00:00Z","data":{
             "id":"sub_1","status":"active","customer_id":"cus_1","product_id":"prod_1",
+            "current_period_start":"2026-10-14T10:00:00Z",
             "current_period_end":"2026-11-14T10:00:00Z","cancel_at_period_end":true,
             "created_at":"2026-10-14T09:00:00Z","modified_at":"2026-10-14T10:00:00Z",
             "metadata":{"tenant_id":"abcdefgh12345678"},"customer":{"external_id":"other"}}}"#;
@@ -573,6 +578,7 @@ mod tests {
                 status: "active".to_owned(),
                 customer_id: "cus_1".to_owned(),
                 product_id: "prod_1".to_owned(),
+                current_period_start: "2026-10-14T10:00:00Z".to_owned(),
                 current_period_end: Some("2026-11-14T10:00:00Z".to_owned()),
                 cancel_at_period_end: true,
                 modified_at: "2026-10-14T10:00:00Z".to_owned(),
@@ -582,7 +588,8 @@ mod tests {
 
         let by_customer =
             br#"{"type":"subscription.revoked","data":{"id":"sub_1","status":"canceled",
-            "customer_id":"cus_1","product_id":"prod_1","current_period_end":null,
+            "customer_id":"cus_1","product_id":"prod_1",
+            "current_period_start":"2026-10-14T09:00:00Z","current_period_end":null,
             "created_at":"2026-10-14T09:00:00Z","modified_at":null,"metadata":{},
             "customer":{"external_id":"abcdefgh12345678"}}}"#;
         let Event::Subscription(revoked) = parse(by_customer).unwrap() else {
@@ -597,7 +604,8 @@ mod tests {
             Event::Ignored("order.paid is not used".to_owned())
         );
         let orphan = br#"{"type":"subscription.created","data":{"id":"sub_2","status":"incomplete",
-            "customer_id":"c","product_id":"p","created_at":"t","metadata":{}}}"#;
+            "customer_id":"c","product_id":"p","current_period_start":"t",
+            "created_at":"t","metadata":{}}}"#;
         assert_eq!(
             parse(orphan).unwrap(),
             Event::Ignored("subscription sub_2 names no tenant".to_owned())

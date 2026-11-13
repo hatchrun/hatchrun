@@ -468,14 +468,7 @@ async fn launch(
     if delivery == Delivery::Launch && !group_open(env, &db, &job, now).await? {
         return Ok(());
     }
-    let standing = match store::standing(
-        &db,
-        message.job_id,
-        billing::month_start(now),
-        DEFAULT_SPEND_CAP_MICROS,
-    )
-    .await
-    {
+    let standing = match store::standing(&db, message.job_id, now, DEFAULT_SPEND_CAP_MICROS).await {
         Ok(Some(standing)) => standing,
         Ok(None) => return Ok(()),
         Err(err) => return Err(err.to_string()),

@@ -8,8 +8,16 @@ use hatchrun_cloud::db::{Db, Param, params};
 use serde::Deserialize;
 use worker::Result;
 
-/// The billing state of a tenant, usage since `$2`, cap default `$3`;
-/// `{owner}` picks the tenant by `$1`.
+/// The billing state of a tenant, usage over its spend cap window and
+/// cap default `$5`; `{owner}` picks the tenant by `$1`. `$2` is now,
+/// `$3` the UTC calendar month start and `$4` the next UTC calendar
+/// month start, all in milliseconds.
+///
+/// The window starts at the latest active or trialing subscription's
+/// period start. When now is at or past its period end (the renewal
+/// webhook is late), the window moves forward in steps of one period
+/// length until it holds now. A tenant with no such subscription keeps
+/// the calendar month, which ends at the next calendar month start.
 const STANDING: &str = "SELECT tenants.id AS tenant_id, tenants.org_login, \
        (tenants.beta OR EXISTS (SELECT 1 FROM subscriptions \
          WHERE subscriptions.tenant_id = tenants.id \
@@ -17,18 +25,38 @@ const STANDING: &str = "SELECT tenants.id AS tenant_id, tenants.org_login, \
        EXISTS (SELECT 1 FROM subscriptions \
          WHERE subscriptions.tenant_id = tenants.id \
          AND subscriptions.status IN ('active', 'trialing')) AS subscribed, \
-       COALESCE((SELECT cap_micros FROM ci_spend_caps WHERE tenant_id = tenants.id), $3) \
+       COALESCE((SELECT cap_micros FROM ci_spend_caps WHERE tenant_id = tenants.id), $5) \
          AS cap_micros, \
+       COALESCE(period.start_ms, $3) AS window_start, \
+       COALESCE(period.end_ms, $4) AS window_end, \
        COALESCE((SELECT json_agg(json_build_object('template', u.template, 'seconds', u.seconds)) \
          FROM (SELECT template, SUM(seconds)::bigint AS seconds FROM ci_usage \
-           WHERE tenant_id = tenants.id AND ended_at >= $2 GROUP BY template) u), \
+           WHERE tenant_id = tenants.id AND ended_at >= COALESCE(period.start_ms, $3) \
+           GROUP BY template) u), \
          '[]'::json)::text AS seconds_by_template, \
        (SELECT COALESCE(SUM(units), 0)::bigint FROM ci_usage \
-         WHERE tenant_id = tenants.id AND ended_at >= $2) AS units, \
+         WHERE tenant_id = tenants.id AND ended_at >= COALESCE(period.start_ms, $3)) AS units, \
        (SELECT count(*) FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
          WHERE ci_runs.tenant_id = tenants.id \
          AND ci_jobs.status IN ('launching', 'launched', 'running'))::bigint AS running \
-     FROM tenants WHERE {owner}";
+     FROM tenants LEFT JOIN LATERAL (SELECT CASE WHEN one.rolled \
+         THEN one.start_ms + (($2 - one.start_ms) / one.len) * one.len \
+         ELSE one.start_ms END AS start_ms, \
+         CASE WHEN one.rolled \
+         THEN one.start_ms + (($2 - one.start_ms) / one.len + 1) * one.len \
+         ELSE one.end_ms END AS end_ms \
+         FROM (SELECT raw.start_ms, raw.end_ms, \
+           GREATEST(raw.end_ms - raw.start_ms, 1) AS len, \
+           raw.end_ms IS NOT NULL AND $2 >= raw.end_ms AS rolled FROM (SELECT \
+         (EXTRACT(epoch FROM s.current_period_start::timestamptz) * 1000)::bigint \
+           AS start_ms, \
+         CASE WHEN s.current_period_end IS NULL THEN NULL \
+           ELSE (EXTRACT(epoch FROM s.current_period_end::timestamptz) * 1000)::bigint \
+           END AS end_ms \
+         FROM subscriptions s WHERE s.tenant_id = tenants.id \
+         AND s.status IN ('active', 'trialing') \
+         ORDER BY s.modified_at DESC LIMIT 1) AS raw) AS one) AS period ON true \
+     WHERE {owner}";
 
 /// [`STANDING`]'s `{owner}` for the tenant of job `$1`.
 const OWNER_OF_JOB: &str = "tenants.id = (SELECT ci_runs.tenant_id FROM ci_jobs \
@@ -74,7 +102,7 @@ const UNSENT_USAGE: &str = "SELECT job_id, attempt, tenant_id, template, seconds
      FROM ci_usage WHERE sent_at IS NULL AND rejected_at IS NULL \
      ORDER BY ended_at, job_id, attempt LIMIT $1";
 
-/// A tenant's billing state this month.
+/// A tenant's billing state over its spend cap window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Standing {
     /// The tenant.
@@ -87,11 +115,17 @@ pub struct Standing {
     /// Whether the tenant has an active or trialing subscription, which
     /// a beta tenant may lack.
     pub subscribed: bool,
-    /// The monthly spend cap in micros: the tenant's own or the default.
+    /// The spend cap in micros: the tenant's own or the default.
     pub cap_micros: u64,
-    /// Billed seconds metered this month, per template label.
+    /// The spend cap window's start, in milliseconds: the licensed
+    /// subscription's period start, or the UTC calendar month start.
+    pub window_start: u64,
+    /// The window's end, in milliseconds: the subscription's period
+    /// end, or the next calendar month start.
+    pub window_end: u64,
+    /// Billed seconds metered over the window, per template label.
     pub seconds_by_template: Vec<(String, u64)>,
-    /// Billing units metered this month, as priced when each job
+    /// Billing units metered over the window, as priced when each job
     /// completed.
     pub units: u64,
     /// Jobs launching, launched or running now.
@@ -106,6 +140,8 @@ struct StandingRow {
     card: bool,
     subscribed: bool,
     cap_micros: u64,
+    window_start: u64,
+    window_end: u64,
     seconds_by_template: String,
     units: u64,
     running: u32,
@@ -125,6 +161,8 @@ impl StandingRow {
             card: self.card,
             subscribed: self.subscribed,
             cap_micros: self.cap_micros,
+            window_start: self.window_start,
+            window_end: self.window_end,
             seconds_by_template: seconds
                 .into_iter()
                 .map(|s| (s.template, s.seconds))
@@ -135,8 +173,8 @@ impl StandingRow {
     }
 }
 
-/// The billing state of the tenant of job `job_id`: usage since
-/// `month_start`, and `default_cap` for a tenant with no cap row.
+/// The billing state of the tenant of job `job_id` at `now`, with
+/// `default_cap` for a tenant with no cap row.
 ///
 /// # Errors
 ///
@@ -144,14 +182,23 @@ impl StandingRow {
 pub async fn standing(
     db: &Db,
     job_id: u64,
-    month_start: u64,
+    now: u64,
     default_cap: u64,
 ) -> Result<Option<Standing>> {
     let sql = STANDING.replace("{owner}", OWNER_OF_JOB);
-    db.first::<StandingRow>(&sql, &params![job_id, month_start, default_cap])
-        .await?
-        .map(StandingRow::into_standing)
-        .transpose()
+    db.first::<StandingRow>(
+        &sql,
+        &params![
+            job_id,
+            now,
+            crate::billing::month_start(now),
+            crate::billing::next_month_start(now),
+            default_cap
+        ],
+    )
+    .await?
+    .map(StandingRow::into_standing)
+    .transpose()
 }
 
 /// As [`standing`], for tenant `tenant_id`.
@@ -162,14 +209,23 @@ pub async fn standing(
 pub async fn tenant_standing(
     db: &Db,
     tenant_id: &str,
-    month_start: u64,
+    now: u64,
     default_cap: u64,
 ) -> Result<Option<Standing>> {
     let sql = STANDING.replace("{owner}", OWNER_IS_TENANT);
-    db.first::<StandingRow>(&sql, &params![tenant_id, month_start, default_cap])
-        .await?
-        .map(StandingRow::into_standing)
-        .transpose()
+    db.first::<StandingRow>(
+        &sql,
+        &params![
+            tenant_id,
+            now,
+            crate::billing::month_start(now),
+            crate::billing::next_month_start(now),
+            default_cap
+        ],
+    )
+    .await?
+    .map(StandingRow::into_standing)
+    .transpose()
 }
 
 /// Sets tenant `tenant_id`'s monthly spend cap to `cap_micros`.

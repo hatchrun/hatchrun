@@ -27,7 +27,6 @@ use worker::{Request, Response, Result};
 
 use crate::access::{self, Access, Failure};
 use crate::api::{Cx, Served, Stop, access_name, name, no_content, now_ms, reply, run_json, stop};
-use crate::billing;
 use crate::installation;
 use crate::page::{self, Query};
 use crate::settings_api::{admin_tenant, audit_of};
@@ -638,7 +637,7 @@ async fn setup_done(cx: &Cx<'_>, org: &str) -> Done {
     let standing = store::tenant_standing(
         cx.db,
         &tenant.id,
-        billing::month_start(now_ms()),
+        now_ms(),
         hatchrun_workflow::templates::DEFAULT_SPEND_CAP_MICROS,
     )
     .await?;
