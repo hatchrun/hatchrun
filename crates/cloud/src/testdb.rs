@@ -348,4 +348,227 @@ mod tests {
                 .is_err()
         );
     }
+
+    static MIGRATION_SCHEMA_NEXT: AtomicU64 = AtomicU64::new(0);
+    static MIGRATION_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The migration files in name order, each with its file name.
+    fn migration_files() -> Vec<(String, String)> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read migrations")
+            .map(|entry| entry.expect("read migrations").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+            .collect();
+        files.sort();
+        files
+            .into_iter()
+            .map(|file| {
+                let name = file
+                    .file_name()
+                    .expect("file name")
+                    .to_string_lossy()
+                    .into_owned();
+                let sql = std::fs::read_to_string(&file).expect("read migration");
+                (name, sql)
+            })
+            .collect()
+    }
+
+    /// Old rows with the tiers their tenants had: t1 keeps 30 days, t2
+    /// keeps 90. Runs 1 and 2 are t1's January and February 2024, run 3
+    /// is t2's January 2024.
+    const MIGRATION_SEED: &str = "
+        INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at, \
+                             retention_days) \
+        VALUES ('t1', 1, 'acme', 99, 0, 0, 30), ('t2', 2, 'initech', 100, 0, 0, 90);
+        INSERT INTO ci_repos (id, tenant_id, installation_id, full_name, default_branch, \
+                              private, updated_at) \
+        VALUES (7, 't1', 99, 'acme/app', 'main', false, 0),
+               (8, 't2', 100, 'initech/app', 'main', false, 0);
+        INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, ref, \
+                             sha, actor, status, created_at, updated_at, expires_at, trust, \
+                             author_login, author_association, gate, gate_status) \
+        VALUES ('t1', 7, 'ci', 1, 'd1', 'push', 'refs/heads/main', 'abc', 'me', 'completed', \
+                1704067200000, 1704067200000, 1704067200000 + 30::bigint * 86400000, \
+                'trusted', 'me', '', 'none', 'none'),
+               ('t1', 7, 'ci', 2, 'd2', 'push', 'refs/heads/main', 'def', 'me', 'completed', \
+                1706745600000, 1706745600000, 1706745600000 + 30::bigint * 86400000, \
+                'trusted', 'me', '', 'none', 'none'),
+               ('t2', 8, 'ci', 1, 'e1', 'push', 'refs/heads/main', 'abc', 'you', 'completed', \
+                1704067200000, 1704067200000, 1704067200000 + 90::bigint * 86400000, \
+                'trusted', 'you', '', 'none', 'none');
+        INSERT INTO ci_jobs (run_id, plan_id, name, status, timeout_minutes, token_permissions, \
+                             secret_refs, needs, created_at, updated_at) \
+        SELECT id, 'build', 'build', 'completed', 10, '{\"metadata\":\"read\"}', \
+               '{\"all\":false,\"names\":[]}', '[]', created_at, created_at FROM ci_runs;
+        INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, ended_at) \
+        SELECT j.id, 1, r.tenant_id, 'x', 60, 60, r.created_at + 60000 \
+        FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id;
+        INSERT INTO ci_audit (tenant_id, at, actor, action, scope, repo, target) \
+        VALUES ('t1', 1704067200000, 'me', 'secret.put', 'org', NULL, 'TOKEN'),
+               ('t2', 1706745600000, 'you', 'var.put', 'repo', 'initech/app', 'MODE');";
+
+    async fn migration_count(client: &tokio_postgres::Client, table: &str) -> i64 {
+        client
+            .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+            .await
+            .expect("count")
+            .get(0)
+    }
+
+    async fn migration_tiers(
+        client: &tokio_postgres::Client,
+        table: &str,
+        id: &str,
+    ) -> Vec<(i64, i16)> {
+        client
+            .query(
+                &format!("SELECT {id}, tier FROM {table} ORDER BY {id}"),
+                &[],
+            )
+            .await
+            .expect("tiers")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+
+    /// 0027 moves the old rows into tiered month partitions: the runs,
+    /// jobs, usage and audit rows land with the tier their tenant had,
+    /// in the month they were recorded, and the dropped foreign keys
+    /// are gone.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn migration_0027_moves_existing_rows_into_tiered_partitions() {
+        let _lock = MIGRATION_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("start a runtime");
+        let schema = format!(
+            "mig27_{}_{}",
+            std::process::id(),
+            MIGRATION_SCHEMA_NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        runtime.block_on(async {
+            let (client, connection) = tokio_postgres::connect(&url(), tokio_postgres::NoTls)
+                .await
+                .unwrap_or_else(|err| panic!("connect to {}: {err}", url()));
+            tokio::spawn(connection);
+            client
+                .batch_execute(&format!(
+                    "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; \
+                     SET search_path TO {schema}"
+                ))
+                .await
+                .expect("create the schema");
+            let files = migration_files();
+            for (name, sql) in files
+                .iter()
+                .filter(|(name, _)| name.as_str() < "0027_ci_partitions.sql")
+            {
+                client
+                    .batch_execute(sql)
+                    .await
+                    .unwrap_or_else(|err| panic!("migrate {name}: {err:?}"));
+            }
+            client
+                .batch_execute(MIGRATION_SEED)
+                .await
+                .expect("seed old rows");
+            let (_, latest) = files
+                .iter()
+                .find(|(name, _)| name == "0027_ci_partitions.sql")
+                .expect("0027 exists");
+            client.batch_execute(latest).await.expect("apply 0027");
+
+            assert_eq!(migration_count(&client, "ci_runs").await, 3);
+            assert_eq!(migration_count(&client, "ci_jobs").await, 3);
+            assert_eq!(migration_count(&client, "ci_usage").await, 3);
+            assert_eq!(migration_count(&client, "ci_audit").await, 2);
+
+            assert_eq!(
+                migration_tiers(&client, "ci_runs", "id").await,
+                [(1, 30), (2, 30), (3, 90)]
+            );
+            assert_eq!(
+                migration_tiers(&client, "ci_jobs", "id").await,
+                [(1, 30), (2, 30), (3, 90)]
+            );
+            assert_eq!(migration_count(&client, "ci_audit_202401").await, 1);
+            assert_eq!(migration_count(&client, "ci_audit_202402").await, 1);
+
+            let months: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM pg_tables WHERE schemaname = current_schema() \
+                     AND tablename IN ('ci_runs_t30_202401', 'ci_runs_t30_202402', \
+                     'ci_runs_t90_202401', 'ci_jobs_t30_202401', 'ci_jobs_t30_202402', \
+                     'ci_jobs_t90_202401', 'ci_usage_202401', 'ci_usage_202402', \
+                     'ci_audit_202401', 'ci_audit_202402')",
+                    &[],
+                )
+                .await
+                .expect("partitions")
+                .get(0);
+            assert_eq!(months, 10);
+
+            let fkeys: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM pg_constraint WHERE contype = 'f' \
+                     AND connamespace = current_schema()::regnamespace AND conname IN \
+                     ('ci_jobs_run_id_fkey', 'ci_artifacts_run_id_fkey', \
+                      'ci_artifacts_job_id_fkey', 'ci_concurrency_run_id_fkey', \
+                      'ci_concurrency_job_id_fkey')",
+                    &[],
+                )
+                .await
+                .expect("foreign keys")
+                .get(0);
+            assert_eq!(fkeys, 0);
+
+            for (sequence, last) in [
+                ("ci_runs_id_seq", 3),
+                ("ci_jobs_id_seq", 3),
+                ("ci_audit_id_seq", 2),
+            ] {
+                let value: i64 = client
+                    .query_one(&format!("SELECT last_value FROM {sequence}"), &[])
+                    .await
+                    .expect("sequence")
+                    .get(0);
+                assert_eq!(value, last, "{sequence}");
+            }
+
+            // A new row routes into its tier and month.
+            client
+                .batch_execute(
+                    "INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, \
+                     event, ref, sha, actor, status, created_at, updated_at, tier, trust, \
+                     author_login, author_association, gate, gate_status) \
+                     VALUES ('t1', 7, 'ci', 3, 'd3', 'push', 'refs/heads/main', 'ghi', 'me', \
+                     'queued', 1706745600000, 1706745600000, 30, 'trusted', 'me', '', 'none', \
+                     'none')",
+                )
+                .await
+                .expect("route a new row");
+            let routed: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM ci_runs_t30_202402 WHERE delivery = 'd3'",
+                    &[],
+                )
+                .await
+                .expect("routed row")
+                .get(0);
+            assert_eq!(routed, 1);
+
+            client
+                .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+                .await
+                .expect("drop the schema");
+        });
+    }
 }

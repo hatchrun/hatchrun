@@ -406,7 +406,10 @@ pub async fn insert_jobs(
         let base = 3 + i * 10;
         highest = base + 9;
         values.push(format!(
-            "($1, ${}, ${}, ${}, ${}, ${}::jsonb, ${}::jsonb, ${}, ${}, ${}, ${}::jsonb, 'waiting', $2, $2)",
+            "($1, (SELECT tier FROM ci_runs WHERE id = $1), \
+             (SELECT created_at FROM ci_runs WHERE id = $1), \
+             ${}, ${}, ${}, ${}, ${}::jsonb, ${}::jsonb, ${}, ${}, ${}, ${}::jsonb, \
+             'waiting', $2, $2)",
             base,
             base + 1,
             base + 2,
@@ -437,9 +440,9 @@ pub async fn insert_jobs(
     }
     debug_assert_eq!(bound.len(), highest);
     let sql = format!(
-        "INSERT INTO ci_jobs (run_id, plan_id, name, timeout_minutes, template, \
-         token_permissions, secret_refs, environment, strategy_group, max_parallel, needs, status, \
-         created_at, updated_at) \
+        "INSERT INTO ci_jobs (run_id, tier, run_created_at, plan_id, name, timeout_minutes, \
+         template, token_permissions, secret_refs, environment, strategy_group, max_parallel, \
+         needs, status, created_at, updated_at) \
          VALUES {} RETURNING plan_id, id",
         values.join(", ")
     );

@@ -22,7 +22,7 @@ fn comment_run(
             rocket,
         }),
     });
-    db.wait(insert_run(db.db(), &new)).unwrap().unwrap()
+    db.wait(make_run(db.db(), &new)).unwrap().unwrap()
 }
 
 /// The active comment runs of issue `number` of repository 7 in the `none` set.
@@ -120,9 +120,9 @@ fn the_cap_leaves_out_other_events_and_other_repositories() {
         issue_number: 12,
         command: None,
     });
-    db.wait(insert_run(db.db(), &issues)).unwrap().unwrap();
+    db.wait(make_run(db.db(), &issues)).unwrap().unwrap();
     // A run with no issue does not either.
-    db.wait(insert_run(db.db(), &new_run("p", "ci", 10)))
+    db.wait(make_run(db.db(), &new_run("p", "ci", 10)))
         .unwrap()
         .unwrap();
     assert_eq!(active(&db, 12), 0);
@@ -143,7 +143,7 @@ fn the_cap_leaves_out_other_events_and_other_repositories() {
         issue_number: 12,
         command: None,
     });
-    db.wait(insert_run(db.db(), &other)).unwrap().unwrap();
+    db.wait(make_run(db.db(), &other)).unwrap().unwrap();
     assert_eq!(active(&db, 12), 0);
     assert_eq!(
         db.wait(active_comment_runs(db.db(), 8, 12, "none"))

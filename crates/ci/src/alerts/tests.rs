@@ -820,20 +820,22 @@ fn failed_job(db: &Db) {
          private, updated_at) VALUES (7, 't1', 99, 'acme/app', 'main', false, 0)",
         &[],
     );
+    db.wait(crate::store::ensure_partitions(db.db(), 0))
+        .unwrap();
     db.run(
         "INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, ref, \
-         sha, actor, status, created_at, updated_at, expires_at, trust, author_login, \
+         sha, actor, status, created_at, updated_at, tier, trust, author_login, \
          author_association, gate, gate_status) \
          VALUES ('t1', 7, 'ci.yml', 1, 'd1', 'push', 'refs/heads/main', 'abc', 'me', \
-         'completed', 0, 0, 0, 'trusted', 'me', '', 'none', 'none')",
+         'completed', 0, 0, 30, 'trusted', 'me', '', 'none', 'none')",
         &[],
     );
     db.run(
-        "INSERT INTO ci_jobs (id, run_id, plan_id, name, status, conclusion, timeout_minutes, \
+        "INSERT INTO ci_jobs (id, run_id, tier, run_created_at, plan_id, name, status, \
+         conclusion, timeout_minutes, \
          launch_attempts, launch_error, steps, created_at, updated_at, token_permissions, \
          secret_refs, needs) \
-         OVERRIDING SYSTEM VALUE \
-         SELECT 5, id, 'build', 'build', 'completed', 'failure', 30, 4, \
+         SELECT 5, id, 30, 0, 'build', 'build', 'completed', 'failure', 30, 4, \
          'RunInstances: InsufficientInstanceCapacity', '[]', 0, 0, \
          '{\"metadata\":\"read\"}', '{\"all\":false,\"names\":[]}', '[]' FROM ci_runs",
         &[],

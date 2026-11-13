@@ -421,7 +421,7 @@ pub(super) fn save_environment(
 
 pub(super) fn job_naming(db: &TestDb, delivery: &str, environment: Option<&str>) -> u64 {
     let run = db
-        .wait(insert_run(db.db(), &new_run(delivery, "ci", 1_000)))
+        .wait(make_run(db.db(), &new_run(delivery, "ci", 1_000)))
         .unwrap()
         .unwrap();
     let job = NewJob {

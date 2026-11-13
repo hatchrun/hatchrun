@@ -239,7 +239,7 @@ impl RunRow {
 /// The columns of a [`RunRow`].
 pub(super) const RUN_COLUMNS: &str = "id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, \
      event, ref AS git_ref, sha, actor, base_ref, status, conclusion, created_at, \
-     completed_at, (expires_at - created_at) / 86400000 AS retention_days, message, \
+     completed_at, tier AS retention_days, message, \
      pull_number, head_ref, \
      (SELECT title FROM ci_pulls WHERE repo_id = ci_runs.repo_id \
       AND number = ci_runs.pull_number) AS pull_title, \
@@ -265,7 +265,7 @@ const LOCK_REPO: &str = "SELECT id FROM ci_repos WHERE id = $1 FOR NO KEY UPDATE
 /// author's association, `$19` the gate, `$20` its status, `$21` the
 /// pull request's head commit, `$22` the planner's findings, `$23` the
 /// issue number, `$24` the comment id, `$25` the command's name and
-/// `$26` its reaction set. The run expires after its tenant's retention tier (30 or 90 days), read
+/// `$26` its reaction set. The run lands in the partition of its tenant's retention tier (30 or 90 days), read
 /// in the same statement. The number is taken only when no run of this
 /// delivery and workflow exists, so a duplicate leaves the counter
 /// alone, and the statement returns no row for it.
@@ -277,16 +277,16 @@ const INSERT_RUN: &str = "WITH n AS (\
        RETURNING last) \
      INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, ref, sha, \
        actor, base_ref, message, pull_number, head_ref, status, created_at, updated_at, \
-       expires_at, trust, head_repo_id, head_repo_name, author_login, author_association, \
+       tier, trust, head_repo_id, head_repo_name, author_login, author_association, \
        gate, gate_status, head_sha, lints, issue_number, comment_id, command_name, \
        command_reaction) \
      SELECT $1, $2, $3, n.last, $4, $5, $6, $7, $8, $10::text, $11::text, $12::bigint, $13::text, 'queued', $9, $9, \
-       $9 + (SELECT CASE WHEN retention_days > 30 THEN 90 ELSE 30 END * 86400000::bigint \
+       (SELECT CASE WHEN retention_days > 30 THEN 90 ELSE 30 END \
          FROM tenants WHERE id = $1), \
        $14::text, $15::bigint, $16::text, $17::text, $18::text, $19::text, $20::text, $21::text, $22::text, $23::bigint, $24::bigint, $25::text, $26::text FROM n \
      RETURNING id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, event, \
        ref AS git_ref, sha, actor, base_ref, status, conclusion, created_at, \
-       completed_at, (expires_at - created_at) / 86400000 AS retention_days, message, \
+       completed_at, tier AS retention_days, message, \
        pull_number, head_ref, \
        (SELECT title FROM ci_pulls WHERE repo_id = ci_runs.repo_id \
         AND number = ci_runs.pull_number) AS pull_title, \
@@ -604,7 +604,7 @@ fn run_where(filter: &RunFilter) -> (String, Vec<hatchrun_cloud::db::Param>) {
 pub(super) const LISTED_COLUMNS: &str = "r.id, r.run_number, r.run_attempt, r.tenant_id, r.repo_id, \
      r.workflow, r.delivery, r.event, r.ref AS git_ref, r.sha, r.actor, r.base_ref, r.status, \
      r.conclusion, r.created_at, r.completed_at, \
-     (r.expires_at - r.created_at) / 86400000 AS retention_days, r.message, \
+     r.tier AS retention_days, r.message, \
      r.pull_number, r.head_ref, \
      (SELECT title FROM ci_pulls WHERE repo_id = r.repo_id AND number = r.pull_number) \
      AS pull_title, r.trust, r.head_repo_name, r.author_login, r.author_association, \

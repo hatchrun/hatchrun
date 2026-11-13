@@ -185,29 +185,38 @@ fn launched_records_the_instance() {
 }
 
 #[test]
-fn sweep_deletes_expired_runs_and_old_deliveries() {
+fn upkeep_drops_expired_run_months_and_old_deliveries() {
     let db = setup();
     let old = db
-        .wait(insert_run(db.db(), &new_run("old", "ci", 1_000)))
+        .wait(make_run(db.db(), &new_run("old", "ci", 1_000)))
         .unwrap()
         .unwrap();
     db.wait(insert_jobs(db.db(), old.id, &[new_job("build")], 1_000))
         .unwrap();
     let fresh = db
-        .wait(insert_run(
-            db.db(),
-            &new_run("fresh", "ci", 1_000 + 20 * DAY),
-        ))
+        .wait(make_run(db.db(), &new_run("fresh", "ci", 1_000 + 32 * DAY)))
         .unwrap()
         .unwrap();
-    let now = 1_000 + 31 * DAY;
+    let now = 1_000 + 62 * DAY;
     db.wait(record_delivery(db.db(), "old", "push", 1_000))
         .unwrap();
     db.wait(record_delivery(db.db(), "fresh", "push", now - DAY))
         .unwrap();
-    let gone = db.wait(sweep(db.db(), now)).unwrap();
-    assert_eq!(gone, vec![old.id]);
-    db.wait(delete_runs(db.db(), &gone)).unwrap();
+    let dropped = db
+        .wait(drop_expired_partitions(
+            db.db(),
+            now,
+            &["ci_runs_t30_197001".to_owned()],
+        ))
+        .unwrap();
+    assert!(
+        dropped.contains(&"ci_runs_t30_197001".to_owned()),
+        "{dropped:?}"
+    );
+    assert!(
+        !dropped.iter().any(|name| name == "ci_runs_t30_197002"),
+        "{dropped:?}"
+    );
     assert!(db.wait(run(db.db(), old.id)).unwrap().is_none());
     assert!(db.wait(run(db.db(), fresh.id)).unwrap().is_some());
     let jobs: i64 = db
@@ -223,7 +232,7 @@ fn stalled_jobs_match_the_reconcilers_decisions() {
     use crate::reconcile::{Fix, stalled};
     let db = setup();
     let run = db
-        .wait(insert_run(db.db(), &new_run("d", "ci", 1)))
+        .wait(make_run(db.db(), &new_run("d", "ci", 1)))
         .unwrap()
         .unwrap();
     let names = [
@@ -583,7 +592,7 @@ fn tenants_are_found_by_id_and_runs_by_delivery() {
     assert_eq!(found.id, "t1");
     assert!(db.wait(tenant(db.db(), "nope")).unwrap().is_none());
     let run = db
-        .wait(insert_run(db.db(), &new_run("d1", "ci", 5)))
+        .wait(make_run(db.db(), &new_run("d1", "ci", 5)))
         .unwrap()
         .unwrap();
     let found = db
@@ -699,7 +708,7 @@ fn runs_page_newest_first() {
     let mut ids = Vec::new();
     for n in 0..3 {
         let run = db
-            .wait(insert_run(db.db(), &new_run(&format!("d{n}"), "ci", n)))
+            .wait(make_run(db.db(), &new_run(&format!("d{n}"), "ci", n)))
             .unwrap()
             .unwrap();
         ids.push(run.id);
@@ -727,7 +736,7 @@ fn runs_page_newest_first() {
 fn open_jobs_skip_completed_ones_and_oldest_come_first() {
     let db = setup();
     let run = db
-        .wait(insert_run(db.db(), &new_run("d", "ci", 1)))
+        .wait(make_run(db.db(), &new_run("d", "ci", 1)))
         .unwrap()
         .unwrap();
     let ids = db
@@ -894,7 +903,7 @@ fn seconds_round_up_with_a_minute_minimum() {
     let mut got = Vec::new();
     let finished = |n: usize, ms: u64, template: Option<&str>| {
         let run = db
-            .wait(insert_run(db.db(), &new_run(&format!("d{n}"), "ci", 1)))
+            .wait(make_run(db.db(), &new_run(&format!("d{n}"), "ci", 1)))
             .unwrap()
             .unwrap();
         let ids = db
@@ -929,6 +938,8 @@ fn seconds_round_up_with_a_minute_minimum() {
 fn daily_usage_groups_by_utc_day() {
     let db = setup();
     let month = 1_790_812_800_000_u64;
+    ensure(&db, month - 1);
+    ensure(&db, month);
     for (job, seconds, ended, units) in [
         (1, 100, month - 1, 100),
         (2, 60, month + 5, 60),
@@ -965,6 +976,8 @@ fn standing_counts_this_month_and_running_jobs() {
     );
     // Units are what was recorded at completion: job 2 was priced before
     // a price change, job 5 has a template the catalog no longer has.
+    ensure(&db, month - 1);
+    ensure(&db, month);
     for (job, tenant, template, seconds, ended, units) in [
         (1, "t1", "ubuntu-latest", 420, month - 1, 420),
         (2, "t1", "ubuntu-latest", 300, month + DAY, 1_000),
@@ -1066,6 +1079,7 @@ fn standing_counts_this_month_and_running_jobs() {
 
 /// One billed attempt of `seconds` for tenant t1, ended at `ended`.
 fn record_usage(db: &TestDb, job: u64, seconds: u64, ended: u64) {
+    ensure(db, ended);
     db.run(
         "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
          ended_at) VALUES ($1, 1, 't1', 'ubuntu-latest', $2, $2, $3)",
@@ -1208,42 +1222,31 @@ fn standing_without_a_subscription_keeps_the_calendar_month() {
 }
 
 #[test]
-fn sweep_deletes_usage_sent_long_ago() {
+fn upkeep_drops_usage_months_older_than_ninety_days() {
     let db = setup();
     let now = 200 * DAY;
-    for (job, ended) in [(1, 0), (2, DAY), (3, 2 * DAY), (4, 3 * DAY)] {
+    for (job, ended) in [(1, 0), (2, DAY), (3, 150 * DAY), (4, 151 * DAY)] {
+        ensure(&db, ended);
         db.run(
             "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
              ended_at) VALUES ($1, 1, 't1', 'ubuntu-latest', 60, 60, $2)",
             &params![job, ended],
         );
     }
-    db.wait(close_windows(db.db(), 4 * DAY, None)).unwrap();
-    let window_of = |job: u64| -> i64 {
-        db.rows(
-            "SELECT w.id AS id FROM ci_usage_windows w JOIN ci_usage u \
-             ON u.window_id = w.id WHERE u.job_id = $1",
-            &params![job],
-        )
-        .unwrap()[0]["id"]
-            .as_i64()
-            .unwrap()
-    };
-    db.wait(windows_sent(db.db(), &[window_of(1)], now - 91 * DAY))
-        .unwrap();
-    db.wait(windows_sent(db.db(), &[window_of(2)], now - 89 * DAY))
-        .unwrap();
-    db.wait(windows_rejected(
-        db.db(),
-        &[window_of(4)],
-        "no such customer",
-        now - 91 * DAY,
-    ))
-    .unwrap();
-    db.wait(sweep(db.db(), now)).unwrap();
+    let dropped = db.wait(drop_expired_partitions(db.db(), now, &[])).unwrap();
+    assert!(
+        dropped.contains(&"ci_usage_197001".to_owned()),
+        "{dropped:?}"
+    );
+    assert!(
+        !dropped
+            .iter()
+            .any(|name| name.starts_with("ci_usage_197005")),
+        "{dropped:?}"
+    );
     assert_eq!(
         usage_rows(&db).iter().map(|r| r.0).collect::<Vec<_>>(),
-        [2, 3]
+        [3, 4]
     );
 }
 
@@ -1274,6 +1277,7 @@ fn caps_are_set_and_replaced() {
 #[test]
 fn usage_goes_to_polar_oldest_first_and_once() {
     let db = setup();
+    ensure(&db, 10);
     for (job, ended) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
         db.run(
             "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
@@ -1292,8 +1296,8 @@ fn usage_goes_to_polar_oldest_first_and_once() {
     db.wait(windows_sent(db.db(), &ids(&all), 99)).unwrap();
     db.wait(windows_sent(db.db(), &[], 99)).unwrap();
     assert_eq!(db.wait(unsent_windows(db.db(), 10)).unwrap(), []);
-    // A sent window's rows are marked too, so the sweep of old sent
-    // usage keeps working.
+    // A sent window's rows are marked too, so the month drops read
+    // what Polar took.
     let sent: Vec<u64> = db
         .rows("SELECT sent_at AS n FROM ci_usage ORDER BY job_id", &[])
         .unwrap()
@@ -1315,6 +1319,7 @@ fn usage_goes_to_polar_oldest_first_and_once() {
 #[test]
 fn a_quarantined_window_is_never_listed_again() {
     let db = setup();
+    ensure(&db, 10);
     for (job, ended) in [(1, 10), (2, 20)] {
         db.run(
             "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
@@ -1353,6 +1358,7 @@ fn a_quarantined_window_is_never_listed_again() {
 
 /// One usage row of `tenant`, `seconds` and `units`, ended at `ended`.
 fn record_tenant_usage(db: &TestDb, tenant: &str, job: u64, seconds: u64, units: u64, ended: u64) {
+    ensure(db, ended);
     db.run(
         "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
          ended_at) VALUES ($1, 1, $2, 'ubuntu-latest', $3, $5, $4)",
@@ -1548,7 +1554,7 @@ fn activity_buckets_runs_by_creation_and_completion() {
     let start = 10 * hour;
     let make = |delivery: &str, created: u64, conclusion: Option<(&str, u64)>| {
         let run = db
-            .wait(insert_run(db.db(), &new_run(delivery, "ci", created)))
+            .wait(make_run(db.db(), &new_run(delivery, "ci", created)))
             .unwrap()
             .unwrap();
         if let Some((conclusion, at)) = conclusion {

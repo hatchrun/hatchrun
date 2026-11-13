@@ -16,7 +16,7 @@ fn run_on(db: &TestDb, delivery: &str, workflow: &str, git_ref: &str, now: u64) 
         new.pull_number = number.parse().ok();
         new.head_ref = Some("feature".into());
     }
-    db.wait(insert_run(db.db(), &new)).unwrap().unwrap()
+    db.wait(make_run(db.db(), &new)).unwrap().unwrap()
 }
 
 fn pull(number: u64, state: &str, updated_at: u64) -> NewPull {

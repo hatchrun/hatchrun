@@ -411,7 +411,7 @@ fn a_restore_moves_an_entry_out_of_the_way_of_the_quota() {
 fn a_pull_request_run_records_its_base_branch() {
     let db = setup();
     let run = db
-        .wait(insert_run(
+        .wait(make_run(
             db.db(),
             &NewRun {
                 base_ref: Some("release".into()),
@@ -425,7 +425,7 @@ fn a_pull_request_run_records_its_base_branch() {
     let read = db.wait(super::run(db.db(), run.id)).unwrap().unwrap();
     assert_eq!(read.base_ref.as_deref(), Some("release"));
     let push = db
-        .wait(insert_run(db.db(), &new_run("push", "ci", 2)))
+        .wait(make_run(db.db(), &new_run("push", "ci", 2)))
         .unwrap()
         .unwrap();
     assert_eq!(push.base_ref, None);

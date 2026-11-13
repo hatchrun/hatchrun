@@ -81,8 +81,9 @@ pub use self::pool::{
     PoolRow, claims_by_bucket, drop_pool, move_pool, pool_rows, save_pool, take_pool,
 };
 pub use self::reconciler::{
-    SWEEP_LIMIT, ScheduleRow, defer_runs, delete_runs, last_minute, lease, replace_schedules,
-    schedules, schedules_after, set_last_minute, stalled_jobs, sweep,
+    ScheduleRow, drop_expired_partitions, ensure_partitions, expired_run_partitions, last_minute,
+    lease, mark_purged, replace_schedules, runs_needing_purge, schedules, schedules_after,
+    set_last_minute, stalled_jobs,
 };
 pub use self::repos::{RepoRow, delivery_seen, record_delivery, repo, repo_by_name, upsert_repo};
 pub use self::runs::{

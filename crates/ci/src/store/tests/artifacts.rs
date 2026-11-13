@@ -270,9 +270,19 @@ fn a_delete_takes_the_row_and_frees_the_name() {
 #[test]
 fn a_run_takes_its_artifacts_with_it() {
     let db = setup();
-    let (run, job) = run_with_job(&db, "running");
-    upload(&db, run.id, job, 1, "dist", 1);
-    db.run("DELETE FROM ci_runs WHERE id = $1", &params![run.id]);
+    let (row, job) = run_with_job(&db, "running");
+    upload(&db, row.id, job, 1, "dist", 1);
+    // The January 1970 month is older than 30 days in March, so the drop
+    // takes the run, its jobs and its artifacts together.
+    let dropped = db
+        .wait(drop_expired_partitions(
+            db.db(),
+            1_000 + 62 * DAY,
+            &["ci_runs_t30_197001".to_owned()],
+        ))
+        .unwrap();
+    assert!(dropped.contains(&"ci_runs_t30_197001".to_owned()));
+    assert!(db.wait(run(db.db(), row.id)).unwrap().is_none());
     let left: Option<u64> = db.column("SELECT count(*) AS n FROM ci_artifacts", &[], "n");
     assert_eq!(left, Some(0));
 }

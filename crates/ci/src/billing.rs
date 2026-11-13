@@ -68,6 +68,30 @@ fn days_from_civil(year: i64, month: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// The `YYYYMM` label of the UTC calendar month `month_start_ms` is
+/// in, for the name of a monthly partition.
+#[must_use]
+pub fn month_label(month_start_ms: u64) -> String {
+    let days = i64::try_from(month_start_ms / DAY_MS).unwrap_or(0);
+    let (year, month) = year_month(days);
+    format!("{year:04}{month:02}")
+}
+
+/// The start of the UTC calendar month `label` (`YYYYMM`) names, in
+/// Unix milliseconds. `None` when the label is not one.
+#[must_use]
+pub fn month_start_of(label: &str) -> Option<u64> {
+    let (year, month) = label.split_at_checked(4)?;
+    let year: i64 = year.parse().ok()?;
+    let month: u32 = month.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1970..=9999).contains(&year) {
+        return None;
+    }
+    u64::try_from(days_from_civil(year, month))
+        .ok()
+        .map(|days| days * DAY_MS)
+}
+
 /// Billing units used over the window, as priced when each job
 /// completed.
 /// A later template price change or a removed template does not alter
@@ -454,6 +478,17 @@ mod tests {
         // February of the 2028 leap year has 29 days.
         assert_eq!(next_month_start(1_833_753_600_000), 1_835_481_600_000);
         assert_eq!(next_month_start(0), 2_678_400_000);
+    }
+
+    #[test]
+    fn month_labels_round_trip() {
+        assert_eq!(month_label(1_790_812_800_000), "202610");
+        assert_eq!(month_label(0), "197001");
+        assert_eq!(month_start_of("202610"), Some(1_790_812_800_000));
+        assert_eq!(month_start_of("197001"), Some(0));
+        assert_eq!(month_start_of("202613"), None);
+        assert_eq!(month_start_of("2026"), None);
+        assert_eq!(month_start_of(""), None);
     }
 
     #[test]

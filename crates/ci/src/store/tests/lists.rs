@@ -13,7 +13,7 @@ fn run_with(db: &TestDb, delivery: &str, actor: &str, git_ref: &str, now: u64) -
         new.base_ref = Some("main".into());
         new.head_ref = Some("feature".into());
     }
-    db.wait(insert_run(db.db(), &new)).unwrap().unwrap()
+    db.wait(make_run(db.db(), &new)).unwrap().unwrap()
 }
 
 fn filter() -> RunFilter {
@@ -544,7 +544,8 @@ fn environments_of_the_organization_count_their_secrets_and_vars() {
 #[test]
 fn audit_rows_page_newest_first_and_filter_by_repository() {
     let db = setup();
-    let record = |action, scope, repo: Option<&str>, target: &str, now| {
+    let record = |action, scope, repo: Option<&str>, target: &str, now: u64| {
+        ensure(&db, now);
         db.wait(record_audit(
             db.db(),
             &NewAudit {

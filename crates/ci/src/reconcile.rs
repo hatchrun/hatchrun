@@ -14,8 +14,9 @@
 //! 4. terminates instances that no job needs;
 //! 5. keeps the warm pool of each runner template at the size the last
 //!    hour's claims ask for ([`crate::pool`]);
-//! 6. deletes expired runs and purges their objects, and deletes the
-//!    cache entries nobody restored for 7 days;
+//! 6. purges the objects of expired runs and drops their month
+//!    partitions, and deletes the cache entries nobody restored for 7
+//!    days;
 //! 7. sends metered usage to Polar;
 //! 8. re-seals secrets that an old key still seals.
 //!
@@ -34,9 +35,8 @@
 //! re-sealing, and the remainder (100 at [`BUDGET`]) for retention. A step whose share runs out stops and resumes in the next
 //! pass. Rows and runs are bounded too: [`MAX_MINUTES`] minutes,
 //! [`MAX_FIXES`] stalled jobs,
-//! [`MAX_TERMINATIONS`] terminated instances and [`store::SWEEP_LIMIT`]
-//! purged runs. Scheduled runs past [`MAX_FIRES`] started in one pass
-//! are skipped and logged.
+//! [`MAX_TERMINATIONS`] terminated instances. Scheduled runs past
+//! [`MAX_FIRES`] started in one pass are skipped and logged.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -138,8 +138,7 @@ pub struct Shares {
 /// Splits `total`: cache eviction takes 1/40 of it. Of the remainder
 /// schedules take 5/9, at most 500. Of the rest stalled jobs take 3/8, orphans and the pool 1/8 each, usage and
 /// re-sealing 1/16 each, rounded down, and retention the remainder.
-/// Schedules cannot take what the other steps need, and retention keeps
-/// at least `SWEEP_LIMIT * PURGE_COST` at [`BUDGET`].
+/// Schedules cannot take what the other steps need.
 #[must_use]
 pub fn shares(total: u32) -> Shares {
     let cache = total / 40;
@@ -1294,45 +1293,69 @@ impl PoolPass<'_> {
     }
 }
 
-/// Step 6. A sweep takes at most [`store::SWEEP_LIMIT`] runs and one
-/// subrequest each purges them, which `budget` covers. A run is deleted
-/// once its purge succeeded.
+/// Step 6. Makes sure the partitions of this month and the next two
+/// months exist, purges the objects of the runs in expired months
+/// within `budget`, and drops the months whose runs are all purged. A
+/// run that concluded purges its own object once its snapshot lands;
+/// a run that never concluded or never snapshotted never armed that
+/// purge, so the pass calls its object's /purge first and its month
+/// drops only once every such purge succeeded. Returns how many
+/// partitions were dropped.
 async fn retain(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<u32, String> {
-    if budget.left() < store::SWEEP_LIMIT * PURGE_COST {
-        return Ok(0);
-    }
-    let expired = store::sweep(db, now).await.map_err(|e| e.to_string())?;
-    budget.take(PURGE_COST * u32::try_from(expired.len()).unwrap_or(0));
-    let (purged, failed): (Vec<_>, Vec<_>) = join_all(expired.iter().map(|&run_id| async move {
-        match purge(env, run_id).await {
-            Ok(()) => (run_id, true),
-            Err(err) => {
-                console_error!("reconcile: purge run {run_id}: {err}");
-                (run_id, false)
-            }
+    store::ensure_partitions(db, now)
+        .await
+        .map_err(|e| e.to_string())?;
+    let expired = store::expired_run_partitions(db, now)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut purged = Vec::new();
+    for partition in expired {
+        let left = budget.left();
+        if left == 0 {
+            break;
         }
-    }))
-    .await
-    .into_iter()
-    .partition(|&(_, ok)| ok);
-    let ids = |runs: Vec<(u64, bool)>| runs.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
-    // A run whose purge failed stays, deferred an hour so it cannot keep
-    // newer expired runs out of the batch.
-    let failed = ids(failed);
-    let unpurged = u32::try_from(failed.len()).unwrap_or(u32::MAX);
-    if !failed.is_empty() {
-        console_error!(
-            "reconcile: {} runs not purged, retrying later",
-            failed.len()
-        );
+        let ids = store::runs_needing_purge(db, &partition, left)
+            .await
+            .map_err(|e| e.to_string())?;
+        let results = join_all(ids.iter().map(|&run_id| async move {
+            match purge(env, run_id).await {
+                Ok(()) => Some(run_id),
+                Err(err) => {
+                    console_error!("reconcile: purge run {run_id}: {err}");
+                    None
+                }
+            }
+        }))
+        .await;
+        budget.take(PURGE_COST.saturating_mul(u32::try_from(ids.len()).unwrap_or(u32::MAX)));
+        let done: Vec<u64> = results.into_iter().flatten().collect();
+        // Purged runs are marked so the next pass moves on to the rest,
+        // and a month with more unconcluded runs than one pass pays for
+        // still drops after a few passes.
+        store::mark_purged(db, &partition, &done, now)
+            .await
+            .map_err(|e| e.to_string())?;
+        let every = u32::try_from(ids.len()).unwrap_or(u32::MAX) < left;
+        if done.len() < ids.len() || !every {
+            break;
+        }
+        purged.push(partition);
     }
-    store::defer_runs(db, &failed, now)
+    let dropped = store::drop_expired_partitions(db, now, &purged)
         .await
         .map_err(|e| e.to_string())?;
-    store::delete_runs(db, &ids(purged))
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(unpurged)
+    Ok(u32::try_from(dropped.len()).unwrap_or(u32::MAX))
+}
+
+async fn purge(env: &Env, run_id: u64) -> worker::Result<()> {
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post);
+    let request = worker::Request::new_with_init("https://run/purge", &init)?;
+    let response = run_stub(env, run_id)?.fetch_with_request(request).await?;
+    match response.status_code() {
+        200..=299 => Ok(()),
+        status => Err(worker::Error::RustError(format!("answered {status}"))),
+    }
 }
 
 /// Step 6, for the job cache: deletes the entries nobody restored for
@@ -1570,17 +1593,6 @@ async fn reseal_secrets(env: &Env, db: &Db, budget: &Budget) -> Result<u32, Stri
         }
     }
     Ok(failed)
-}
-
-async fn purge(env: &Env, run_id: u64) -> worker::Result<()> {
-    let mut init = RequestInit::new();
-    init.with_method(Method::Post);
-    let request = worker::Request::new_with_init("https://run/purge", &init)?;
-    let response = run_stub(env, run_id)?.fetch_with_request(request).await?;
-    match response.status_code() {
-        200..=299 => Ok(()),
-        status => Err(worker::Error::RustError(format!("answered {status}"))),
-    }
 }
 
 #[cfg(test)]
@@ -1914,7 +1926,6 @@ mod tests {
             }
         );
         assert_eq!(sum(share), BUDGET);
-        assert!(share.retention >= store::SWEEP_LIMIT * PURGE_COST);
         assert!(share.reseal > 0 && share.usage > 0);
         assert!(share.cache > cache::EVICT_LIMIT);
         for total in [0, 1, 8, 100, 900, 5_000] {
