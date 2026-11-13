@@ -890,13 +890,12 @@ const DELIVERY_RESENDS: u32 = 50;
 /// sends never reach a consumer fails instead of resending every
 /// minute. Returns how many sends failed.
 async fn resend_deliveries(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<u32, String> {
-    let capped = store::fail_capped_deliveries(db, now)
+    // The pass's alert check lists the failed ones.
+    for (guid, error) in store::fail_capped_deliveries(db, now)
         .await
-        .map_err(|e| e.to_string())?;
-    if !capped.is_empty() {
-        alerts::deliveries_failed(env, db, now, &capped)
-            .await
-            .map_err(|err| format!("capped deliveries: {err}"))?;
+        .map_err(|e| e.to_string())?
+    {
+        console_error!("reconcile: delivery {guid}: {error}");
     }
     let guids = store::stale_deliveries(db, now, DELIVERY_RESENDS)
         .await

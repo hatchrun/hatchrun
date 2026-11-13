@@ -8,12 +8,12 @@ use hatchrun_cloud::db::params;
 use hatchrun_cloud::testdb::Db;
 
 use super::checks::{
-    Database, Facts, FailedLaunch, LowRateLimit, PassRecord, check, failed_launches,
+    Database, Facts, FailedDelivery, FailedLaunch, LowRateLimit, PassRecord, check, failed_launches,
 };
 use super::health::history as parse_history;
 use super::queries::{
-    DATABASE, DELETE_FAILED, DELETE_RATE_LIMITS, FAILED_SINCE, LOW_SINCE, NOTE_RATE_LIMIT,
-    RECORD_FAILED, RECORD_UNREADABLE,
+    DATABASE, DELETE_FAILED, DELETE_RATE_LIMITS, FAILED_DELIVERIES_SINCE, FAILED_SINCE, LOW_SINCE,
+    NOTE_RATE_LIMIT, RECORD_FAILED, RECORD_UNREADABLE,
 };
 use super::runtime::Kept;
 use super::*;
@@ -241,7 +241,34 @@ fn checks_read_the_pass_history() {
     // Data that could not be read changes nothing.
     let seen = check(&Facts::default());
     assert!(seen.iter().all(|(_, seen)| *seen == Seen::Unknown));
-    assert_eq!(seen.len(), 4);
+    assert_eq!(seen.len(), 5);
+}
+
+#[test]
+fn failed_deliveries_fire_their_own_alert() {
+    let seen = check(&Facts {
+        failed_deliveries: Some(vec![FailedDelivery {
+            guid: "d-1".to_owned(),
+            event: "push".to_owned(),
+            error: Some("the delivery was resent too often: d-1".to_owned()),
+            attempts: 50,
+            failed_at: NOW,
+        }]),
+        ..Facts::default()
+    });
+    assert!(matches!(
+        found(&seen, Key::DeliveryFailed),
+        Seen::Firing(detail) if detail.contains("delivery d-1 (push), 50 attempts")
+            && detail.contains("resent too often")
+    ));
+    // Launch failures are a separate alert.
+    assert_eq!(*found(&seen, Key::LaunchFailed), Seen::Unknown);
+    let clear = check(&Facts {
+        failed_deliveries: Some(Vec::new()),
+        ..Facts::default()
+    });
+    assert_eq!(*found(&clear, Key::DeliveryFailed), Seen::Clear);
+    assert_eq!(Key::DeliveryFailed.as_str(), "ci_delivery_failed");
 }
 
 #[test]
@@ -838,6 +865,24 @@ fn failed_job(db: &Db) {
          '{\"metadata\":\"read\"}', '{\"all\":false,\"names\":[]}', '[]' FROM ci_runs",
         &[],
     );
+}
+
+#[test]
+fn the_failed_delivery_alert_reads_failed_deliveries() {
+    let db = Db::new();
+    db.run(
+        "INSERT INTO ci_deliveries (guid, event, received_at, state, attempts, error, failed_at) \
+         VALUES ('old', 'push', 0, 'failed', 3, 'boom', $1), \
+         ('new', 'push', 0, 'failed', 50, 'resent too often', $2), \
+         ('done', 'push', 0, 'done', 1, NULL, NULL), \
+         ('waiting', 'push', 0, 'received', 1, NULL, NULL)",
+        &params![NOW - 2 * HOUR, NOW],
+    );
+    let failed = db.all::<FailedDelivery>(FAILED_DELIVERIES_SINCE, &params![NOW - HOUR, LISTED]);
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].guid, "new");
+    assert_eq!(failed[0].attempts, 50);
+    assert_eq!(failed[0].error.as_deref(), Some("resent too often"));
 }
 
 #[test]

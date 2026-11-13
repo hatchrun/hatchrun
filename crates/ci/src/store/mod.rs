@@ -55,8 +55,7 @@ pub use self::concurrency::{
 };
 pub use self::deliveries::{
     DeliveryClaim, LEASE_MS, MAX_ATTEMPTS, RECEIVED_STALE_MS, accept_delivery, claim_delivery,
-    delivery_state, fail_capped_deliveries, finish_dead_letter, finish_delivery, note_resend,
-    release_delivery, stale_deliveries,
+    fail_capped_deliveries, finish_delivery, note_resend, release_delivery, stale_deliveries,
 };
 pub use self::environments::{
     EnvironmentRow, JobEnvironment, OrgEnvironment, PutEnvironment, decide_approval,

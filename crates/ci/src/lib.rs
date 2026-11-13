@@ -144,7 +144,7 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
         launches::QUEUE => launches::consume(batch, env).await,
         launches::DEAD_LETTERS => launches::dead_letters(batch, env).await,
         deliveries::QUEUE => deliveries::consume(batch, env).await,
-        deliveries::DEAD_LETTERS => deliveries::dead_letters(batch, env).await,
+        deliveries::DEAD_LETTERS => deliveries::dead_letters(&batch),
         other => {
             // No consumer reads this queue: retrying would loop
             // forever, so the batch is logged and acked.

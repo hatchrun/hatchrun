@@ -90,10 +90,7 @@ async fn forward_api(env: &Env, req: Request) -> Result<Response> {
 /// so GitHub sends it again.
 async fn forward(env: &Env, req: &mut Request) -> Result<Response> {
     let Ok(ci) = env.service(CI) else {
-        return Ok(
-            Response::from_json(&serde_json::json!({ "ignored": "no CI service" }))?
-                .with_status(202),
-        );
+        return error("no CI service", 503);
     };
     let headers = Headers::new();
     for name in ["X-Hub-Signature-256", "X-GitHub-Event", "X-GitHub-Delivery"] {
