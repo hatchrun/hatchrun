@@ -6,8 +6,8 @@
 //! Workers runtime so it tests natively.
 //!
 //! An organization pays for hatchrun CI through a Polar subscription to
-//! the metered product. `hatchrun-ci` sends each job's usage as an event
-//! (see [`ci_ingest`]). The app opens a Polar checkout for the
+//! the metered product. `hatchrun-ci` sends each tenant's usage per
+//! 15 minute window as an event (see [`ci_ingest`]). The app opens a Polar checkout for the
 //! product, with the tenant id as Polar's
 //! external customer id and in the checkout's metadata, so every
 //! subscription Polar reports names its tenant. Polar's webhooks, signed
@@ -109,38 +109,35 @@ fn decode<T: for<'de> Deserialize<'de>>(response: &Response, what: &str) -> Resu
     serde_json::from_slice(&response.body).map_err(|err| format!("{what}: {err}"))
 }
 
-/// Name of the events that carry a CI job attempt's billing units. The
-/// CI usage meter sums their `units`.
+/// Name of the events that carry a tenant's CI usage of one 15 minute
+/// window. The CI usage meter sums their `units`.
 pub const CI_USAGE_EVENT: &str = "ci.usage";
 
-/// Most CI usage events in one ingest call. Polar documents no limit,
-/// so this stays small: a batch with one refused event splits down to
+/// Most CI usage windows in one ingest call. Polar documents no limit,
+/// so this stays small: a batch with one refused window splits down to
 /// it in about 2 * log2(100) calls.
 pub const CI_INGEST_BATCH: usize = 100;
 
-/// One CI job attempt's usage, as Polar's meter takes it.
+/// One tenant's CI usage of a 15 minute window, as Polar's meter takes
+/// it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CiUsage<'a> {
-    /// The job.
-    pub job_id: u64,
-    /// The attempt, so a re-run counts apart from the first run.
-    pub attempt: u32,
     /// The tenant, Polar's external customer id.
     pub tenant: &'a str,
-    /// The runner template's label.
-    pub template: &'a str,
-    /// The billed seconds of the attempt, at least 60.
-    pub seconds: u64,
-    /// The billing units: the seconds weighted by the template's price
-    /// relative to the amd64 2 vCPU rate.
+    /// The window's start, in Unix milliseconds, inside the
+    /// subscription period the window belongs to.
+    pub window_start: u64,
+    /// The billing units of the window: the summed units of its jobs.
     pub units: u64,
-    /// When it completed, ISO 8601.
-    pub at: String,
+    /// The billed seconds of the window.
+    pub seconds: u64,
+    /// How many jobs the window holds.
+    pub jobs: i32,
 }
 
-/// Sends CI usage to Polar. Each event's `external_id` names the job and
-/// the attempt, so an event sent again after a lost answer is skipped
-/// as a duplicate and never counted twice.
+/// Sends CI usage to Polar. Each event's `external_id` names the tenant
+/// and the window start, so an event sent again after a lost answer is
+/// skipped as a duplicate and never counted twice.
 #[must_use]
 pub fn ci_ingest(api: &str, token: &str, events: &[CiUsage<'_>]) -> Request {
     let events: Vec<_> = events
@@ -149,12 +146,12 @@ pub fn ci_ingest(api: &str, token: &str, events: &[CiUsage<'_>]) -> Request {
             serde_json::json!({
                 "name": CI_USAGE_EVENT,
                 "external_customer_id": event.tenant,
-                "external_id": format!("ci:{}:{}", event.job_id, event.attempt),
-                "timestamp": event.at,
+                "external_id": format!("{}:{}", event.tenant, event.window_start),
+                "timestamp": crate::format_rfc3339(event.window_start),
                 "metadata": {
                     "units": event.units,
                     "seconds": event.seconds,
-                    "template": event.template,
+                    "jobs": event.jobs,
                 },
             })
         })
@@ -742,20 +739,15 @@ mod tests {
     }
 
     #[test]
-    fn ci_ingest_names_job_and_attempt() {
-        let request = ci_ingest(
-            API,
-            "t",
-            &[CiUsage {
-                job_id: 7,
-                attempt: 2,
-                tenant: "abcdefgh12345678",
-                template: "ubuntu-26.04-8core",
-                seconds: 90,
-                units: 360,
-                at: "2026-10-14T10:09:30Z".to_owned(),
-            }],
-        );
+    fn ci_ingest_names_the_tenant_and_the_window() {
+        let window = CiUsage {
+            tenant: "abcdefgh12345678",
+            window_start: 1_792_676_700_000,
+            units: 1_560,
+            seconds: 390,
+            jobs: 4,
+        };
+        let request = ci_ingest(API, "t", std::slice::from_ref(&window));
         assert_eq!(request.url, "https://api.polar.sh/v1/events/ingest");
         let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(
@@ -763,11 +755,43 @@ mod tests {
             serde_json::json!({ "events": [{
                 "name": "ci.usage",
                 "external_customer_id": "abcdefgh12345678",
-                "external_id": "ci:7:2",
-                "timestamp": "2026-10-14T10:09:30Z",
-                "metadata": { "units": 360, "seconds": 90, "template": "ubuntu-26.04-8core" },
+                "external_id": "abcdefgh12345678:1792676700000",
+                "timestamp": "2026-10-22T13:45:00Z",
+                "metadata": { "units": 1560, "seconds": 390, "jobs": 4 },
             }] })
         );
+        // A retry after a lost answer builds the same event, so Polar
+        // sees a duplicate and bills once.
+        let retry = ci_ingest(API, "t", &[window]);
+        assert_eq!(retry.body, request.body);
+    }
+
+    #[test]
+    fn ci_ingest_batches_windows_oldest_first() {
+        let windows = [
+            CiUsage {
+                tenant: "t1",
+                window_start: 1_792_676_700_000,
+                units: 60,
+                seconds: 60,
+                jobs: 1,
+            },
+            CiUsage {
+                tenant: "t2",
+                window_start: 1_792_677_600_000,
+                units: 120,
+                seconds: 120,
+                jobs: 2,
+            },
+        ];
+        let body: serde_json::Value =
+            serde_json::from_slice(&ci_ingest(API, "t", &windows).body).unwrap();
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["external_id"], "t1:1792676700000");
+        assert_eq!(events[1]["external_id"], "t2:1792677600000");
+        assert_eq!(events[1]["timestamp"], "2026-10-22T14:00:00Z");
+        assert_eq!(events[1]["metadata"]["jobs"], 2);
     }
 
     #[test]

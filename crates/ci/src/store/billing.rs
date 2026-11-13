@@ -98,9 +98,9 @@ const SET_SPEND_CAP: &str = "INSERT INTO ci_spend_caps (tenant_id, cap_micros, u
 
 /// Usage Polar has not taken and has not refused, oldest first, at
 /// most `$1`.
-const UNSENT_USAGE: &str = "SELECT job_id, attempt, tenant_id, template, seconds, units, ended_at \
-     FROM ci_usage WHERE sent_at IS NULL AND rejected_at IS NULL \
-     ORDER BY ended_at, job_id, attempt LIMIT $1";
+const UNSENT_WINDOWS: &str = "SELECT id, tenant_id, window_start, window_end, units, seconds, jobs \
+     FROM ci_usage_windows WHERE sent_at IS NULL AND rejected_at IS NULL \
+     ORDER BY window_start, id LIMIT $1";
 
 /// A tenant's billing state over its spend cap window.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,87 +239,112 @@ pub async fn set_spend_cap(db: &Db, tenant_id: &str, cap_micros: u64, now: u64) 
         .map(|_| ())
 }
 
-/// One attempt's usage that Polar has not taken yet.
+/// One window's usage that Polar has not taken yet.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct UnsentUsage {
-    /// The job.
-    pub job_id: u64,
-    /// The attempt.
-    pub attempt: u32,
+pub struct UnsentWindow {
+    /// The window's id.
+    pub id: i64,
     /// The tenant, Polar's external customer id.
     pub tenant_id: String,
-    /// The template's label.
-    pub template: String,
-    /// The billed seconds of the attempt, at least 60.
-    pub seconds: u64,
-    /// The billing units, priced when the attempt completed.
+    /// The window's start, in milliseconds.
+    pub window_start: u64,
+    /// The window's end, in milliseconds.
+    pub window_end: u64,
+    /// The summed billing units of its jobs.
     pub units: u64,
-    /// When the attempt completed, in milliseconds.
-    pub ended_at: u64,
+    /// The summed billed seconds of its jobs.
+    pub seconds: u64,
+    /// How many jobs the window holds.
+    pub jobs: i32,
 }
 
-/// The oldest `limit` usage rows Polar has not taken.
+/// The oldest `limit` usage windows Polar has not taken.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn unsent_usage(db: &Db, limit: u32) -> Result<Vec<UnsentUsage>> {
-    db.all(UNSENT_USAGE, &params![limit]).await
+pub async fn unsent_windows(db: &Db, limit: u32) -> Result<Vec<UnsentWindow>> {
+    db.all(UNSENT_WINDOWS, &params![limit]).await
 }
 
-/// Marks the usage of the `(job, attempt)` pairs in `keys` as taken by
-/// Polar at `now`. A row already marked keeps its time.
+/// Closes usage windows at `now`: without `tenant` every tenant's
+/// ended windows, with it that tenant's open window at once (see
+/// [`hatchrun_cloud::usage::close_windows`]). Returns how many usage
+/// rows were assigned a window.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn usage_sent(db: &Db, keys: &[(u64, u32)], now: u64) -> Result<()> {
-    mark_usage("sent_at = $1", &[], keys, now, db).await
+pub async fn close_windows(db: &Db, now: u64, tenant: Option<&str>) -> Result<u64> {
+    hatchrun_cloud::usage::close_windows(db, now, tenant).await
 }
 
-/// Quarantines the usage of the `(job, attempt)` pairs in `keys`:
-/// Polar refused it for good, so it is never sent again.
+/// Marks the windows `ids` as taken by Polar at `now`, with the usage
+/// rows closed into them. A row already marked keeps its time.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn usage_rejected(db: &Db, keys: &[(u64, u32)], reason: &str, now: u64) -> Result<()> {
-    mark_usage(
+pub async fn windows_sent(db: &Db, ids: &[i64], now: u64) -> Result<()> {
+    mark_windows("sent_at = $1", &[], ids, now, db).await
+}
+
+/// Quarantines the windows `ids`: Polar refused them for good, so they
+/// are never sent again, nor are the usage rows closed into them.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn windows_rejected(db: &Db, ids: &[i64], reason: &str, now: u64) -> Result<()> {
+    mark_windows(
         "rejected_at = $1, reject_reason = $2",
         &[Param::from(reason)],
-        keys,
+        ids,
         now,
         db,
     )
     .await
 }
 
-/// Sets `assignments` on the open usage rows of `keys`. `$1` is `now`
-/// and `extra` binds `$2` on.
-async fn mark_usage(
+/// Sets `assignments` on the open windows `ids` and the usage rows
+/// closed into them. `$1` is `now` and `extra` binds `$2` on.
+async fn mark_windows(
     assignments: &str,
     extra: &[Param],
-    keys: &[(u64, u32)],
+    ids: &[i64],
     now: u64,
     db: &Db,
 ) -> Result<()> {
-    if keys.is_empty() {
+    if ids.is_empty() {
         return Ok(());
     }
     let first = extra.len() + 2;
-    let pairs: Vec<String> = (0..keys.len())
-        .map(|n| format!("(${}, ${})", first + 2 * n, first + 2 * n + 1))
-        .collect();
-    let sql = format!(
-        "UPDATE ci_usage SET {assignments} WHERE sent_at IS NULL AND rejected_at IS NULL \
-         AND (job_id, attempt) IN ({})",
-        pairs.join(", ")
-    );
+    let windows: Vec<String> = (0..ids.len()).map(|n| format!("${}", first + n)).collect();
     let mut bound: Vec<Param> = vec![Param::from(now)];
     bound.extend(extra.iter().cloned());
-    for (job, attempt) in keys {
-        bound.push(Param::from(*job));
-        bound.push(Param::from(*attempt));
+    for id in ids {
+        bound.push(Param::from(*id));
     }
-    db.run(&sql, &bound).await.map(|_| ())
+    let list = windows.join(", ");
+    let statements = [
+        (
+            format!(
+                "UPDATE ci_usage_windows SET {assignments} WHERE sent_at IS NULL \
+                 AND rejected_at IS NULL AND id IN ({list})"
+            ),
+            bound.clone(),
+        ),
+        (
+            format!(
+                "UPDATE ci_usage SET {assignments} WHERE sent_at IS NULL \
+                 AND rejected_at IS NULL AND window_id IN ({list})"
+            ),
+            bound,
+        ),
+    ];
+    let statements: Vec<(&str, Vec<Param>)> = statements
+        .iter()
+        .map(|(sql, params)| (sql.as_str(), params.clone()))
+        .collect();
+    db.batch(&statements).await.map(|_| ())
 }

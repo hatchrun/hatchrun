@@ -1360,18 +1360,17 @@ async fn evict_cache(
 /// Of one ingest call to Polar.
 const INGEST_COST: u32 = 1;
 
-/// The events of `rows`, in their order, with the units priced when the
-/// attempt completed.
-fn usage_events(rows: &[store::UnsentUsage]) -> Vec<CiUsage<'_>> {
-    rows.iter()
-        .map(|row| CiUsage {
-            job_id: row.job_id,
-            attempt: row.attempt,
-            tenant: &row.tenant_id,
-            template: &row.template,
-            seconds: row.seconds,
-            units: row.units,
-            at: hatchrun_cloud::format_rfc3339(row.ended_at),
+/// The events of `windows`, in their order, with the summed units,
+/// seconds and job count of each.
+fn usage_events(windows: &[store::UnsentWindow]) -> Vec<CiUsage<'_>> {
+    windows
+        .iter()
+        .map(|window| CiUsage {
+            tenant: &window.tenant_id,
+            window_start: window.window_start,
+            units: window.units,
+            seconds: window.seconds,
+            jobs: window.jobs,
         })
         .collect()
 }
@@ -1441,14 +1440,15 @@ fn split(rows: &std::ops::Range<usize>) -> Split {
     Split::Halves(rows.start..middle, middle..rows.end)
 }
 
-/// Step 6. Sends up to [`CI_INGEST_BATCH`] unsent usage rows to Polar
-/// and marks them sent only when Polar took them. Each event is keyed
-/// by job and attempt, so a batch sent again after a lost answer is
-/// counted once. A batch Polar refuses for its content is split until
-/// the refused rows are alone; those are quarantined with Polar's
-/// reason and never sent again. A transport error, a 429 or a 5xx ends
-/// the step and the next pass sends the rest again. Without a Polar
-/// token nothing is sent.
+/// Step 7. Closes the usage windows that ended before the grace, then
+/// sends up to [`CI_INGEST_BATCH`] unsent ones to Polar
+/// and marks them and their rows sent only when Polar took them.
+/// Each event is keyed by tenant and window start, so a batch sent
+/// again after a lost answer is counted once. A batch Polar refuses for
+/// its content is split until the refused windows are alone; those are
+/// quarantined with Polar's reason and never sent again. A transport
+/// error, a 429 or a 5xx ends the step and the next pass sends the rest
+/// again. Without a Polar token nothing is sent.
 async fn report_usage(
     db: &Db,
     settings: &Settings,
@@ -1458,15 +1458,18 @@ async fn report_usage(
     if settings.polar_token.is_empty() || !budget.take(INGEST_COST) {
         return Ok(());
     }
-    let limit = u32::try_from(CI_INGEST_BATCH).unwrap_or(u32::MAX);
-    let rows = store::unsent_usage(db, limit)
+    let closed = store::close_windows(db, now, None)
         .await
         .map_err(|e| e.to_string())?;
-    let keys = |range: &std::ops::Range<usize>| -> Vec<(u64, u32)> {
-        rows[range.clone()]
-            .iter()
-            .map(|r| (r.job_id, r.attempt))
-            .collect()
+    if closed > 0 {
+        console_log!("reconcile: closed {closed} usage rows into windows");
+    }
+    let limit = u32::try_from(CI_INGEST_BATCH).unwrap_or(u32::MAX);
+    let rows = store::unsent_windows(db, limit)
+        .await
+        .map_err(|e| e.to_string())?;
+    let keys = |range: &std::ops::Range<usize>| -> Vec<i64> {
+        rows[range.clone()].iter().map(|r| r.id).collect()
     };
     let mut pending = std::iter::once(0..rows.len()).collect::<Vec<_>>();
     let mut first = true;
@@ -1489,7 +1492,7 @@ async fn report_usage(
         match judge(&answer, range.len()) {
             Ingest::Taken => {
                 took_any = true;
-                store::usage_sent(db, &keys(&range), now)
+                store::windows_sent(db, &keys(&range), now)
                     .await
                     .map_err(|e| e.to_string())?;
             }
@@ -1505,18 +1508,17 @@ async fn report_usage(
     }
     if !took_any && !refused.is_empty() {
         console_error!(
-            "reconcile: Polar refused every usage event this pass; none quarantined, retrying"
+            "reconcile: Polar refused every usage window this pass; none quarantined, retrying"
         );
     }
     for (at, reason) in quarantine(refused, took_any) {
         let row = &rows[at];
         console_error!(
-            "reconcile: usage of job {} attempt {} (tenant {}) quarantined: {reason}",
-            row.job_id,
-            row.attempt,
+            "reconcile: usage window {} of tenant {} quarantined: {reason}",
+            row.window_start,
             row.tenant_id
         );
-        store::usage_rejected(db, &[(row.job_id, row.attempt)], &reason, now)
+        store::windows_rejected(db, &[row.id], &reason, now)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -1922,29 +1924,37 @@ mod tests {
         }
     }
 
-    fn usage_row(job_id: u64, template: &str, seconds: u64, units: u64) -> store::UnsentUsage {
-        store::UnsentUsage {
-            job_id,
-            attempt: 2,
-            tenant_id: "t1".into(),
-            template: template.into(),
+    fn usage_window(
+        tenant: &str,
+        start: u64,
+        seconds: u64,
+        units: u64,
+        jobs: i32,
+    ) -> store::UnsentWindow {
+        store::UnsentWindow {
+            id: 1,
+            tenant_id: tenant.into(),
+            window_start: start,
+            window_end: start + 900_000,
             seconds,
             units,
-            ended_at: NOW,
+            jobs,
         }
     }
 
     #[test]
-    fn usage_events_carry_the_units_recorded_at_completion() {
+    fn usage_events_carry_the_summed_window() {
         let rows = [
-            usage_row(7, "ubuntu-26.04-8core", 300, 1_200),
-            usage_row(8, "retired", 180, 180),
+            usage_window("t1", NOW - 900_000, 300, 1_200, 2),
+            usage_window("t2", NOW - 1_800_000, 180, 180, 1),
         ];
         let events = usage_events(&rows);
-        assert_eq!((events[0].job_id, events[0].attempt), (7, 2));
+        assert_eq!(events[0].tenant, "t1");
+        assert_eq!(events[0].window_start, NOW - 900_000);
         assert_eq!(events[0].units, 1_200);
         assert_eq!(events[0].seconds, 300);
-        assert_eq!(events[0].at, "2026-10-22T13:45:00Z");
+        assert_eq!(events[0].jobs, 2);
+        assert_eq!(events[1].tenant, "t2");
         assert_eq!(events[1].units, 180);
     }
 

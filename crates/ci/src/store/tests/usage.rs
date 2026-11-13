@@ -821,12 +821,11 @@ fn beta_usage_is_metered_but_never_sent_to_polar() {
     db.wait(start_job(db.db(), beta, 10_000)).unwrap();
     assert!(finish(&db, beta, 1, 71_000));
     assert_eq!(usage_rows(&db).len(), 2, "both are metered");
-    let unsent = db.wait(unsent_usage(db.db(), 10)).unwrap();
-    assert_eq!(
-        unsent.iter().map(|r| r.job_id).collect::<Vec<_>>(),
-        [paid],
-        "only the non-beta row goes to Polar"
-    );
+    db.wait(close_windows(db.db(), 2_000_000, None)).unwrap();
+    let unsent = db.wait(unsent_windows(db.db(), 10)).unwrap();
+    assert_eq!(unsent.len(), 1, "only the non-beta window goes to Polar");
+    assert_eq!(unsent[0].units, 61);
+    assert_eq!(unsent[0].jobs, 1);
 }
 
 #[test]
@@ -1212,22 +1211,35 @@ fn standing_without_a_subscription_keeps_the_calendar_month() {
 fn sweep_deletes_usage_sent_long_ago() {
     let db = setup();
     let now = 200 * DAY;
-    for (job, sent) in [
-        (1, Some(now - 91 * DAY)),
-        (2, Some(now - 89 * DAY)),
-        (3, None),
-    ] {
+    for (job, ended) in [(1, 0), (2, DAY), (3, 2 * DAY), (4, 3 * DAY)] {
         db.run(
             "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
-             ended_at, sent_at) VALUES ($1, 1, 't1', 'ubuntu-latest', 60, 60, 0, $2)",
-            &params![job, sent],
+             ended_at) VALUES ($1, 1, 't1', 'ubuntu-latest', 60, 60, $2)",
+            &params![job, ended],
         );
     }
-    db.run(
-        "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
-         ended_at, rejected_at) VALUES (4, 1, 't1', 'ubuntu-latest', 60, 60, 0, $1)",
-        &params![now - 91 * DAY],
-    );
+    db.wait(close_windows(db.db(), 4 * DAY, None)).unwrap();
+    let window_of = |job: u64| -> i64 {
+        db.rows(
+            "SELECT w.id AS id FROM ci_usage_windows w JOIN ci_usage u \
+             ON u.window_id = w.id WHERE u.job_id = $1",
+            &params![job],
+        )
+        .unwrap()[0]["id"]
+            .as_i64()
+            .unwrap()
+    };
+    db.wait(windows_sent(db.db(), &[window_of(1)], now - 91 * DAY))
+        .unwrap();
+    db.wait(windows_sent(db.db(), &[window_of(2)], now - 89 * DAY))
+        .unwrap();
+    db.wait(windows_rejected(
+        db.db(),
+        &[window_of(4)],
+        "no such customer",
+        now - 91 * DAY,
+    ))
+    .unwrap();
     db.wait(sweep(db.db(), now)).unwrap();
     assert_eq!(
         usage_rows(&db).iter().map(|r| r.0).collect::<Vec<_>>(),
@@ -1262,52 +1274,271 @@ fn caps_are_set_and_replaced() {
 #[test]
 fn usage_goes_to_polar_oldest_first_and_once() {
     let db = setup();
-    for (job, attempt, ended) in [(3, 1, 30), (1, 1, 10), (1, 2, 20), (2, 1, 20)] {
+    for (job, ended) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
         db.run(
             "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
-             ended_at) VALUES ($1, $2, 't1', 'ubuntu-latest', 240, 240, $3)",
-            &params![job, attempt, ended],
+             ended_at) VALUES ($1, 1, 't1', 'ubuntu-latest', 240, 240, $2)",
+            &params![job, ended],
         );
     }
-    let keys = |rows: &[UnsentUsage]| -> Vec<(u64, u32)> {
-        rows.iter().map(|r| (r.job_id, r.attempt)).collect()
-    };
-    let all = db.wait(unsent_usage(db.db(), 10)).unwrap();
-    assert_eq!(keys(&all), [(1, 1), (1, 2), (2, 1), (3, 1)]);
+    db.wait(close_windows(db.db(), 2_000_000, None)).unwrap();
+    let ids = |rows: &[UnsentWindow]| -> Vec<i64> { rows.iter().map(|r| r.id).collect() };
+    let all = db.wait(unsent_windows(db.db(), 10)).unwrap();
+    assert_eq!(all.len(), 1);
     assert_eq!(all[0].tenant_id, "t1");
-    assert_eq!(all[0].seconds, 240);
-    assert_eq!(all[0].units, 240);
-    let two = db.wait(unsent_usage(db.db(), 2)).unwrap();
-    assert_eq!(keys(&two), [(1, 1), (1, 2)]);
-    db.wait(usage_sent(db.db(), &keys(&two), 99)).unwrap();
-    db.wait(usage_sent(db.db(), &[], 99)).unwrap();
-    let rest = db.wait(unsent_usage(db.db(), 10)).unwrap();
-    assert_eq!(keys(&rest), [(2, 1), (3, 1)]);
-    // A quarantined row is never listed again, nor marked sent.
-    db.wait(usage_rejected(db.db(), &[(2, 1)], "no such customer", 150))
-        .unwrap();
-    db.wait(usage_sent(db.db(), &[(2, 1)], 160)).unwrap();
-    let rest = db.wait(unsent_usage(db.db(), 10)).unwrap();
-    assert_eq!(keys(&rest), [(3, 1)]);
+    assert_eq!((all[0].units, all[0].seconds, all[0].jobs), (960, 960, 4));
+    let two = db.wait(unsent_windows(db.db(), 0)).unwrap();
+    assert_eq!(ids(&two), Vec::<i64>::new());
+    db.wait(windows_sent(db.db(), &ids(&all), 99)).unwrap();
+    db.wait(windows_sent(db.db(), &[], 99)).unwrap();
+    assert_eq!(db.wait(unsent_windows(db.db(), 10)).unwrap(), []);
+    // A sent window's rows are marked too, so the sweep of old sent
+    // usage keeps working.
+    let sent: Vec<u64> = db
+        .rows("SELECT sent_at AS n FROM ci_usage ORDER BY job_id", &[])
+        .unwrap()
+        .into_iter()
+        .map(|row| row["n"].as_u64().unwrap())
+        .collect();
+    assert_eq!(sent, [99, 99, 99, 99]);
+    // A second mark does not move the time.
+    db.wait(windows_sent(db.db(), &ids(&all), 200)).unwrap();
+    let sent: Vec<u64> = db
+        .rows("SELECT sent_at AS n FROM ci_usage ORDER BY job_id", &[])
+        .unwrap()
+        .into_iter()
+        .map(|row| row["n"].as_u64().unwrap())
+        .collect();
+    assert_eq!(sent, [99, 99, 99, 99]);
+}
+
+#[test]
+fn a_quarantined_window_is_never_listed_again() {
+    let db = setup();
+    for (job, ended) in [(1, 10), (2, 20)] {
+        db.run(
+            "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
+             ended_at) VALUES ($1, 1, 't1', 'ubuntu-latest', 240, 240, $2)",
+            &params![job, ended],
+        );
+    }
+    db.wait(close_windows(db.db(), 2_000_000, None)).unwrap();
+    let all = db.wait(unsent_windows(db.db(), 10)).unwrap();
+    assert_eq!(all.len(), 1);
+    db.wait(windows_rejected(
+        db.db(),
+        &[all[0].id],
+        "no such customer",
+        150,
+    ))
+    .unwrap();
+    db.wait(windows_sent(db.db(), &[all[0].id], 160)).unwrap();
+    assert_eq!(db.wait(unsent_windows(db.db(), 10)).unwrap(), []);
     let row = db
         .rows(
-            "SELECT sent_at, rejected_at, reject_reason FROM ci_usage \
-             WHERE job_id = 2",
+            "SELECT sent_at, rejected_at, reject_reason FROM ci_usage_windows",
             &[],
         )
         .unwrap();
     assert!(row[0]["sent_at"].is_null());
     assert_eq!(row[0]["rejected_at"].as_u64(), Some(150));
     assert_eq!(row[0]["reject_reason"].as_str(), Some("no such customer"));
-    // A second mark does not move the time.
-    db.wait(usage_sent(db.db(), &[(1, 1)], 200)).unwrap();
-    let sent = db
-        .rows(
-            "SELECT sent_at FROM ci_usage WHERE job_id = 1 AND attempt = 1",
-            &[],
+    let usage = db.rows("SELECT rejected_at FROM ci_usage", &[]).unwrap();
+    assert!(
+        usage
+            .iter()
+            .all(|row| row["rejected_at"].as_u64() == Some(150))
+    );
+}
+
+/// One usage row of `tenant`, `seconds` and `units`, ended at `ended`.
+fn record_tenant_usage(db: &TestDb, tenant: &str, job: u64, seconds: u64, units: u64, ended: u64) {
+    db.run(
+        "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
+         ended_at) VALUES ($1, 1, $2, 'ubuntu-latest', $3, $5, $4)",
+        &params![job, tenant, seconds, ended, units],
+    );
+}
+
+/// Every usage window as tenant, start, end, units, seconds and jobs.
+fn closed_windows(db: &TestDb) -> Vec<(String, u64, u64, u64, u64, i64)> {
+    db.rows(
+        "SELECT tenant_id, window_start, window_end, units, seconds, jobs \
+         FROM ci_usage_windows ORDER BY tenant_id, window_start",
+        &[],
+    )
+    .unwrap()
+    .into_iter()
+    .map(|row| {
+        (
+            row["tenant_id"].as_str().unwrap().to_owned(),
+            row["window_start"].as_u64().unwrap(),
+            row["window_end"].as_u64().unwrap(),
+            row["units"].as_u64().unwrap(),
+            row["seconds"].as_u64().unwrap(),
+            row["jobs"].as_i64().unwrap(),
         )
+    })
+    .collect()
+}
+
+/// The jobs of usage rows with no window.
+fn unwindowed(db: &TestDb) -> Vec<u64> {
+    db.rows(
+        "SELECT job_id AS n FROM ci_usage WHERE window_id IS NULL ORDER BY job_id",
+        &[],
+    )
+    .unwrap()
+    .into_iter()
+    .map(|row| row["n"].as_u64().unwrap())
+    .collect()
+}
+
+#[test]
+fn close_groups_two_tenants_and_two_windows() {
+    const W: u64 = 900_000;
+    let db = setup();
+    db.run(
+        "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
+         VALUES ('t2', 2, 'other', 98, 0, 0)",
+        &[],
+    );
+    // 2026-10-22 13:45:00 UTC, on a window boundary.
+    let now = 1_792_676_700_000;
+    let (a, b) = (now - 3 * W, now - 2 * W);
+    record_tenant_usage(&db, "t1", 1, 60, 60, a + 1_000);
+    record_tenant_usage(&db, "t1", 2, 120, 120, a + 2_000);
+    record_tenant_usage(&db, "t1", 3, 90, 90, b + 1_000);
+    record_tenant_usage(&db, "t2", 11, 60, 60, a + 1_000);
+    record_tenant_usage(&db, "t2", 12, 60, 60, b + 5_000);
+    record_tenant_usage(&db, "t2", 13, 60, 60, b + 6_000);
+    // Still in its window: left alone.
+    record_tenant_usage(&db, "t1", 4, 60, 60, now - 1_000);
+    assert_eq!(db.wait(close_windows(db.db(), now, None)).unwrap(), 6);
+    assert_eq!(
+        closed_windows(&db),
+        [
+            ("t1".to_owned(), a, a + W, 180, 180, 2),
+            ("t1".to_owned(), b, b + W, 90, 90, 1),
+            ("t2".to_owned(), a, a + W, 60, 60, 1),
+            ("t2".to_owned(), b, b + W, 120, 120, 2),
+        ]
+    );
+    assert_eq!(unwindowed(&db), [4]);
+    // A second pass changes nothing.
+    assert_eq!(db.wait(close_windows(db.db(), now, None)).unwrap(), 0);
+    assert_eq!(closed_windows(&db).len(), 4);
+}
+
+#[test]
+fn close_cuts_the_window_at_the_period_end() {
+    let db = setup();
+    subscribe_period(
+        &db,
+        "s1",
+        "active",
+        "2026-10-15T00:00:00Z",
+        Some("2026-11-15T00:07:00Z"),
+        "2026-10-15T00:00:00Z",
+    );
+    // Midnight is on the grid; the period ends 7 minutes after.
+    let midnight = 1_794_700_800_000_u64;
+    let end = midnight + 7 * 60_000;
+    record_tenant_usage(&db, "t1", 1, 300, 300, midnight + 60_000);
+    record_tenant_usage(&db, "t1", 2, 120, 120, midnight + 600_000);
+    db.wait(close_windows(db.db(), midnight + 2 * 900_000, None))
         .unwrap();
-    assert_eq!(sent[0]["sent_at"].as_u64(), Some(99));
+    assert_eq!(
+        closed_windows(&db),
+        [
+            ("t1".to_owned(), midnight, end, 300, 300, 1),
+            ("t1".to_owned(), end, midnight + 900_000, 120, 120, 1),
+        ]
+    );
+}
+
+#[test]
+fn close_cuts_the_window_at_the_renewed_period_start() {
+    let db = setup();
+    // After a renewal the period starts 7 minutes past midnight, in the
+    // same grid slot as rows of the old period.
+    subscribe_period(
+        &db,
+        "s1",
+        "active",
+        "2026-11-15T00:07:00Z",
+        Some("2026-12-15T00:07:00Z"),
+        "2026-11-15T00:07:00Z",
+    );
+    let midnight = 1_794_700_800_000_u64;
+    let start = midnight + 7 * 60_000;
+    record_tenant_usage(&db, "t1", 1, 300, 300, midnight + 60_000);
+    record_tenant_usage(&db, "t1", 2, 120, 120, midnight + 600_000);
+    db.wait(close_windows(db.db(), midnight + 2 * 900_000, None))
+        .unwrap();
+    assert_eq!(
+        closed_windows(&db),
+        [
+            ("t1".to_owned(), midnight, start, 300, 300, 1),
+            ("t1".to_owned(), start, midnight + 900_000, 120, 120, 1),
+        ]
+    );
+}
+
+#[test]
+fn a_late_row_joins_the_open_window() {
+    const W: u64 = 900_000;
+    let db = setup();
+    let now = 1_792_676_700_000;
+    let start = now - 2 * W;
+    record_tenant_usage(&db, "t1", 1, 60, 60, start + 1_000);
+    db.wait(close_windows(db.db(), now, None)).unwrap();
+    assert_eq!(
+        closed_windows(&db),
+        [("t1".to_owned(), start, start + W, 60, 60, 1)]
+    );
+    // A row that arrives late for the written window waits: the window
+    // of now is still open.
+    record_tenant_usage(&db, "t1", 2, 70, 70, start + 2_000);
+    assert_eq!(db.wait(close_windows(db.db(), now, None)).unwrap(), 0);
+    assert_eq!(
+        closed_windows(&db),
+        [("t1".to_owned(), start, start + W, 60, 60, 1)]
+    );
+    assert_eq!(unwindowed(&db), [2]);
+    // Once that window ends, the late row closes into it.
+    db.wait(close_windows(db.db(), now + W + 180_000, None))
+        .unwrap();
+    assert_eq!(
+        closed_windows(&db),
+        [
+            ("t1".to_owned(), start, start + W, 60, 60, 1),
+            ("t1".to_owned(), now, now + W, 70, 70, 1),
+        ]
+    );
+    assert_eq!(unwindowed(&db), Vec::<u64>::new());
+}
+
+#[test]
+fn a_flush_closes_the_open_window_right_away() {
+    const W: u64 = 900_000;
+    let db = setup();
+    db.run(
+        "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
+         VALUES ('t2', 2, 'other', 98, 0, 0)",
+        &[],
+    );
+    let start = 1_792_676_700_000 - 2 * W;
+    let now = start + 500_000;
+    record_tenant_usage(&db, "t1", 1, 60, 60, start + 100_000);
+    record_tenant_usage(&db, "t1", 2, 60, 60, start + 200_000);
+    record_tenant_usage(&db, "t2", 11, 60, 60, start + 100_000);
+    assert_eq!(db.wait(close_windows(db.db(), now, Some("t1"))).unwrap(), 2);
+    assert_eq!(
+        closed_windows(&db),
+        [("t1".to_owned(), start, start + W, 120, 120, 2)]
+    );
+    assert_eq!(unwindowed(&db), [11]);
 }
 
 #[test]

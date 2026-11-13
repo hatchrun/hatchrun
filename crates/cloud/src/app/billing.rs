@@ -234,7 +234,8 @@ async fn wake(env: &Env, woken: &[ci_wake::Woken]) {
 
 /// What a stored subscription changes. A licensed one returns the
 /// tenant's oldest CI jobs held for the card, for the caller to send to
-/// the CI launch queue.
+/// the CI launch queue. One that is no longer licensed closes the
+/// tenant's open usage window at once so the next send bills it.
 async fn settle(db: &Db, subscription: &Subscription, changed: u64) -> Result<Vec<ci_wake::Woken>> {
     if changed == 0 {
         console_warn!(
@@ -242,8 +243,10 @@ async fn settle(db: &Db, subscription: &Subscription, changed: u64) -> Result<Ve
             subscription.id,
             subscription.tenant
         );
-    } else if polar::LICENSED.contains(&subscription.status.as_str()) {
+    } else if subscription.licensed() {
         return ci_wake::card_returned(db, &subscription.tenant).await;
+    } else {
+        crate::usage::close_windows(db, now_ms(), Some(&subscription.tenant)).await?;
     }
     Ok(Vec::new())
 }
@@ -335,10 +338,7 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn a_licensed_subscription_wakes_jobs_held_for_the_card() {
-        let db = Db::new();
-        tenant(&db, "t1", 11, "acme");
+    fn held_jobs(db: &Db) -> Vec<u64> {
         db.run(
             "INSERT INTO ci_repos (id, tenant_id, installation_id, full_name, default_branch, \
              private, updated_at) VALUES (7, 't1', 1, 'acme/app', 'main', false, 1)",
@@ -361,12 +361,18 @@ mod tests {
                 &params![plan],
             );
         }
-        let ids: Vec<u64> = db
-            .rows("SELECT id FROM ci_jobs ORDER BY id", &[])
+        db.rows("SELECT id FROM ci_jobs ORDER BY id", &[])
             .unwrap()
             .iter()
             .map(|row| row["id"].as_u64().unwrap())
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn a_licensed_subscription_wakes_jobs_held_for_the_card() {
+        let db = Db::new();
+        tenant(&db, "t1", 11, "acme");
+        let ids = held_jobs(&db);
         let canceled = subscription_of("sub_1", "t1", "canceled");
         assert_eq!(db.wait(settle(db.db(), &canceled, 1)).unwrap(), []);
         assert_eq!(held(&db), ["card", "card"]);
@@ -375,6 +381,73 @@ mod tests {
         let jobs: Vec<u64> = woken.iter().map(|job| job.job_id).collect();
         assert_eq!(jobs, ids);
         assert_eq!(held(&db), ["concurrency", "concurrency"]);
+    }
+
+    #[test]
+    fn a_licensed_subscription_set_to_cancel_still_wakes_held_jobs() {
+        let db = Db::new();
+        tenant(&db, "t1", 11, "acme");
+        let ids = held_jobs(&db);
+        db.run(
+            "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
+             ended_at) VALUES (1, 1, 't1', 'ubuntu-latest', 60, 60, $1)",
+            &params![NOW - 1_000],
+        );
+        let canceling = Subscription {
+            cancel_at_period_end: true,
+            ..subscription_of("sub_1", "t1", "active")
+        };
+        let woken = db.wait(settle(db.db(), &canceling, 1)).unwrap();
+        let jobs: Vec<u64> = woken.iter().map(|job| job.job_id).collect();
+        assert_eq!(jobs, ids);
+        assert_eq!(held(&db), ["concurrency", "concurrency"]);
+        assert_eq!(
+            db.rows("SELECT id FROM ci_usage_windows", &[])
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn an_ending_subscription_closes_the_open_window() {
+        let db = Db::new();
+        tenant(&db, "t1", 11, "acme");
+        db.run(
+            "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
+             ended_at) VALUES (1, 1, 't1', 'ubuntu-latest', 60, 60, $1)",
+            &params![NOW - 1_000],
+        );
+        // A licensed subscription sends no usage anywhere.
+        let active = subscription_of("sub_1", "t1", "active");
+        db.wait(settle(db.db(), &active, 1)).unwrap();
+        assert_eq!(
+            db.rows("SELECT id FROM ci_usage_windows", &[])
+                .unwrap()
+                .len(),
+            0
+        );
+        // A canceled one closes the open window at once.
+        let canceled = subscription_of("sub_1", "t1", "canceled");
+        db.wait(settle(db.db(), &canceled, 1)).unwrap();
+        let windows = db
+            .rows(
+                "SELECT tenant_id, units, seconds, jobs FROM ci_usage_windows",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0]["tenant_id"].as_str(), Some("t1"));
+        assert_eq!(windows[0]["units"].as_u64(), Some(60));
+        assert_eq!(windows[0]["jobs"].as_i64(), Some(1));
+        let tagged: u64 = db
+            .column(
+                "SELECT COUNT(*) AS n FROM ci_usage WHERE window_id IS NULL",
+                &[],
+                "n",
+            )
+            .unwrap();
+        assert_eq!(tagged, 0);
     }
 
     #[test]
