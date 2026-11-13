@@ -1699,6 +1699,12 @@ impl<'a> Cx<'a> {
             let Some(mut run) = self.loaded().await? else {
                 return answer(404);
             };
+            // A delivery whose rerun went through already is answered
+            // first: its job may have left the matrix since, and a 409
+            // would have the queue retry it until it failed.
+            if run.info.reran_for(delivery) {
+                return answer(204);
+            }
             // A job a rerun left out of its matrix is no part of the run.
             if run.graph.node(job).is_some_and(|n| n.stale) {
                 return answer(409);
