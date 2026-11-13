@@ -823,6 +823,7 @@ fn title_of(
         warnings: Vec::new(),
         check_sha: None,
         command: None,
+        rerun_deliveries: Vec::new(),
     };
     let mut github = github_context(&info, req.event, api);
     if let Some(fields) = github.as_object_mut() {
@@ -1015,6 +1016,7 @@ fn start_body(
             warnings: warnings.to_vec(),
             check_sha: check_sha(req),
             command: command_of(req),
+            rerun_deliveries: Vec::new(),
         },
         jobs,
         event: req.event.clone(),
