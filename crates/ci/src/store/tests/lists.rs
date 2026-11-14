@@ -212,12 +212,12 @@ fn the_latest_default_branch_run_is_the_one_that_counts() {
     db.wait(finish_run(db.db(), other.id, 1, "failure", 9))
         .unwrap();
     let _ = open;
-    let latest = db.wait(latest_on_default(db.db(), "t1", &[7])).unwrap();
+    let latest = db.wait(latest_on_default(db.db(), "t1", &[7], 0)).unwrap();
     assert_eq!(latest.len(), 1);
     assert_eq!(latest[0].run.id, new.id);
     assert_eq!(latest[0].repository, "acme/app");
     assert_eq!(
-        db.wait(latest_on_default(db.db(), "t1", &[]))
+        db.wait(latest_on_default(db.db(), "t1", &[], 0))
             .unwrap()
             .len(),
         0
@@ -617,4 +617,26 @@ fn a_run_past_its_retention_is_not_listed() {
     f.alive_at = 39 * DAY;
     let page = db.wait(runs_page(db.db(), &f, None, 10)).unwrap();
     assert_eq!(ids(&page), [new.id, old.id]);
+}
+
+#[test]
+fn the_latest_default_run_skips_runs_past_their_retention() {
+    let db = setup();
+    let old = run_with(&db, "a", "x", "refs/heads/main", 10 * DAY);
+    let new = run_with(&db, "b", "x", "refs/heads/main", 20 * DAY);
+    db.wait(finish_run(db.db(), old.id, 1, "failure", 10 * DAY + 1))
+        .unwrap();
+    db.wait(finish_run(db.db(), new.id, 1, "failure", 20 * DAY + 1))
+        .unwrap();
+    // At day 49 the newer run is still inside its 30 days; at day 50 it
+    // is not, and neither is the older one.
+    let latest = db
+        .wait(latest_on_default(db.db(), "t1", &[7], 49 * DAY))
+        .unwrap();
+    assert_eq!(latest.len(), 1);
+    assert_eq!(latest[0].run.id, new.id);
+    let latest = db
+        .wait(latest_on_default(db.db(), "t1", &[7], 50 * DAY))
+        .unwrap();
+    assert_eq!(latest.len(), 0);
 }

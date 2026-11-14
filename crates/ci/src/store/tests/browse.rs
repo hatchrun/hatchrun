@@ -143,8 +143,17 @@ fn a_pull_request_shows_its_newest_run() {
         .unwrap();
     assert_eq!(rows[0].last_run_id, Some(newest.id));
     assert_eq!(rows[1].last_run_id, None);
-    let listed = db.wait(listed_runs(db.db(), &[newest.id])).unwrap();
+    let listed = db.wait(listed_runs(db.db(), &[newest.id], 0)).unwrap();
     assert_eq!(listed[0].repository, "acme/app");
+    // The run is gone for the list once its 30 days are up.
+    let alive = db
+        .wait(listed_runs(db.db(), &[newest.id], 32 * DAY - 1))
+        .unwrap();
+    assert_eq!(alive.len(), 1);
+    let gone = db
+        .wait(listed_runs(db.db(), &[newest.id], 32 * DAY))
+        .unwrap();
+    assert_eq!(gone.len(), 0);
 }
 
 #[test]

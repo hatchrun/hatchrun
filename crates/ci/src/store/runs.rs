@@ -666,15 +666,16 @@ pub async fn runs_page(
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn listed_runs(db: &Db, ids: &[u64]) -> Result<Vec<ListedRun>> {
+pub async fn listed_runs(db: &Db, ids: &[u64], now: u64) -> Result<Vec<ListedRun>> {
     let ids: Vec<String> = ids.iter().map(u64::to_string).collect();
     db.all(
         &format!(
             "SELECT {LISTED_COLUMNS} FROM ci_runs r, ci_repos p \
              WHERE p.id = r.repo_id AND p.tenant_id = r.tenant_id \
-             AND r.id = ANY (string_to_array($1, ',')::bigint[])"
+             AND r.id = ANY (string_to_array($1, ',')::bigint[]) \
+             AND r.created_at + r.tier::bigint * 86400000 > $2"
         ),
-        &params![ids.join(",")],
+        &params![ids.join(","), now],
     )
     .await
 }
@@ -820,12 +821,18 @@ pub async fn run_counts(db: &Db, filter: &RunFilter) -> Result<RunCounts> {
 }
 
 /// The newest completed run on the default branch of each repository
-/// in `repo_ids` of `tenant`, for those that have one.
+/// in `repo_ids` of `tenant` still inside its retention at `now`, for
+/// those that have one.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn latest_on_default(db: &Db, tenant: &str, repo_ids: &[u64]) -> Result<Vec<ListedRun>> {
+pub async fn latest_on_default(
+    db: &Db,
+    tenant: &str,
+    repo_ids: &[u64],
+    now: u64,
+) -> Result<Vec<ListedRun>> {
     let ids: Vec<String> = repo_ids.iter().map(u64::to_string).collect();
     db.all(
         &format!(
@@ -834,9 +841,10 @@ pub async fn latest_on_default(db: &Db, tenant: &str, repo_ids: &[u64]) -> Resul
              WHERE p.id = r.repo_id AND p.tenant_id = r.tenant_id AND p.tenant_id = $1 \
              AND p.id = ANY (string_to_array($2, ',')::bigint[]) \
              AND r.status = 'completed' AND r.ref = 'refs/heads/' || p.default_branch \
+             AND r.created_at + r.tier::bigint * 86400000 > $3 \
              ORDER BY r.repo_id, r.created_at DESC, r.id DESC"
         ),
-        &params![tenant, ids.join(",")],
+        &params![tenant, ids.join(","), now],
     )
     .await
 }
