@@ -601,3 +601,20 @@ fn audit_rows_page_newest_first_and_filter_by_repository() {
         .unwrap();
     assert_eq!((none.len(), total), (0, 0));
 }
+
+#[test]
+fn a_run_past_its_retention_is_not_listed() {
+    let db = setup();
+    let old = run_with(&db, "a", "octocat", "refs/heads/main", 10 * DAY);
+    let new = run_with(&db, "b", "octocat", "refs/heads/main", 20 * DAY);
+    let mut f = filter();
+    // The 30 day tier: the first run is past it, the second is not,
+    // though both still sit in the same month partition.
+    f.alive_at = 40 * DAY;
+    let page = db.wait(runs_page(db.db(), &f, None, 10)).unwrap();
+    assert_eq!(ids(&page), [new.id]);
+    assert_eq!(db.wait(run_counts(db.db(), &f)).unwrap().all, 1);
+    f.alive_at = 39 * DAY;
+    let page = db.wait(runs_page(db.db(), &f, None, 10)).unwrap();
+    assert_eq!(ids(&page), [new.id, old.id]);
+}

@@ -517,6 +517,10 @@ pub struct RunFilter {
     pub since: u64,
     /// Runs recorded before this, in Unix milliseconds.
     pub until: Option<u64>,
+    /// Runs still inside their retention at this time, in Unix
+    /// milliseconds. A run past it waits for its month partition to
+    /// drop and is no longer listed.
+    pub alive_at: u64,
 }
 
 /// A run of a list, with the name of its repository.
@@ -554,7 +558,7 @@ pub(super) fn like(text: &str) -> String {
 }
 
 /// The `WHERE` of a run list over `ci_runs r` and `ci_repos p`, and
-/// its parameters `$1` to `$10`.
+/// its parameters `$1` to `$11`.
 fn run_where(filter: &RunFilter) -> (String, Vec<hatchrun_cloud::db::Param>) {
     let mut sql = String::from(
         "p.id = r.repo_id AND p.tenant_id = r.tenant_id \
@@ -570,7 +574,8 @@ fn run_where(filter: &RunFilter) -> (String, Vec<hatchrun_cloud::db::Param>) {
          AND ($7::text IS NULL OR r.workflow ILIKE $7 OR r.ref ILIKE $7 OR r.actor ILIKE $7 \
            OR r.sha ILIKE $8::text) \
          AND ($9::text IS NULL OR r.workflow = ANY (string_to_array($9, ','))) \
-         AND ($10::bigint IS NULL OR r.pull_number = $10::bigint)",
+         AND ($10::bigint IS NULL OR r.pull_number = $10::bigint) \
+         AND r.created_at + r.tier::bigint * 86400000 > $11",
     );
     if !filter.states.is_empty() {
         let any: Vec<&str> = filter.states.iter().map(|s| s.condition()).collect();
@@ -595,7 +600,8 @@ fn run_where(filter: &RunFilter) -> (String, Vec<hatchrun_cloud::db::Param>) {
         text,
         sha,
         list(&filter.workflows),
-        filter.pull
+        filter.pull,
+        filter.alive_at
     ];
     (sql, bound)
 }
@@ -647,8 +653,8 @@ pub async fn runs_page(
     let page = format!(
         "SELECT {LISTED_COLUMNS} FROM ci_runs r, ci_repos p \
          WHERE {conditions} \
-         AND ($11::bigint IS NULL OR (r.created_at, r.id) < ($11::bigint, $12::bigint)) \
-         ORDER BY r.created_at DESC, r.id DESC LIMIT $13"
+         AND ($12::bigint IS NULL OR (r.created_at, r.id) < ($12::bigint, $13::bigint)) \
+         ORDER BY r.created_at DESC, r.id DESC LIMIT $14"
     );
     let rows = db.all(&page, &bound).await?;
     Ok((rows, total))

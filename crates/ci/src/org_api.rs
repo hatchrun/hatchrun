@@ -221,6 +221,7 @@ pub fn run_filter(
             .number("since")?
             .unwrap_or_else(|| now.saturating_sub(window)),
         until: query.number("until")?,
+        alive_at: now,
     })
 }
 

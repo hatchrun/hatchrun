@@ -33,6 +33,10 @@
 -- and ci_concurrency rows name their run, so the upkeep deletes the
 -- rows of a dropped month before it drops the partition.
 
+-- Month boundaries are UTC, as the reconciler's upkeep makes them, so
+-- the partitions made here never overlap the ones it adds later.
+SET LOCAL TIME ZONE 'UTC';
+
 ALTER TABLE ci_jobs DROP CONSTRAINT IF EXISTS ci_jobs_run_id_fkey;
 ALTER TABLE ci_artifacts DROP CONSTRAINT IF EXISTS ci_artifacts_run_id_fkey;
 ALTER TABLE ci_artifacts DROP CONSTRAINT IF EXISTS ci_artifacts_job_id_fkey;
@@ -224,7 +228,9 @@ BEGIN
     SELECT date_trunc('month', to_timestamp(MIN(r.created_at) / 1000.0)),
            date_trunc('month', to_timestamp(MAX(r.created_at) / 1000.0))
       INTO first_ts, last_ts
-      FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id AND r.tier = t;
+      -- Every run month, not only the months with jobs yet: a retried
+      -- delivery adds the missing jobs of a run later, in its month.
+      FROM ci_runs r WHERE r.tier = t;
     IF first_ts IS NULL THEN CONTINUE; END IF;
     cur := first_ts;
     WHILE cur <= last_ts LOOP

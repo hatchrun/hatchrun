@@ -64,13 +64,14 @@ fn migrations() -> Vec<String> {
         .collect()
 }
 
+// Tests migrate one at a time: a migration may change the database
+// itself, which two sessions cannot do at once.
+static MIGRATING: Mutex<()> = Mutex::new(());
+
 impl Db {
     /// A fresh schema, migrated.
     pub fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        // Tests migrate one at a time: a migration may change the
-        // database itself, which two sessions cannot do at once.
-        static MIGRATING: Mutex<()> = Mutex::new(());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .enable_time()
@@ -350,7 +351,6 @@ mod tests {
     }
 
     static MIGRATION_SCHEMA_NEXT: AtomicU64 = AtomicU64::new(0);
-    static MIGRATION_LOCK: Mutex<()> = Mutex::new(());
 
     /// The migration files in name order, each with its file name.
     fn migration_files() -> Vec<(String, String)> {
@@ -441,7 +441,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn migration_0027_moves_existing_rows_into_tiered_partitions() {
-        let _lock = MIGRATION_LOCK
+        let _lock = super::MIGRATING
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let runtime = tokio::runtime::Builder::new_current_thread()

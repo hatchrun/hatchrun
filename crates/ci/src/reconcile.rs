@@ -1297,10 +1297,10 @@ impl PoolPass<'_> {
 /// months exist, purges the objects of the runs in expired months
 /// within `budget`, and drops the months whose runs are all purged. A
 /// run that concluded purges its own object once its snapshot lands;
-/// a run that never concluded or never snapshotted never armed that
-/// purge, so the pass calls its object's /purge first and its month
-/// drops only once every such purge succeeded. Returns how many
-/// partitions were dropped.
+/// a run that never concluded never armed that purge, so the pass
+/// calls its object's /purge first and its month drops only once every
+/// such purge succeeded. A month whose purges fail stays for the next
+/// pass while later months go on. Returns how many purges failed.
 async fn retain(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<u32, String> {
     store::ensure_partitions(db, now)
         .await
@@ -1309,6 +1309,7 @@ async fn retain(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<u32, St
         .await
         .map_err(|e| e.to_string())?;
     let mut purged = Vec::new();
+    let mut failed = 0u32;
     for partition in expired {
         let left = budget.left();
         if left == 0 {
@@ -1335,16 +1336,23 @@ async fn retain(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<u32, St
         store::mark_purged(db, &partition, &done, now)
             .await
             .map_err(|e| e.to_string())?;
-        let every = u32::try_from(ids.len()).unwrap_or(u32::MAX) < left;
-        if done.len() < ids.len() || !every {
+        let misses = ids.len() - done.len();
+        failed = failed.saturating_add(u32::try_from(misses).unwrap_or(u32::MAX));
+        if u32::try_from(ids.len()).unwrap_or(u32::MAX) >= left {
+            // The budget ran out inside this month; the rest wait.
             break;
         }
-        purged.push(partition);
+        if misses == 0 {
+            purged.push(partition);
+        }
     }
     let dropped = store::drop_expired_partitions(db, now, &purged)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(u32::try_from(dropped.len()).unwrap_or(u32::MAX))
+    if !dropped.is_empty() {
+        console_log!("reconcile: dropped {} expired partitions", dropped.len());
+    }
+    Ok(failed)
 }
 
 async fn purge(env: &Env, run_id: u64) -> worker::Result<()> {
