@@ -248,20 +248,23 @@ pub struct WorkflowRow {
     pub failed_7d: u64,
 }
 
-/// The workflows of repository `$1` of tenant `$2` with runs, each
-/// with its newest run and its runs since `$3`.
+/// The workflows of repository `$1` of tenant `$2` with runs still
+/// inside their retention at `$7`, each with its newest such run and
+/// its runs since `$3`.
 const WORKFLOWS: &str = "SELECT r.workflow AS name, \
        (array_agg(r.id ORDER BY r.created_at DESC, r.id DESC))[1] AS last_run_id, \
        max(r.created_at) AS last_at, \
        count(*) FILTER (WHERE r.created_at >= $3) AS runs_7d, \
        count(*) FILTER (WHERE r.created_at >= $3 AND r.conclusion = 'success') AS passed_7d, \
        count(*) FILTER (WHERE r.created_at >= $3 AND r.conclusion = 'failure') AS failed_7d \
-     FROM ci_runs r WHERE r.repo_id = $1 AND r.tenant_id = $2 GROUP BY r.workflow";
+     FROM ci_runs r WHERE r.repo_id = $1 AND r.tenant_id = $2 \
+       AND r.created_at + r.tier::bigint * 86400000 > $7 GROUP BY r.workflow";
 
 /// A page of the workflows that ran in repository `repo_id` of
 /// `tenant`, the newest activity first, those after `after` when it is
 /// set, at most `limit`; and how many there are in all. `since` starts
-/// the window of the counts.
+/// the window of the counts, and only runs inside their retention at
+/// `now` count.
 ///
 /// # Errors
 ///
@@ -270,6 +273,7 @@ pub async fn workflows_page(
     db: &Db,
     repo_id: u64,
     tenant: &str,
+    now: u64,
     since: u64,
     after: Option<After>,
     limit: u32,
@@ -280,9 +284,10 @@ pub async fn workflows_page(
     }
     let total = db
         .first::<Total>(
-            "SELECT count(DISTINCT workflow) AS total FROM ci_runs \
-             WHERE repo_id = $1 AND tenant_id = $2",
-            &params![repo_id, tenant],
+            "SELECT count(DISTINCT r.workflow) AS total FROM ci_runs r \
+             WHERE r.repo_id = $1 AND r.tenant_id = $2 \
+             AND r.created_at + r.tier::bigint * 86400000 > $3",
+            &params![repo_id, tenant, now],
         )
         .await?
         .map_or(0, |row| row.total);
@@ -300,7 +305,8 @@ pub async fn workflows_page(
                 since,
                 after.map(|a| a.created_at),
                 after.map(|a| a.id),
-                limit
+                limit,
+                now
             ],
         )
         .await?;
@@ -331,14 +337,16 @@ pub struct BranchAfter {
     pub run: After,
 }
 
-/// The branches of repository `$1` of tenant `$2` that ran, whose name
-/// holds `$3` when it is set, and where the default branch `$4` is.
-fn branches_sql() -> String {
+/// The branches of repository `$1` of tenant `$2` with runs still
+/// inside their retention at parameter `alive`, whose name holds `$3`
+/// when it is set.
+fn branches_sql(alive: &str) -> String {
     format!(
         "SELECT * FROM (SELECT {BRANCH} AS name, count(*) AS runs, \
            (array_agg(r.id ORDER BY r.created_at DESC, r.id DESC))[1] AS last_run_id, \
            max(r.created_at) AS last_at FROM ci_runs r \
-           WHERE r.repo_id = $1 AND r.tenant_id = $2 GROUP BY 1) b \
+           WHERE r.repo_id = $1 AND r.tenant_id = $2 \
+           AND r.created_at + r.tier::bigint * 86400000 > {alive}::bigint GROUP BY 1) b \
          WHERE b.name IS NOT NULL AND ($3::text IS NULL OR b.name ILIKE $3::text)"
     )
 }
@@ -346,15 +354,18 @@ fn branches_sql() -> String {
 /// A page of the branches that ran in repository `repo_id` of
 /// `tenant`, the default branch first and then the newest activity,
 /// those after `after` when it is set, at most `limit`; and how many
-/// there are in all. `q` narrows the names.
+/// there are in all. `q` narrows the names, and only runs inside their
+/// retention at `now` count.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
+#[allow(clippy::too_many_arguments)] // One query's binds.
 pub async fn branches_page(
     db: &Db,
     repo_id: u64,
     tenant: &str,
+    now: u64,
     default_branch: &str,
     q: Option<&str>,
     after: Option<BranchAfter>,
@@ -367,8 +378,8 @@ pub async fn branches_page(
     let pattern = q.map(like);
     let total = db
         .first::<Total>(
-            &format!("SELECT count(*) AS total FROM ({}) n", branches_sql()),
-            &params![repo_id, tenant, &pattern],
+            &format!("SELECT count(*) AS total FROM ({}) n", branches_sql("$4")),
+            &params![repo_id, tenant, &pattern, now],
         )
         .await?
         .map_or(0, |row| row.total);
@@ -381,7 +392,7 @@ pub async fn branches_page(
              > ($5::bigint, -$6::bigint, -$7::bigint)) \
          ORDER BY (CASE WHEN name = $4::text THEN 0 ELSE 1 END), last_at DESC, last_run_id DESC \
          LIMIT $8",
-        branches_sql()
+        branches_sql("$9")
     );
     let rows = db
         .all(
@@ -394,7 +405,8 @@ pub async fn branches_page(
                 after.map(|a| a.rank),
                 after.map(|a| a.run.created_at),
                 after.map(|a| a.run.id),
-                limit
+                limit,
+                now
             ],
         )
         .await?;
@@ -447,10 +459,12 @@ const PULLS_WHERE: &str = "n.repo_id = $1 \
 /// # Errors
 ///
 /// Postgres refused the statement.
+#[allow(clippy::too_many_arguments)] // One query's binds.
 pub async fn pulls_page(
     db: &Db,
     repo_id: u64,
     tenant: &str,
+    now: u64,
     state: Option<&str>,
     q: Option<&str>,
     after: Option<PullAfter>,
@@ -471,7 +485,8 @@ pub async fn pulls_page(
     let sql = format!(
         "SELECT n.number, n.title, n.head_ref, n.base_ref, n.author, n.state, n.updated_at, \
            (SELECT r.id FROM ci_runs r WHERE r.repo_id = n.repo_id AND r.tenant_id = $2 \
-            AND r.pull_number = n.number ORDER BY r.created_at DESC, r.id DESC LIMIT 1) \
+            AND r.pull_number = n.number AND r.created_at + r.tier::bigint * 86400000 > $9 \
+            ORDER BY r.created_at DESC, r.id DESC LIMIT 1) \
            AS last_run_id \
          FROM ci_pulls n WHERE {PULLS_WHERE} \
          AND ($6::bigint IS NULL OR (n.updated_at, n.number) < ($6::bigint, $7::bigint)) \
@@ -488,7 +503,8 @@ pub async fn pulls_page(
                 q,
                 after.map(|a| a.updated_at),
                 after.map(|a| a.number),
-                limit
+                limit,
+                now
             ],
         )
         .await?;

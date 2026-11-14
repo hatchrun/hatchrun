@@ -791,8 +791,16 @@ async fn workflows_done(cx: &Cx<'_>, owner: &str, name: &str, query: Option<&str
         id: c[1],
     });
     let since = now_ms().saturating_sub(WORKFLOW_WINDOW_MS);
-    let (mut rows, total) =
-        store::workflows_page(cx.db, repo.id, &repo.tenant_id, since, after, limit + 1).await?;
+    let (mut rows, total) = store::workflows_page(
+        cx.db,
+        repo.id,
+        &repo.tenant_id,
+        now_ms(),
+        since,
+        after,
+        limit + 1,
+    )
+    .await?;
     let more = rows.len() > limit as usize;
     rows.truncate(limit as usize);
     let next = rows
@@ -854,6 +862,7 @@ async fn branches_done(cx: &Cx<'_>, owner: &str, name: &str, query: Option<&str>
         cx.db,
         repo.id,
         &repo.tenant_id,
+        now_ms(),
         &repo.default_branch,
         text.as_deref(),
         after,
@@ -930,6 +939,7 @@ async fn pulls_done(cx: &Cx<'_>, owner: &str, name: &str, query: Option<&str>) -
         cx.db,
         repo.id,
         &repo.tenant_id,
+        now_ms(),
         state,
         text.as_deref(),
         after,
