@@ -181,13 +181,16 @@ fn job_counts_and_approvals() {
         }
     );
     assert!(!counts.contains_key(&999));
-    let approvals = db.wait(approval_jobs(db.db(), "t1", 10)).unwrap();
+    let approvals = db.wait(approval_jobs(db.db(), "t1", 0, 10)).unwrap();
     assert_eq!(approvals.len(), 1);
     assert_eq!(approvals[0].job_name, "deploy");
     assert_eq!(approvals[0].environment.as_deref(), Some("prod"));
     assert_eq!(approvals[0].since, 99);
     assert_eq!(approvals[0].run.repository, "acme/app");
-    assert_eq!(db.wait(approval_jobs(db.db(), "t2", 10)).unwrap().len(), 0);
+    assert_eq!(
+        db.wait(approval_jobs(db.db(), "t2", 0, 10)).unwrap().len(),
+        0
+    );
 
     // A run with a job waiting for approval is waiting, not running.
     db.wait(run_started(db.db(), run.id, 6)).unwrap();

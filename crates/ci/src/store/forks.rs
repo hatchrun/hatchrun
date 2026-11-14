@@ -218,11 +218,13 @@ const UNFINISHED: &str = "SELECT {columns} FROM (\
      WHERE rn <= $2 ORDER BY gate_scanned_at, gate_at, id LIMIT $1";
 
 /// The runs of the repositories `$2` of tenant `$1` that wait for an
-/// approval, the oldest first, at most `$3`.
+/// approval and are still inside their retention at `$4`, the oldest
+/// first, at most `$3`.
 const WAITING_RUNS: &str = "SELECT {columns} FROM ci_runs r, ci_repos p \
      WHERE p.id = r.repo_id AND p.tenant_id = r.tenant_id AND p.tenant_id = $1 \
      AND p.id = ANY (string_to_array($2, ',')::bigint[]) AND r.gate_status = 'pending' \
-     AND r.status <> 'completed' ORDER BY r.created_at, r.id LIMIT $3";
+     AND r.status <> 'completed' AND r.created_at + r.tier::bigint * 86400000 > $4 \
+     ORDER BY r.created_at, r.id LIMIT $3";
 
 /// The policy of repository `repo_id`: the row when one was saved,
 /// otherwise the defaults for a repository that is `private` or not.
@@ -642,8 +644,9 @@ pub async fn runs_needing_card(
     .await
 }
 
-/// The runs of `repo_ids` of `tenant` that wait for an approval, the
-/// longest waiting first, at most `limit`.
+/// The runs of `repo_ids` of `tenant` that wait for an approval and
+/// are still inside their retention at `now`, the longest waiting
+/// first, at most `limit`.
 ///
 /// # Errors
 ///
@@ -652,12 +655,13 @@ pub async fn pending_gate_runs(
     db: &Db,
     tenant: &str,
     repo_ids: &[u64],
+    now: u64,
     limit: u32,
 ) -> Result<Vec<ListedRun>> {
     let ids: Vec<String> = repo_ids.iter().map(u64::to_string).collect();
     db.all(
         &with_columns(WAITING_RUNS, super::runs::LISTED_COLUMNS),
-        &params![tenant, ids.join(","), limit],
+        &params![tenant, ids.join(","), limit, now],
     )
     .await
 }

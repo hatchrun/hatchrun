@@ -407,7 +407,24 @@ mod tests {
         FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id;
         INSERT INTO ci_audit (tenant_id, at, actor, action, scope, repo, target) \
         VALUES ('t1', 1704067200000, 'me', 'secret.put', 'org', NULL, 'TOKEN'),
-               ('t2', 1706745600000, 'you', 'var.put', 'repo', 'initech/app', 'MODE');";
+               ('t2', 1706745600000, 'you', 'var.put', 'repo', 'initech/app', 'MODE');
+        INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, ref, \
+                             sha, actor, status, created_at, updated_at, expires_at, trust, \
+                             author_login, author_association, gate, gate_status) \
+        VALUES ('t1', 7, 'ci', 9, 'd9', 'push', 'refs/heads/main', 'zzz', 'me', 'completed', \
+                1704067200000, 1704067200000, 1704067200000 + 30::bigint * 86400000, \
+                'trusted', 'me', '', 'none', 'none');
+        INSERT INTO ci_jobs (run_id, plan_id, name, status, timeout_minutes, token_permissions, \
+                             secret_refs, needs, created_at, updated_at) \
+        SELECT id, 'build', 'build', 'completed', 10, '{\"metadata\":\"read\"}', \
+               '{\"all\":false,\"names\":[]}', '[]', created_at, created_at \
+        FROM ci_runs WHERE delivery = 'd9';
+        INSERT INTO ci_audit (tenant_id, at, actor, action, scope, repo, target) \
+        VALUES ('t1', 1704067200000, 'me', 'secret.put', 'org', NULL, 'GONE');
+        -- Retention deleted the newest rows, so each sequence is past
+        -- the highest id left.
+        DELETE FROM ci_runs WHERE delivery = 'd9';
+        DELETE FROM ci_audit WHERE target = 'GONE';";
 
     async fn migration_count(client: &tokio_postgres::Client, table: &str) -> i64 {
         client
@@ -530,10 +547,11 @@ mod tests {
                 .get(0);
             assert_eq!(fkeys, 0);
 
+            // The sequences keep the ids the deleted tail used.
             for (sequence, last) in [
-                ("ci_runs_id_seq", 3),
-                ("ci_jobs_id_seq", 3),
-                ("ci_audit_id_seq", 2),
+                ("ci_runs_id_seq", 4),
+                ("ci_jobs_id_seq", 4),
+                ("ci_audit_id_seq", 3),
             ] {
                 let value: i64 = client
                     .query_one(&format!("SELECT last_value FROM {sequence}"), &[])

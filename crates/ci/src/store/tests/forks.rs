@@ -491,29 +491,37 @@ fn the_app_lists_the_pending_runs_of_the_tenants_readable_repositories() {
     fork_run(&db, "b", 2, "s2", "mallory", GateStatus::Deferred, 6);
     fork_run(&db, "c", 3, "s3", "mallory", GateStatus::NotGated, 7);
     let c = fork_run(&db, "d", 4, "s4", "eve", GateStatus::Pending, 3);
-    let listed = db.wait(pending_gate_runs(db.db(), "t1", &[7], 10)).unwrap();
+    let listed = db
+        .wait(pending_gate_runs(db.db(), "t1", &[7], 0, 10))
+        .unwrap();
     let ids: Vec<u64> = listed.iter().map(|row| row.run.id).collect();
     assert_eq!(ids, [c.id, a.id], "the longest waiting first");
     assert_eq!(listed[0].repository, "acme/app");
     assert_eq!(listed[0].run.trust, Trust::Fork);
     assert_eq!(
-        db.wait(pending_gate_runs(db.db(), "t1", &[8], 10))
+        db.wait(pending_gate_runs(db.db(), "t1", &[8], 0, 10))
             .unwrap()
             .len(),
         0
     );
     assert_eq!(
-        db.wait(pending_gate_runs(db.db(), "t2", &[7], 10))
+        db.wait(pending_gate_runs(db.db(), "t2", &[7], 0, 10))
             .unwrap()
             .len(),
         0
     );
     assert_eq!(
-        db.wait(pending_gate_runs(db.db(), "t1", &[7], 1))
+        db.wait(pending_gate_runs(db.db(), "t1", &[7], 0, 1))
             .unwrap()
             .len(),
         1
     );
+    // Past its 30 days the older run leaves the list.
+    let alive = db
+        .wait(pending_gate_runs(db.db(), "t1", &[7], 30 * DAY + 4, 10))
+        .unwrap();
+    let ids: Vec<u64> = alive.iter().map(|row| row.run.id).collect();
+    assert_eq!(ids, [a.id]);
 }
 
 #[test]

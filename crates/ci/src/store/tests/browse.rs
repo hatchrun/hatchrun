@@ -170,7 +170,12 @@ fn workflows_and_branches_are_grouped_from_runs() {
     db.wait(finish_run(db.db(), pr.id, 1, "success", now))
         .unwrap();
 
-    let counts = db.wait(repo_counts(db.db(), 7, "t1")).unwrap();
+    // Once the main run is past its 30 days, its branch no longer counts.
+    let later = db
+        .wait(repo_counts(db.db(), 7, "t1", now + 20 * DAY))
+        .unwrap();
+    assert_eq!(later.branches, 2);
+    let counts = db.wait(repo_counts(db.db(), 7, "t1", 0)).unwrap();
     assert_eq!(
         counts,
         RepoCounts {

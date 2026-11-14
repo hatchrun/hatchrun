@@ -138,6 +138,13 @@ INSERT INTO ci_runs_new
    gate_scanned_at, head_sha, lints, issue_number, comment_id, command_name, command_reaction
   FROM ci_runs;
 
+-- The ids the old sequence handed out stay used even when retention
+-- deleted their rows: run and job ids name Durable Objects and R2
+-- snapshots, so the new sequence starts past the old high-water mark.
+CREATE TEMP TABLE ci_runs_id_mark AS
+  SELECT GREATEST(
+    COALESCE(pg_sequence_last_value(pg_get_serial_sequence('ci_runs', 'id')::regclass), 0),
+    COALESCE((SELECT MAX(id) FROM ci_runs), 0)) AS hw;
 DROP TABLE ci_runs;
 ALTER TABLE ci_runs_new RENAME TO ci_runs;
 ALTER TABLE ci_runs RENAME CONSTRAINT ci_runs_new_pkey TO ci_runs_pkey;
@@ -145,7 +152,9 @@ ALTER TABLE ci_runs RENAME CONSTRAINT ci_runs_new_delivery_workflow_tier_created
   TO ci_runs_delivery_workflow_key;
 
 CREATE SEQUENCE ci_runs_id_seq;
-SELECT setval('ci_runs_id_seq', COALESCE((SELECT MAX(id) FROM ci_runs), 1), (SELECT COUNT(*) FROM ci_runs) > 0);
+SELECT setval('ci_runs_id_seq', GREATEST((SELECT hw FROM ci_runs_id_mark), 1),
+  (SELECT hw FROM ci_runs_id_mark) > 0);
+DROP TABLE ci_runs_id_mark;
 ALTER TABLE ci_runs ALTER COLUMN id SET DEFAULT nextval('ci_runs_id_seq');
 
 CREATE INDEX ci_runs_repo ON ci_runs (repo_id, created_at DESC);
@@ -259,6 +268,13 @@ INSERT INTO ci_jobs_new
    j.environment_url, j.superseded, j.cache_scopes
   FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id;
 
+-- The ids the old sequence handed out stay used even when retention
+-- deleted their rows: run and job ids name Durable Objects and R2
+-- snapshots, so the new sequence starts past the old high-water mark.
+CREATE TEMP TABLE ci_jobs_id_mark AS
+  SELECT GREATEST(
+    COALESCE(pg_sequence_last_value(pg_get_serial_sequence('ci_jobs', 'id')::regclass), 0),
+    COALESCE((SELECT MAX(id) FROM ci_jobs), 0)) AS hw;
 DROP TABLE ci_jobs;
 ALTER TABLE ci_jobs_new RENAME TO ci_jobs;
 ALTER TABLE ci_jobs RENAME CONSTRAINT ci_jobs_new_pkey TO ci_jobs_pkey;
@@ -266,7 +282,9 @@ ALTER TABLE ci_jobs RENAME CONSTRAINT ci_jobs_new_run_id_plan_id_tier_run_create
   TO ci_jobs_run_id_plan_id_key;
 
 CREATE SEQUENCE ci_jobs_id_seq;
-SELECT setval('ci_jobs_id_seq', COALESCE((SELECT MAX(id) FROM ci_jobs), 1), (SELECT COUNT(*) FROM ci_jobs) > 0);
+SELECT setval('ci_jobs_id_seq', GREATEST((SELECT hw FROM ci_jobs_id_mark), 1),
+  (SELECT hw FROM ci_jobs_id_mark) > 0);
+DROP TABLE ci_jobs_id_mark;
 ALTER TABLE ci_jobs ALTER COLUMN id SET DEFAULT nextval('ci_jobs_id_seq');
 
 CREATE INDEX ci_jobs_open ON ci_jobs (status, updated_at) WHERE status <> 'completed';
@@ -375,12 +393,21 @@ INSERT INTO ci_audit_new
   SELECT id, tenant_id, at, actor, action, scope, repo, target
   FROM ci_audit;
 
+-- The ids the old sequence handed out stay used even when retention
+-- deleted their rows: run and job ids name Durable Objects and R2
+-- snapshots, so the new sequence starts past the old high-water mark.
+CREATE TEMP TABLE ci_audit_id_mark AS
+  SELECT GREATEST(
+    COALESCE(pg_sequence_last_value(pg_get_serial_sequence('ci_audit', 'id')::regclass), 0),
+    COALESCE((SELECT MAX(id) FROM ci_audit), 0)) AS hw;
 DROP TABLE ci_audit;
 ALTER TABLE ci_audit_new RENAME TO ci_audit;
 ALTER TABLE ci_audit RENAME CONSTRAINT ci_audit_new_pkey TO ci_audit_pkey;
 
 CREATE SEQUENCE ci_audit_id_seq;
-SELECT setval('ci_audit_id_seq', COALESCE((SELECT MAX(id) FROM ci_audit), 1), (SELECT COUNT(*) FROM ci_audit) > 0);
+SELECT setval('ci_audit_id_seq', GREATEST((SELECT hw FROM ci_audit_id_mark), 1),
+  (SELECT hw FROM ci_audit_id_mark) > 0);
+DROP TABLE ci_audit_id_mark;
 ALTER TABLE ci_audit ALTER COLUMN id SET DEFAULT nextval('ci_audit_id_seq');
 
 CREATE INDEX ci_audit_tenant ON ci_audit (tenant_id, id DESC);

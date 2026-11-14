@@ -204,26 +204,29 @@ pub struct RepoCounts {
     pub open_pulls: u64,
 }
 
-/// The counts of repository `$1` of tenant `$2`.
+/// The counts of repository `$1` of tenant `$2`, over the runs still
+/// inside their retention at `$3`.
 fn counts_sql() -> String {
     format!(
         "SELECT \
            (SELECT count(DISTINCT r.workflow) FROM ci_runs r \
-            WHERE r.repo_id = $1 AND r.tenant_id = $2) AS workflows, \
+            WHERE r.repo_id = $1 AND r.tenant_id = $2 \
+              AND r.created_at + r.tier::bigint * 86400000 > $3) AS workflows, \
            (SELECT count(DISTINCT {BRANCH}) FROM ci_runs r \
-            WHERE r.repo_id = $1 AND r.tenant_id = $2) AS branches, \
+            WHERE r.repo_id = $1 AND r.tenant_id = $2 \
+              AND r.created_at + r.tier::bigint * 86400000 > $3) AS branches, \
            (SELECT count(*) FROM ci_pulls WHERE repo_id = $1 AND state = 'open') AS open_pulls"
     )
 }
 
-/// What repository `repo_id` of `tenant` counts.
+/// What repository `repo_id` of `tenant` counts at `now`.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn repo_counts(db: &Db, repo_id: u64, tenant: &str) -> Result<RepoCounts> {
+pub async fn repo_counts(db: &Db, repo_id: u64, tenant: &str, now: u64) -> Result<RepoCounts> {
     Ok(db
-        .first(&counts_sql(), &params![repo_id, tenant])
+        .first(&counts_sql(), &params![repo_id, tenant, now])
         .await?
         .unwrap_or_default())
 }

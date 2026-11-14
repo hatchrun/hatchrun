@@ -1196,13 +1196,18 @@ pub struct ApprovalJob {
     pub run: super::runs::ListedRun,
 }
 
-/// The jobs of `tenant` held for approval, the longest waiting first,
-/// at most `limit`.
+/// The jobs of `tenant` held for approval whose run is still inside its
+/// retention at `now`, the longest waiting first, at most `limit`.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn approval_jobs(db: &Db, tenant: &str, limit: u32) -> Result<Vec<ApprovalJob>> {
+pub async fn approval_jobs(
+    db: &Db,
+    tenant: &str,
+    now: u64,
+    limit: u32,
+) -> Result<Vec<ApprovalJob>> {
     db.all(
         &format!(
             "SELECT j.id AS job_id, j.name AS job_name, j.environment, j.updated_at AS since, \
@@ -1210,10 +1215,11 @@ pub async fn approval_jobs(db: &Db, tenant: &str, limit: u32) -> Result<Vec<Appr
              FROM ci_jobs j, ci_runs r, ci_repos p \
              WHERE j.run_id = r.id AND p.id = r.repo_id AND p.tenant_id = r.tenant_id \
              AND p.tenant_id = $1 AND j.status = 'queued' AND j.held = 'approval' \
+             AND r.created_at + r.tier::bigint * 86400000 > $3 \
              ORDER BY j.updated_at, j.id LIMIT $2",
             columns = super::runs::LISTED_COLUMNS
         ),
-        &params![tenant, limit],
+        &params![tenant, limit, now],
     )
     .await
 }

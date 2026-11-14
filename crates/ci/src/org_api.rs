@@ -359,7 +359,7 @@ async fn needs_you_done(cx: &Cx<'_>, org: &str) -> Done {
     let (tenant, admin, session) = member_tenant(cx, org).await?;
     // Only an admin of the organization can approve a job.
     let approvals = if admin {
-        store::approval_jobs(cx.db, &tenant.id, NEEDS_LIMIT).await?
+        store::approval_jobs(cx.db, &tenant.id, now_ms(), NEEDS_LIMIT).await?
     } else {
         Vec::new()
     };
@@ -368,7 +368,7 @@ async fn needs_you_done(cx: &Cx<'_>, org: &str) -> Done {
     // can write may approve one; the list is the organization admins',
     // like the environment approvals.
     let fork_approvals = if admin {
-        store::pending_gate_runs(cx.db, &tenant.id, &ids, NEEDS_LIMIT).await?
+        store::pending_gate_runs(cx.db, &tenant.id, &ids, now_ms(), NEEDS_LIMIT).await?
     } else {
         Vec::new()
     };
@@ -743,7 +743,7 @@ async fn repo_done(cx: &Cx<'_>, owner: &str, name: &str) -> Done {
         .repo_access(owner, name, Access::Read)
         .await?
         .map_err(Fail::Stop)?;
-    let counts = store::repo_counts(cx.db, repo.id, &repo.tenant_id).await?;
+    let counts = store::repo_counts(cx.db, repo.id, &repo.tenant_id, now_ms()).await?;
     let enabled = store::repo_enabled(cx.db, &repo.tenant_id, repo.id).await?;
     Ok(Response::from_json(&repo_body(
         &repo, enabled, &counts, access,
