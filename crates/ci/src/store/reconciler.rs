@@ -12,9 +12,10 @@ use worker::Result;
 use super::jobs::{JOB_COLUMNS, JobRow};
 use super::with_columns;
 
-/// How long delivery ids are kept, in milliseconds. Runs, jobs, usage
-/// and audit rows go with the month partition they sit in.
-const RETENTION_MS: u64 = 30 * 86_400_000;
+/// How long webhook deliveries are kept, in milliseconds. Like runs,
+/// jobs, usage and audit rows, they go with the month partition they
+/// sit in.
+const DELIVERY_RETENTION_MS: u64 = 30 * 86_400_000;
 
 /// The retention tiers, in days: the `tier` of a partitioned row is the
 /// retention its tenant had when the row was recorded.
@@ -99,9 +100,6 @@ const STALLED_JOBS: &str = "SELECT {columns} FROM ci_jobs WHERE \
      OR (status IN ('launching', 'launched') AND updated_at < $3) \
      OR (status = 'running' AND COALESCE(heartbeat_at, started_at, updated_at) < $4) \
      ORDER BY updated_at, id LIMIT $5";
-
-/// Deletes delivery ids received before `$1`.
-const SWEEP_DELIVERIES: &str = "DELETE FROM ci_deliveries WHERE received_at < $1";
 
 /// The month partitions of parent `$1` in this schema, oldest first.
 const PARTITIONS: &str = "SELECT c.relname AS name FROM pg_class c      JOIN pg_inherits i ON i.inhrelid = c.oid      JOIN pg_class p ON p.oid = i.inhparent      JOIN pg_namespace n ON n.oid = c.relnamespace      WHERE p.relname = $1 AND n.nspname = current_schema() ORDER BY 1";
@@ -195,8 +193,8 @@ pub async fn set_last_minute(db: &Db, minute_ms: u64) -> Result<()> {
 }
 
 /// Makes sure the partitions of this month and the next two months
-/// exist: the runs and jobs of each tier, and the usage and audit
-/// months. Creating one that exists already changes nothing.
+/// exist: the runs and jobs of each tier, and the usage, audit and
+/// delivery months. Creating one that exists already changes nothing.
 ///
 /// # Errors
 ///
@@ -219,7 +217,7 @@ pub async fn ensure_partitions(db: &Db, now: u64) -> Result<()> {
                 ));
             }
         }
-        for parent in ["ci_usage", "ci_audit"] {
+        for parent in ["ci_usage", "ci_audit", "ci_deliveries"] {
             sql.push(format!(
                 "CREATE TABLE IF NOT EXISTS {parent}_{label}              PARTITION OF {parent} FOR VALUES FROM ({start}) TO ({end})"
             ));
@@ -332,11 +330,11 @@ pub async fn mark_purged(db: &Db, partition: &str, ids: &[u64], now: u64) -> Res
 }
 
 /// Drops the month partitions whose whole month is older than what
-/// they keep: a usage month older than 90 days, an audit month older
-/// than 400 days, and the run months in `purged` with the job months of
-/// the same tier and month. The artifacts and concurrency rows of a
-/// dropped run month go in the same pass, and delivery ids older than
-/// 30 days with them. A run month drops only once every run in it that
+/// they keep: a delivery month older than 30 days, a usage month older
+/// than 90 days, an audit month older than 400 days, and the run months
+/// in `purged` with the job months of the same tier and month. The
+/// artifacts and concurrency rows of a dropped run month go in the same
+/// pass. A run month drops only once every run in it that
 /// never concluded is purged, so the caller purges through
 /// [`expired_run_partitions`] and [`runs_needing_purge`] first and
 /// lists here what is fully purged. Returns the partitions dropped,
@@ -348,6 +346,7 @@ pub async fn mark_purged(db: &Db, partition: &str, ids: &[u64], now: u64) -> Res
 pub async fn drop_expired_partitions(db: &Db, now: u64, purged: &[String]) -> Result<Vec<String>> {
     let mut expired = expired_months(db, "ci_usage", USAGE_RETENTION_MS, now).await?;
     expired.extend(expired_months(db, "ci_audit", AUDIT_RETENTION_MS, now).await?);
+    expired.extend(expired_months(db, "ci_deliveries", DELIVERY_RETENTION_MS, now).await?);
     let mut runs = Vec::new();
     for tier in TIERS {
         let retention = u64::try_from(tier).unwrap_or(30) * DAY_MS;
@@ -370,10 +369,7 @@ pub async fn drop_expired_partitions(db: &Db, now: u64, purged: &[String]) -> Re
     runs.sort();
     expired.extend(runs.iter().cloned());
     expired.sort();
-    let mut sql = vec![(
-        SWEEP_DELIVERIES.to_owned(),
-        params![now.saturating_sub(RETENTION_MS)],
-    )];
+    let mut sql: Vec<(String, Vec<Param>)> = Vec::new();
     for partition in &runs {
         sql.push((
             format!("DELETE FROM ci_artifacts WHERE run_id IN (SELECT id FROM {partition})"),

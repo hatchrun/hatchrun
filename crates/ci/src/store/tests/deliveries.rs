@@ -448,6 +448,11 @@ fn resends_count_toward_the_cap_and_capped_deliveries_fail() {
     );
 }
 
+/// Locks the slot of guid `g` in `ci_delivery_locks`, as the intake
+/// does before it stores a delivery.
+const LOCK_G: &str =
+    "SELECT slot FROM ci_delivery_locks WHERE slot = hashtext('g') & 1023 FOR UPDATE";
+
 /// Runs `second` on `other` while `db` holds an open transaction, which
 /// commits after 200 ms. Returns what `second` gave and how long it
 /// took: at least the 200 ms when it waited on the transaction's row.
@@ -476,17 +481,20 @@ fn copies_on_two_connections_store_claim_and_restart_once() {
     let db = setup();
     let config: tokio_postgres::Config = hatchrun_cloud::testdb::url().parse().unwrap();
     let other = db.connect(&config);
+    let third = db.connect(&config);
     let waited = std::time::Duration::from_millis(150);
 
-    // Two copies arrive: the second waits for the first's insert and
-    // stores nothing.
+    // Two copies arrive on two connections while the guid's lock slot is
+    // held: both wait, then exactly one stores.
     db.run("BEGIN", &[]);
-    assert!(
-        db.wait(accept_delivery(db.db(), "g", "push", b"{}", 1_000))
-            .unwrap()
-    );
-    let (copy, took) = overlapped(&db, accept_delivery(&other, "g", "push", b"{}", 1_001));
-    assert!(!copy.unwrap());
+    db.run(LOCK_G, &[]);
+    let ((first, second), took) = overlapped(&db, async {
+        futures_util::join!(
+            accept_delivery(&other, "g", "push", b"{}", 1_000),
+            accept_delivery(&third, "g", "push", b"{}", 1_001),
+        )
+    });
+    assert_ne!(first.unwrap(), second.unwrap());
     assert!(took >= waited, "{took:?}");
 
     // Two consumers claim it: the second waits for the first's claim
@@ -513,12 +521,14 @@ fn copies_on_two_connections_store_claim_and_restart_once() {
         .unwrap()
     );
     db.run("BEGIN", &[]);
-    assert!(
-        db.wait(accept_delivery(db.db(), "g", "push", b"{}", 1_004))
-            .unwrap()
-    );
-    let (copy, took) = overlapped(&db, accept_delivery(&other, "g", "push", b"{}", 1_004));
-    assert!(!copy.unwrap());
+    db.run(LOCK_G, &[]);
+    let ((first, second), took) = overlapped(&db, async {
+        futures_util::join!(
+            accept_delivery(&other, "g", "push", b"{}", 1_004),
+            accept_delivery(&third, "g", "push", b"{}", 1_004),
+        )
+    });
+    assert_ne!(first.unwrap(), second.unwrap());
     assert!(took >= waited, "{took:?}");
     let state: Option<String> = db.column(
         "SELECT state AS s FROM ci_deliveries WHERE guid = 'g'",
@@ -566,4 +576,79 @@ fn a_delivery_at_the_cap_is_not_claimed_again() {
     );
     let again = db.wait(claim_delivery(db.db(), "g", now)).unwrap().unwrap();
     assert_eq!(again.attempts, MAX_ATTEMPTS + 1);
+}
+
+#[test]
+fn a_copy_in_a_later_month_is_still_a_duplicate() {
+    let db = setup();
+    // The last minute of January 1970 and the first of February sit in
+    // two month partitions.
+    let january = 31 * DAY - 60_000;
+    let february = 31 * DAY + 60_000;
+    assert!(
+        db.wait(accept_delivery(db.db(), "g", "push", b"{}", january))
+            .unwrap()
+    );
+    assert!(
+        !db.wait(accept_delivery(db.db(), "g", "push", b"{}", february))
+            .unwrap()
+    );
+    let rows: i64 = db
+        .column(
+            "SELECT COUNT(*) AS n FROM ci_deliveries WHERE guid = 'g'",
+            &[],
+            "n",
+        )
+        .unwrap();
+    assert_eq!(rows, 1);
+
+    // It fails, and the redelivery in February starts it over in the
+    // January partition it was stored in.
+    let claim = db
+        .wait(claim_delivery(db.db(), "g", february))
+        .unwrap()
+        .unwrap();
+    assert!(
+        db.wait(finish_delivery(
+            db.db(),
+            "g",
+            claim.attempts,
+            "failed",
+            Some("boom"),
+            february
+        ))
+        .unwrap()
+    );
+    assert!(
+        db.wait(accept_delivery(db.db(), "g", "push", b"{}", february + 1))
+            .unwrap()
+    );
+    let partition: Option<String> = db.column(
+        "SELECT tableoid::regclass::text AS p FROM ci_deliveries \
+         WHERE guid = 'g' AND state = 'received'",
+        &[],
+        "p",
+    );
+    assert!(
+        partition
+            .as_deref()
+            .is_some_and(|p| p.ends_with("ci_deliveries_197001")),
+        "{partition:?}"
+    );
+    // The reconciler leaves it to the queue message the intake sends,
+    // as it does a new delivery.
+    assert_eq!(
+        db.wait(stale_deliveries(db.db(), february + 2, 10))
+            .unwrap(),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        db.wait(stale_deliveries(
+            db.db(),
+            february + 2 + RECEIVED_STALE_MS,
+            10
+        ))
+        .unwrap(),
+        vec!["g".to_owned()]
+    );
 }

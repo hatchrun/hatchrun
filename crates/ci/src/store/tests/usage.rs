@@ -225,7 +225,13 @@ fn upkeep_drops_expired_run_months_and_old_deliveries() {
         "{dropped:?}"
     );
     assert!(
-        !dropped.iter().any(|name| name == "ci_runs_t30_197002"),
+        dropped.contains(&"ci_deliveries_197001".to_owned()),
+        "{dropped:?}"
+    );
+    assert!(
+        !dropped
+            .iter()
+            .any(|name| name == "ci_runs_t30_197002" || name == "ci_deliveries_197003"),
         "{dropped:?}"
     );
     assert!(db.wait(run(db.db(), old.id)).unwrap().is_none());
@@ -234,8 +240,8 @@ fn upkeep_drops_expired_run_months_and_old_deliveries() {
         .column("SELECT COUNT(*) AS n FROM ci_jobs", &[], "n")
         .unwrap();
     assert_eq!(jobs, 0);
-    // The sweep deletes delivery ids older than 30 days: storing `old`
-    // again is new, while `fresh` is still stored.
+    // January's deliveries went with their month: storing `old` again
+    // is new, while `fresh` is still stored.
     assert!(
         db.wait(accept_delivery(db.db(), "old", "push", payload, now))
             .unwrap()

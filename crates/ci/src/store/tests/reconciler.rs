@@ -113,6 +113,9 @@ fn upkeep_creates_the_next_partitions_and_is_idempotent() {
         ("ci_audit", "ci_audit_202610"),
         ("ci_audit", "ci_audit_202611"),
         ("ci_audit", "ci_audit_202612"),
+        ("ci_deliveries", "ci_deliveries_202610"),
+        ("ci_deliveries", "ci_deliveries_202611"),
+        ("ci_deliveries", "ci_deliveries_202612"),
     ] {
         assert!(
             partitions(&db, parent).contains(&name.to_owned()),
@@ -133,6 +136,7 @@ fn tenant_run(tenant_id: &str, repo_id: u64, delivery: &str, now: u64) -> NewRun
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn a_thirty_day_month_drops_on_time_while_ninety_day_stays() {
     let db = setup();
     db.run(
@@ -205,7 +209,11 @@ fn a_thirty_day_month_drops_on_time_while_ninety_day_stays() {
             &["ci_runs_t30_202610".to_owned()],
         ))
         .unwrap();
-    for partition in ["ci_runs_t30_202610", "ci_jobs_t30_202610"] {
+    for partition in [
+        "ci_runs_t30_202610",
+        "ci_jobs_t30_202610",
+        "ci_deliveries_202610",
+    ] {
         assert!(dropped.contains(&partition.to_owned()), "{dropped:?}");
     }
     assert!(
@@ -223,21 +231,15 @@ fn a_thirty_day_month_drops_on_time_while_ninety_day_stays() {
         .column("SELECT COUNT(*) AS n FROM ci_jobs", &[], "n")
         .unwrap();
     assert_eq!(jobs, 1);
-    // Delivery ids older than 30 days go: storing `old` again is new,
-    // while `fresh` is still stored.
+    // October's deliveries went with their month: storing `old` again
+    // is new, while `fresh` is still stored.
     assert!(
         db.wait(accept_delivery(db.db(), "old", "push", payload, DECEMBER))
             .unwrap()
     );
     assert!(
-        !db.wait(accept_delivery(
-            db.db(),
-            "fresh",
-            "push",
-            payload,
-            DECEMBER
-        ))
-        .unwrap()
+        !db.wait(accept_delivery(db.db(), "fresh", "push", payload, DECEMBER))
+            .unwrap()
     );
     // Dropping again changes nothing.
     assert_eq!(

@@ -2842,6 +2842,15 @@ mod tests {
     use super::*;
     use crate::store::CiBilling;
 
+    /// A database whose January 1970 delivery partition exists, for
+    /// deliveries stored at epoch timestamps.
+    fn delivery_db() -> TestDb {
+        let db = TestDb::new();
+        db.wait(crate::store::ensure_partitions(db.db(), 0))
+            .unwrap();
+        db
+    }
+
     fn tenant_db() -> TestDb {
         let db = TestDb::new();
         db.run(
@@ -2913,7 +2922,7 @@ mod tests {
 
     #[test]
     fn intake_accepts_without_reads_or_runs() {
-        let db = TestDb::new();
+        let db = delivery_db();
         let queue = FakeQueue::working();
         // The intake takes no GitHub client: it stores the delivery and
         // answers, and any call would not compile.
@@ -2944,7 +2953,7 @@ mod tests {
 
     #[test]
     fn intake_accepts_when_the_queue_send_fails() {
-        let db = TestDb::new();
+        let db = delivery_db();
         let queue = FakeQueue::failing();
         assert_eq!(
             db.wait(intake(db.db(), &queue, "g2", "push", b"{}", 2_000))
@@ -2963,7 +2972,7 @@ mod tests {
 
     #[test]
     fn a_failed_delivery_sent_again_is_planned_again() {
-        let db = TestDb::new();
+        let db = delivery_db();
         let queue = FakeQueue::working();
         db.wait(intake(db.db(), &queue, "g3", "push", b"{}", 3_000))
             .unwrap();

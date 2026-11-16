@@ -589,4 +589,93 @@ mod tests {
                 .expect("drop the schema");
         });
     }
+
+    /// 0028 moves the deliveries the old Worker recorded into month
+    /// partitions as `done` with no payload, and a delivery stored
+    /// without a state is refused.
+    #[test]
+    fn migration_0028_moves_old_deliveries_into_month_partitions_as_done() {
+        let _lock = super::MIGRATING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("start a runtime");
+        let schema = format!(
+            "mig28_{}_{}",
+            std::process::id(),
+            MIGRATION_SCHEMA_NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        runtime.block_on(async {
+            let (client, connection) = tokio_postgres::connect(&url(), tokio_postgres::NoTls)
+                .await
+                .unwrap_or_else(|err| panic!("connect to {}: {err}", url()));
+            tokio::spawn(connection);
+            client
+                .batch_execute(&format!(
+                    "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; \
+                     SET search_path TO {schema}"
+                ))
+                .await
+                .expect("create the schema");
+            let files = migration_files();
+            for (name, sql) in files
+                .iter()
+                .filter(|(name, _)| name.as_str() < "0028_ci_delivery_intake.sql")
+            {
+                client
+                    .batch_execute(sql)
+                    .await
+                    .unwrap_or_else(|err| panic!("migrate {name}: {err:?}"));
+            }
+            client
+                .batch_execute(
+                    "INSERT INTO ci_deliveries (guid, event, received_at) \
+                     VALUES ('a', 'push', 1704067200000), ('b', 'push', 1706745600000)",
+                )
+                .await
+                .expect("seed old deliveries");
+            let (_, intake) = files
+                .iter()
+                .find(|(name, _)| name == "0028_ci_delivery_intake.sql")
+                .expect("0028 exists");
+            client.batch_execute(intake).await.expect("apply 0028");
+
+            for month in ["ci_deliveries_202401", "ci_deliveries_202402"] {
+                assert_eq!(migration_count(&client, month).await, 1, "{month}");
+            }
+            let done: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM ci_deliveries \
+                     WHERE state = 'done' AND payload IS NULL AND attempts = 0",
+                    &[],
+                )
+                .await
+                .expect("done rows")
+                .get(0);
+            assert_eq!(done, 2);
+            assert_eq!(migration_count(&client, "ci_delivery_locks").await, 1024);
+
+            let refused = client
+                .batch_execute(
+                    "INSERT INTO ci_deliveries (guid, event, received_at) \
+                     VALUES ('c', 'push', 1706745600001)",
+                )
+                .await
+                .expect_err("a delivery needs a state");
+            assert!(
+                refused
+                    .as_db_error()
+                    .is_some_and(|err| err.message().contains("\"state\"")),
+                "{refused:?}"
+            );
+
+            client
+                .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+                .await
+                .expect("drop the schema");
+        });
+    }
 }

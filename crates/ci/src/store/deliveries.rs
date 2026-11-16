@@ -46,7 +46,10 @@ pub const MAX_ATTEMPTS: u64 = 50;
 /// sent again, which GitHub does when an operator redelivers it. That
 /// one starts over with the payload that came and no error, and the
 /// cap counts its tries from there.
-/// A copy of a delivery that waits, plans or is done stores nothing.
+/// A copy of a delivery that waits, plans or is done stores nothing,
+/// whichever month partition holds the first one. A restarted delivery
+/// keeps its `received_at`, and so its partition; the reconciler leaves
+/// it alone for [`RECEIVED_STALE_MS`] as it does a new one.
 /// The payload goes in hex, since the statements bind text.
 ///
 /// # Errors
@@ -65,9 +68,16 @@ pub async fn accept_delivery(
         guid: String,
     }
     Ok(db
-        .first::<Row>(
+        .first_locked::<Row>(
+            (LOCK_GUID, &params![guid]),
             ACCEPT_DELIVERY,
-            &params![guid, event, hex::encode(payload), now],
+            &params![
+                guid,
+                event,
+                hex::encode(payload),
+                now,
+                now + RECEIVED_STALE_MS
+            ],
         )
         .await?
         .is_some())
@@ -251,24 +261,35 @@ pub async fn stale_deliveries(db: &Db, now: u64, limit: u32) -> Result<Vec<Strin
     Ok(rows.into_iter().map(|row| row.guid).collect())
 }
 
+/// Locks the slot of guid `$1` in `ci_delivery_locks`, so one
+/// [`ACCEPT_DELIVERY`] at a time decides whether that guid is new.
+/// The primary key of the partitioned table includes `received_at`, so
+/// it cannot.
+const LOCK_GUID: &str = "SELECT slot FROM ci_delivery_locks \
+     WHERE slot = hashtext($1) & 1023 FOR UPDATE";
+
 /// Stores delivery `$1` of event `$2` with payload `decode($3,
-/// 'hex')`, received at `$4`. A stored guid is left alone unless it
-/// failed: then it starts over as `received`. A row returned means the
-/// delivery is to be planned; concurrent copies return it once, since
-/// the conflicting insert waits for the first and sees it `received`.
+/// 'hex')`, received at `$4`, when no month partition holds the guid
+/// yet. A stored guid is left alone unless it failed: then it starts
+/// over as `received`, held off the reconciler until `$5`. A row
+/// returned means the delivery is to be planned. It runs under
+/// [`LOCK_GUID`], after the lock is held, so it reads what a
+/// concurrent copy stored and copies return a row once.
 /// `attempts` keeps growing, so no claim token from before can match a
 /// new claim; `attempts_before` takes its value, so the cap counts the
 /// new tries only.
 /// Hex, not base64: `encode` wraps base64 every 76 characters.
-const ACCEPT_DELIVERY: &str = "INSERT INTO ci_deliveries \
-     (guid, event, payload, state, received_at) \
-     VALUES ($1, $2, decode($3, 'hex'), 'received', $4) \
-     ON CONFLICT (guid) DO UPDATE SET event = excluded.event, payload = excluded.payload, \
-       state = 'received', received_at = excluded.received_at, \
-       attempts_before = ci_deliveries.attempts, \
-       lease_until = NULL, error = NULL, failed_at = NULL \
-     WHERE ci_deliveries.state = 'failed' \
-     RETURNING guid";
+const ACCEPT_DELIVERY: &str = "WITH restarted AS ( \
+       UPDATE ci_deliveries SET event = $2, payload = decode($3, 'hex'), \
+         state = 'received', attempts_before = attempts, lease_until = $5, \
+         error = NULL, failed_at = NULL \
+       WHERE guid = $1 AND state = 'failed' RETURNING guid), \
+     stored AS ( \
+       INSERT INTO ci_deliveries (guid, event, payload, state, received_at) \
+       SELECT $1, $2, decode($3, 'hex'), 'received', $4 \
+       WHERE NOT EXISTS (SELECT 1 FROM ci_deliveries WHERE guid = $1) \
+       RETURNING guid) \
+     SELECT guid FROM restarted UNION ALL SELECT guid FROM stored";
 
 /// Claims delivery `$1` until `$2` when it is `received`, or
 /// `planning` with its lease out before `$3`, and claimed and resent

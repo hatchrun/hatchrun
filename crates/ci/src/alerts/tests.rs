@@ -872,6 +872,8 @@ fn failed_job(db: &Db) {
 #[test]
 fn the_failed_delivery_alert_reads_failed_deliveries() {
     let db = Db::new();
+    db.wait(crate::store::ensure_partitions(db.db(), 0))
+        .unwrap();
     db.run(
         "INSERT INTO ci_deliveries (guid, event, received_at, state, attempts, error, failed_at) \
          VALUES ('old', 'push', 0, 'failed', 3, 'boom', $1), \
