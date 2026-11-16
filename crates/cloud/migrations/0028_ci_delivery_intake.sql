@@ -12,16 +12,23 @@
 -- each claim's token, so it only grows; `attempts_before` is what it
 -- was when a failed delivery last started over, so the cap counts the
 -- tries since. `error` says why it failed and `failed_at` when, for the
--- failed delivery alert. Existing rows are done: they were planned inline by the old
--- Worker, which this default keeps working during the deploy.
+-- failed delivery alert.
+--
+-- `state` has no default: the intake names the state of every row it
+-- stores. The rows already here were planned inline before the intake
+-- existed, so they are `done` and keep no payload.
 
 ALTER TABLE ci_deliveries ADD COLUMN payload bytea,
-  ADD COLUMN state text NOT NULL DEFAULT 'done',
+  ADD COLUMN state text,
   ADD COLUMN attempts bigint NOT NULL DEFAULT 0,
   ADD COLUMN attempts_before bigint NOT NULL DEFAULT 0,
   ADD COLUMN lease_until bigint,
   ADD COLUMN error text,
-  ADD COLUMN failed_at bigint,
+  ADD COLUMN failed_at bigint;
+
+UPDATE ci_deliveries SET state = 'done';
+
+ALTER TABLE ci_deliveries ALTER COLUMN state SET NOT NULL,
   ADD CONSTRAINT ci_deliveries_state_check
     CHECK (state IN ('received', 'planning', 'done', 'failed'));
 
