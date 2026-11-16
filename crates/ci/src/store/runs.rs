@@ -239,7 +239,7 @@ impl RunRow {
 /// The columns of a [`RunRow`].
 pub(super) const RUN_COLUMNS: &str = "id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, \
      event, ref AS git_ref, sha, actor, base_ref, status, conclusion, created_at, \
-     completed_at, (expires_at - created_at) / 86400000 AS retention_days, message, \
+     completed_at, tier AS retention_days, message, \
      pull_number, head_ref, \
      (SELECT title FROM ci_pulls WHERE repo_id = ci_runs.repo_id \
       AND number = ci_runs.pull_number) AS pull_title, \
@@ -265,7 +265,7 @@ const LOCK_REPO: &str = "SELECT id FROM ci_repos WHERE id = $1 FOR NO KEY UPDATE
 /// author's association, `$19` the gate, `$20` its status, `$21` the
 /// pull request's head commit, `$22` the planner's findings, `$23` the
 /// issue number, `$24` the comment id, `$25` the command's name and
-/// `$26` its reaction set. The run expires after its tenant's retention tier (30 or 90 days), read
+/// `$26` its reaction set. The run lands in the partition of its tenant's retention tier (30 or 90 days), read
 /// in the same statement. The number is taken only when no run of this
 /// delivery and workflow exists, so a duplicate leaves the counter
 /// alone, and the statement returns no row for it.
@@ -277,16 +277,16 @@ const INSERT_RUN: &str = "WITH n AS (\
        RETURNING last) \
      INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, ref, sha, \
        actor, base_ref, message, pull_number, head_ref, status, created_at, updated_at, \
-       expires_at, trust, head_repo_id, head_repo_name, author_login, author_association, \
+       tier, trust, head_repo_id, head_repo_name, author_login, author_association, \
        gate, gate_status, head_sha, lints, issue_number, comment_id, command_name, \
        command_reaction) \
      SELECT $1, $2, $3, n.last, $4, $5, $6, $7, $8, $10::text, $11::text, $12::bigint, $13::text, 'queued', $9, $9, \
-       $9 + (SELECT CASE WHEN retention_days > 30 THEN 90 ELSE 30 END * 86400000::bigint \
+       (SELECT CASE WHEN retention_days > 30 THEN 90 ELSE 30 END \
          FROM tenants WHERE id = $1), \
        $14::text, $15::bigint, $16::text, $17::text, $18::text, $19::text, $20::text, $21::text, $22::text, $23::bigint, $24::bigint, $25::text, $26::text FROM n \
      RETURNING id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, event, \
        ref AS git_ref, sha, actor, base_ref, status, conclusion, created_at, \
-       completed_at, (expires_at - created_at) / 86400000 AS retention_days, message, \
+       completed_at, tier AS retention_days, message, \
        pull_number, head_ref, \
        (SELECT title FROM ci_pulls WHERE repo_id = ci_runs.repo_id \
         AND number = ci_runs.pull_number) AS pull_title, \
@@ -517,6 +517,10 @@ pub struct RunFilter {
     pub since: u64,
     /// Runs recorded before this, in Unix milliseconds.
     pub until: Option<u64>,
+    /// Runs still inside their retention at this time, in Unix
+    /// milliseconds. A run past it waits for its month partition to
+    /// drop and is no longer listed.
+    pub alive_at: u64,
 }
 
 /// A run of a list, with the name of its repository.
@@ -554,7 +558,7 @@ pub(super) fn like(text: &str) -> String {
 }
 
 /// The `WHERE` of a run list over `ci_runs r` and `ci_repos p`, and
-/// its parameters `$1` to `$10`.
+/// its parameters `$1` to `$11`.
 fn run_where(filter: &RunFilter) -> (String, Vec<hatchrun_cloud::db::Param>) {
     let mut sql = String::from(
         "p.id = r.repo_id AND p.tenant_id = r.tenant_id \
@@ -570,7 +574,8 @@ fn run_where(filter: &RunFilter) -> (String, Vec<hatchrun_cloud::db::Param>) {
          AND ($7::text IS NULL OR r.workflow ILIKE $7 OR r.ref ILIKE $7 OR r.actor ILIKE $7 \
            OR r.sha ILIKE $8::text) \
          AND ($9::text IS NULL OR r.workflow = ANY (string_to_array($9, ','))) \
-         AND ($10::bigint IS NULL OR r.pull_number = $10::bigint)",
+         AND ($10::bigint IS NULL OR r.pull_number = $10::bigint) \
+         AND r.created_at + r.tier::bigint * 86400000 > $11",
     );
     if !filter.states.is_empty() {
         let any: Vec<&str> = filter.states.iter().map(|s| s.condition()).collect();
@@ -595,7 +600,8 @@ fn run_where(filter: &RunFilter) -> (String, Vec<hatchrun_cloud::db::Param>) {
         text,
         sha,
         list(&filter.workflows),
-        filter.pull
+        filter.pull,
+        filter.alive_at
     ];
     (sql, bound)
 }
@@ -604,7 +610,7 @@ fn run_where(filter: &RunFilter) -> (String, Vec<hatchrun_cloud::db::Param>) {
 pub(super) const LISTED_COLUMNS: &str = "r.id, r.run_number, r.run_attempt, r.tenant_id, r.repo_id, \
      r.workflow, r.delivery, r.event, r.ref AS git_ref, r.sha, r.actor, r.base_ref, r.status, \
      r.conclusion, r.created_at, r.completed_at, \
-     (r.expires_at - r.created_at) / 86400000 AS retention_days, r.message, \
+     r.tier AS retention_days, r.message, \
      r.pull_number, r.head_ref, \
      (SELECT title FROM ci_pulls WHERE repo_id = r.repo_id AND number = r.pull_number) \
      AS pull_title, r.trust, r.head_repo_name, r.author_login, r.author_association, \
@@ -647,8 +653,8 @@ pub async fn runs_page(
     let page = format!(
         "SELECT {LISTED_COLUMNS} FROM ci_runs r, ci_repos p \
          WHERE {conditions} \
-         AND ($11::bigint IS NULL OR (r.created_at, r.id) < ($11::bigint, $12::bigint)) \
-         ORDER BY r.created_at DESC, r.id DESC LIMIT $13"
+         AND ($12::bigint IS NULL OR (r.created_at, r.id) < ($12::bigint, $13::bigint)) \
+         ORDER BY r.created_at DESC, r.id DESC LIMIT $14"
     );
     let rows = db.all(&page, &bound).await?;
     Ok((rows, total))
@@ -660,15 +666,16 @@ pub async fn runs_page(
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn listed_runs(db: &Db, ids: &[u64]) -> Result<Vec<ListedRun>> {
+pub async fn listed_runs(db: &Db, ids: &[u64], now: u64) -> Result<Vec<ListedRun>> {
     let ids: Vec<String> = ids.iter().map(u64::to_string).collect();
     db.all(
         &format!(
             "SELECT {LISTED_COLUMNS} FROM ci_runs r, ci_repos p \
              WHERE p.id = r.repo_id AND p.tenant_id = r.tenant_id \
-             AND r.id = ANY (string_to_array($1, ',')::bigint[])"
+             AND r.id = ANY (string_to_array($1, ',')::bigint[]) \
+             AND r.created_at + r.tier::bigint * 86400000 > $2"
         ),
-        &params![ids.join(",")],
+        &params![ids.join(","), now],
     )
     .await
 }
@@ -814,12 +821,18 @@ pub async fn run_counts(db: &Db, filter: &RunFilter) -> Result<RunCounts> {
 }
 
 /// The newest completed run on the default branch of each repository
-/// in `repo_ids` of `tenant`, for those that have one.
+/// in `repo_ids` of `tenant` still inside its retention at `now`, for
+/// those that have one.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn latest_on_default(db: &Db, tenant: &str, repo_ids: &[u64]) -> Result<Vec<ListedRun>> {
+pub async fn latest_on_default(
+    db: &Db,
+    tenant: &str,
+    repo_ids: &[u64],
+    now: u64,
+) -> Result<Vec<ListedRun>> {
     let ids: Vec<String> = repo_ids.iter().map(u64::to_string).collect();
     db.all(
         &format!(
@@ -828,9 +841,10 @@ pub async fn latest_on_default(db: &Db, tenant: &str, repo_ids: &[u64]) -> Resul
              WHERE p.id = r.repo_id AND p.tenant_id = r.tenant_id AND p.tenant_id = $1 \
              AND p.id = ANY (string_to_array($2, ',')::bigint[]) \
              AND r.status = 'completed' AND r.ref = 'refs/heads/' || p.default_branch \
+             AND r.created_at + r.tier::bigint * 86400000 > $3 \
              ORDER BY r.repo_id, r.created_at DESC, r.id DESC"
         ),
-        &params![tenant, ids.join(",")],
+        &params![tenant, ids.join(","), now],
     )
     .await
 }

@@ -64,7 +64,7 @@ const LIST: &str = "SELECT {columns} FROM ci_artifacts \
 
 /// How many finalized artifacts run `$1` has. Uploads that are not
 /// finalized do not count: a client that never finishes them is bounded
-/// by the retention sweep, and they would otherwise eat the limit.
+/// by the month dropping, and they would otherwise eat the limit.
 const COUNT: &str =
     "SELECT count(*) AS n FROM ci_artifacts WHERE run_id = $1 AND finalized_at IS NOT NULL";
 

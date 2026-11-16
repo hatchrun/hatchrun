@@ -41,7 +41,23 @@ pub(super) fn setup() -> TestDb {
         private: false,
     };
     db.wait(upsert_repo(db.db(), &repo, 1)).unwrap();
+    // Most fixtures use epoch timestamps, whose audit rows need their
+    // month partitions before anything is recorded.
+    db.wait(ensure_partitions(db.db(), 0)).unwrap();
     db
+}
+
+/// Inserts `run`, making sure its month partition exists first, like
+/// the reconciler's upkeep does before any run is recorded.
+pub(super) async fn make_run(db: &Db, run: &NewRun) -> worker::Result<Option<RunRow>> {
+    ensure_partitions(db, run.now).await?;
+    insert_run(db, run).await
+}
+
+/// Makes sure the partitions of the month `now` is in exist, like the
+/// reconciler's upkeep does.
+pub(super) fn ensure(db: &TestDb, now: u64) {
+    db.wait(ensure_partitions(db.db(), now)).unwrap();
 }
 
 /// Claims job `job_id` of tenant t1, which must succeed.
@@ -115,7 +131,7 @@ pub(super) fn new_job(plan_id: &str) -> NewJob {
 /// A run with one job, which the test moves to `status`.
 pub(super) fn run_with_job(db: &TestDb, status: &str) -> (RunRow, u64) {
     let run = db
-        .wait(insert_run(db.db(), &new_run("d", "ci", 1_000)))
+        .wait(make_run(db.db(), &new_run("d", "ci", 1_000)))
         .unwrap()
         .unwrap();
     let ids = db
@@ -130,7 +146,7 @@ pub(super) fn run_with_job(db: &TestDb, status: &str) -> (RunRow, u64) {
 /// As [`run_with_job`], for a run of delivery `delivery`.
 pub(super) fn run_with_job_named(db: &TestDb, delivery: &str, status: &str) -> (RunRow, u64) {
     let run = db
-        .wait(insert_run(db.db(), &new_run(delivery, "ci", 1_000)))
+        .wait(make_run(db.db(), &new_run(delivery, "ci", 1_000)))
         .unwrap()
         .unwrap();
     let ids = db

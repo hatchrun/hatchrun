@@ -152,14 +152,10 @@ fn claims_by_bucket_groups_by_template() {
 #[test]
 fn insert_run_dedupes_on_delivery_and_workflow() {
     let db = setup();
-    let first = db
-        .wait(insert_run(db.db(), &new_run("d1", "ci", 5)))
-        .unwrap();
-    let again = db
-        .wait(insert_run(db.db(), &new_run("d1", "ci", 6)))
-        .unwrap();
+    let first = db.wait(make_run(db.db(), &new_run("d1", "ci", 5))).unwrap();
+    let again = db.wait(make_run(db.db(), &new_run("d1", "ci", 6))).unwrap();
     let other = db
-        .wait(insert_run(db.db(), &new_run("d1", "lint", 7)))
+        .wait(make_run(db.db(), &new_run("d1", "lint", 7)))
         .unwrap();
     let first = first.unwrap();
     assert!(again.is_none());
@@ -167,41 +163,41 @@ fn insert_run_dedupes_on_delivery_and_workflow() {
     assert_eq!(first.status, "queued");
     assert_eq!(first.created_at, 5);
     assert_eq!(first.git_ref, "refs/heads/main");
-    let expires: u64 = db
+    let tier: i64 = db
         .column(
-            "SELECT expires_at AS n FROM ci_runs WHERE id = $1",
+            "SELECT tier AS n FROM ci_runs WHERE id = $1",
             &params![first.id],
             "n",
         )
         .unwrap();
-    assert_eq!(expires, 5 + 30 * DAY);
+    assert_eq!((tier, first.retention_days), (30, 30));
 }
 
 #[test]
 fn expiry_follows_the_tenant() {
     let db = setup();
-    let expires = |run: &RunRow| -> u64 {
+    let tier = |run: &RunRow| -> i64 {
         db.column(
-            "SELECT expires_at AS n FROM ci_runs WHERE id = $1",
+            "SELECT tier AS n FROM ci_runs WHERE id = $1",
             &params![run.id],
             "n",
         )
         .unwrap()
     };
     let short = db
-        .wait(insert_run(db.db(), &new_run("a", "ci", 5)))
+        .wait(make_run(db.db(), &new_run("a", "ci", 5)))
         .unwrap()
         .unwrap();
-    assert_eq!((expires(&short), short.retention_days), (5 + 30 * DAY, 30));
+    assert_eq!((tier(&short), short.retention_days), (30, 30));
     db.run(
         "UPDATE tenants SET retention_days = 90 WHERE id = 't1'",
         &[],
     );
     let long = db
-        .wait(insert_run(db.db(), &new_run("b", "ci", 5)))
+        .wait(make_run(db.db(), &new_run("b", "ci", 5)))
         .unwrap()
         .unwrap();
-    assert_eq!((expires(&long), long.retention_days), (5 + 90 * DAY, 90));
+    assert_eq!((tier(&long), long.retention_days), (90, 90));
     let found = db.wait(run(db.db(), long.id)).unwrap().unwrap();
     assert_eq!(found.retention_days, 90);
     let tenant = db.wait(tenant(db.db(), "t1")).unwrap().unwrap();
@@ -220,7 +216,7 @@ fn retention_days_is_30_or_90() {
         let tenant = db.wait(tenant(db.db(), "t1")).unwrap().unwrap();
         assert_eq!(tenant.retention_days, tier, "{set} days");
         let made = db
-            .wait(insert_run(db.db(), &new_run(&format!("r{set}"), "ci", 5)))
+            .wait(make_run(db.db(), &new_run(&format!("r{set}"), "ci", 5)))
             .unwrap()
             .unwrap();
         assert_eq!(made.retention_days, tier, "{set} days");
@@ -233,7 +229,7 @@ fn run_numbers_count_per_workflow() {
     let mut numbers = Vec::new();
     for (delivery, workflow) in [("a", "ci"), ("b", "ci"), ("c", "lint")] {
         let run = db
-            .wait(insert_run(db.db(), &new_run(delivery, workflow, 1)))
+            .wait(make_run(db.db(), &new_run(delivery, workflow, 1)))
             .unwrap()
             .unwrap();
         numbers.push(run.run_number);
@@ -244,16 +240,16 @@ fn run_numbers_count_per_workflow() {
 #[test]
 fn a_duplicate_does_not_use_up_a_run_number() {
     let db = setup();
-    db.wait(insert_run(db.db(), &new_run("a", "ci", 1)))
+    db.wait(make_run(db.db(), &new_run("a", "ci", 1)))
         .unwrap()
         .unwrap();
     assert!(
-        db.wait(insert_run(db.db(), &new_run("a", "ci", 2)))
+        db.wait(make_run(db.db(), &new_run("a", "ci", 2)))
             .unwrap()
             .is_none()
     );
     let third = db
-        .wait(insert_run(db.db(), &new_run("b", "ci", 3)))
+        .wait(make_run(db.db(), &new_run("b", "ci", 3)))
         .unwrap()
         .unwrap();
     assert_eq!(third.run_number, 2);
@@ -266,13 +262,14 @@ fn concurrent_duplicates_use_up_one_number() {
     let second = db.connect(&config);
     let first = new_run("same", "ci", 5);
     let other = new_run("same", "ci", 5);
-    let (a, b) = db.wait(async {
-        futures_util::join!(insert_run(db.db(), &first), insert_run(&second, &other))
-    });
+    // Partitions exist already, so the race is only over the delivery.
+    ensure(&db, 5);
+    let (a, b) = db
+        .wait(async { futures_util::join!(make_run(db.db(), &first), make_run(&second, &other)) });
     let recorded = [a.unwrap(), b.unwrap()];
     assert_eq!(recorded.iter().flatten().count(), 1);
     let next = db
-        .wait(insert_run(db.db(), &new_run("next", "ci", 6)))
+        .wait(make_run(db.db(), &new_run("next", "ci", 6)))
         .unwrap()
         .unwrap();
     assert_eq!(next.run_number, 2);
@@ -287,7 +284,7 @@ fn a_transferred_repo_keeps_its_history_with_the_old_tenant() {
         &[],
     );
     let before = db
-        .wait(insert_run(db.db(), &new_run("old", "ci", 5)))
+        .wait(make_run(db.db(), &new_run("old", "ci", 5)))
         .unwrap()
         .unwrap();
     let mut moved = db.wait(repo(db.db(), 7)).unwrap().unwrap();
@@ -300,7 +297,7 @@ fn a_transferred_repo_keeps_its_history_with_the_old_tenant() {
     );
     let mut mine = new_run("new", "ci", 7);
     mine.tenant_id = "t2".into();
-    let after = db.wait(insert_run(db.db(), &mine)).unwrap().unwrap();
+    let after = db.wait(make_run(db.db(), &mine)).unwrap().unwrap();
     let seen = db.wait(runs_for_repo(db.db(), 7, None, 10)).unwrap();
     assert_eq!(seen.iter().map(|r| r.id).collect::<Vec<_>>(), [after.id]);
     // The old run is still there, under its own tenant.
@@ -357,7 +354,7 @@ fn a_transferred_repo_leaves_its_secrets_and_vars_behind() {
 fn a_recreated_repository_takes_the_name_and_the_old_runs_stay() {
     let db = setup();
     let old = db
-        .wait(insert_run(db.db(), &new_run("d1", "ci", 2)))
+        .wait(make_run(db.db(), &new_run("d1", "ci", 2)))
         .unwrap()
         .unwrap();
     let fresh = RepoRow {
@@ -408,7 +405,7 @@ fn a_rename_swap_keeps_both_repositories() {
 fn jobs_come_back_in_plan_order() {
     let db = setup();
     let run = db
-        .wait(insert_run(db.db(), &new_run("d", "ci", 1)))
+        .wait(make_run(db.db(), &new_run("d", "ci", 1)))
         .unwrap()
         .unwrap();
     let ids = db
@@ -436,7 +433,7 @@ fn jobs_keep_their_needs_and_runs_their_message() {
     let db = setup();
     let mut asked = new_run("d", "ci", 1);
     asked.message = Some("fix the build".into());
-    let run = db.wait(insert_run(db.db(), &asked)).unwrap().unwrap();
+    let run = db.wait(make_run(db.db(), &asked)).unwrap().unwrap();
     assert_eq!(run.message.as_deref(), Some("fix the build"));
     let mut deploy = new_job("deploy");
     deploy.needs = vec!["test".into(), "build".into()];
@@ -451,7 +448,7 @@ fn jobs_keep_their_needs_and_runs_their_message() {
     assert_eq!(jobs[0].needs, serde_json::json!([]));
     assert_eq!(jobs[2].needs, serde_json::json!(["test", "build"]));
     let plain = db
-        .wait(insert_run(db.db(), &new_run("e", "ci", 1)))
+        .wait(make_run(db.db(), &new_run("e", "ci", 1)))
         .unwrap()
         .unwrap();
     assert_eq!(plain.message, None);
@@ -461,7 +458,7 @@ fn jobs_keep_their_needs_and_runs_their_message() {
 fn insert_jobs_keeps_template_permissions_and_refs() {
     let db = setup();
     let run = db
-        .wait(insert_run(db.db(), &new_run("d", "ci", 1)))
+        .wait(make_run(db.db(), &new_run("d", "ci", 1)))
         .unwrap()
         .unwrap();
     let build = NewJob {
@@ -539,7 +536,7 @@ fn claim_launch_holds_the_sixth_job() {
         &[],
     );
     let other = db
-        .wait(insert_run(
+        .wait(make_run(
             db.db(),
             &NewRun {
                 tenant_id: "t2".into(),
@@ -571,7 +568,7 @@ fn claim_launch_holds_the_sixth_job() {
     assert_eq!((row.status.as_str(), row.launch_attempts), ("queued", 0));
     // A completed job frees a place.
     let first = db
-        .wait(insert_run(db.db(), &new_run("free", "ci", 1_000)))
+        .wait(make_run(db.db(), &new_run("free", "ci", 1_000)))
         .unwrap()
         .unwrap();
     let done = db
@@ -669,7 +666,7 @@ fn a_held_job_of_another_reason_or_tenant_blocks_nobody() {
         &[],
     );
     let other = db
-        .wait(insert_run(
+        .wait(make_run(
             db.db(),
             &NewRun {
                 tenant_id: "t2".into(),
@@ -1053,7 +1050,7 @@ fn a_rerun_clears_the_hold() {
 /// `limit`, and the ids of the jobs in plan order.
 fn matrix_run(db: &TestDb, delivery: &str, count: usize, limit: Option<u32>) -> Vec<u64> {
     let run = db
-        .wait(insert_run(db.db(), &new_run(delivery, "ci", 1_000)))
+        .wait(make_run(db.db(), &new_run(delivery, "ci", 1_000)))
         .unwrap()
         .unwrap();
     let jobs: Vec<NewJob> = (0..count)
@@ -1272,7 +1269,7 @@ fn insert_jobs_keeps_the_strategy() {
 fn a_stand_in_job_becomes_its_first_expanded_job() {
     let db = setup();
     let run = db
-        .wait(insert_run(db.db(), &new_run("d", "ci", 1)))
+        .wait(make_run(db.db(), &new_run("d", "ci", 1)))
         .unwrap()
         .unwrap();
     db.wait(insert_jobs(
@@ -1409,7 +1406,7 @@ fn a_rerun_that_shrinks_a_matrix_goes_through_the_rows_the_database_holds() {
     };
     let plan = compile(&parse(SHRINK).unwrap(), "ci", "refs/heads/main").unwrap();
     let run = db
-        .wait(insert_run(db.db(), &new_run("shrink", "ci", 1_000)))
+        .wait(make_run(db.db(), &new_run("shrink", "ci", 1_000)))
         .unwrap()
         .unwrap();
     let news: Vec<NewJob> = plan.jobs.iter().map(crate::runs::new_job).collect();

@@ -866,6 +866,11 @@ impl Cx<'_> {
         let Some(run) = store::run(self.db, run_id).await? else {
             return Ok(stop(404, "not found"));
         };
+        // A run past its retention waits for its month partition to
+        // drop; it is gone for the caller already.
+        if run.created_at + u64::from(run.retention_days) * 86_400_000 <= now_ms() {
+            return Ok(stop(404, "not found"));
+        }
         let Some(repo) = store::repo(self.db, run.repo_id).await? else {
             return Ok(stop(404, "not found"));
         };

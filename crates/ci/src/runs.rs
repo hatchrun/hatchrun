@@ -1617,6 +1617,7 @@ mod tests {
             private: false,
         };
         db.wait(store::upsert_repo(db.db(), &repo, 1)).unwrap();
+        db.wait(store::ensure_partitions(db.db(), 1)).unwrap();
         let run = db
             .wait(store::insert_run(
                 db.db(),

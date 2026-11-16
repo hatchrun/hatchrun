@@ -16,7 +16,7 @@ fn run_on(db: &TestDb, delivery: &str, workflow: &str, git_ref: &str, now: u64) 
         new.pull_number = number.parse().ok();
         new.head_ref = Some("feature".into());
     }
-    db.wait(insert_run(db.db(), &new)).unwrap().unwrap()
+    db.wait(make_run(db.db(), &new)).unwrap().unwrap()
 }
 
 fn pull(number: u64, state: &str, updated_at: u64) -> NewPull {
@@ -107,7 +107,7 @@ fn pull_requests_follow_the_webhook_and_ignore_stale_deliveries() {
     db.wait(upsert_pull(db.db(), &pull(1, "open", 150)))
         .unwrap();
     let page = |state: Option<&str>, q: Option<&str>, after| {
-        db.wait(pulls_page(db.db(), 7, "t1", state, q, after, 10))
+        db.wait(pulls_page(db.db(), 7, "t1", 0, state, q, after, 10))
             .unwrap()
     };
     let (all, total) = page(None, None, None);
@@ -120,7 +120,7 @@ fn pull_requests_follow_the_webhook_and_ignore_stale_deliveries() {
     assert_eq!(page(None, Some("renam"), None).1, 1);
     assert_eq!(page(None, Some("2"), None).1, 1);
     let first = db
-        .wait(pulls_page(db.db(), 7, "t1", None, None, None, 1))
+        .wait(pulls_page(db.db(), 7, "t1", 0, None, None, None, 1))
         .unwrap();
     let cursor = PullAfter {
         updated_at: first.0[0].updated_at,
@@ -139,12 +139,21 @@ fn a_pull_request_shows_its_newest_run() {
     run_on(&db, "a", "ci", "refs/pull/3/merge", DAY);
     let newest = run_on(&db, "b", "ci", "refs/pull/3/merge", 2 * DAY);
     let (rows, _) = db
-        .wait(pulls_page(db.db(), 7, "t1", None, None, None, 10))
+        .wait(pulls_page(db.db(), 7, "t1", 0, None, None, None, 10))
         .unwrap();
     assert_eq!(rows[0].last_run_id, Some(newest.id));
     assert_eq!(rows[1].last_run_id, None);
-    let listed = db.wait(listed_runs(db.db(), &[newest.id])).unwrap();
+    let listed = db.wait(listed_runs(db.db(), &[newest.id], 0)).unwrap();
     assert_eq!(listed[0].repository, "acme/app");
+    // The run is gone for the list once its 30 days are up.
+    let alive = db
+        .wait(listed_runs(db.db(), &[newest.id], 32 * DAY - 1))
+        .unwrap();
+    assert_eq!(alive.len(), 1);
+    let gone = db
+        .wait(listed_runs(db.db(), &[newest.id], 32 * DAY))
+        .unwrap();
+    assert_eq!(gone.len(), 0);
 }
 
 #[test]
@@ -161,7 +170,12 @@ fn workflows_and_branches_are_grouped_from_runs() {
     db.wait(finish_run(db.db(), pr.id, 1, "success", now))
         .unwrap();
 
-    let counts = db.wait(repo_counts(db.db(), 7, "t1")).unwrap();
+    // Once the main run is past its 30 days, its branch no longer counts.
+    let later = db
+        .wait(repo_counts(db.db(), 7, "t1", now + 20 * DAY))
+        .unwrap();
+    assert_eq!(later.branches, 2);
+    let counts = db.wait(repo_counts(db.db(), 7, "t1", 0)).unwrap();
     assert_eq!(
         counts,
         RepoCounts {
@@ -173,7 +187,7 @@ fn workflows_and_branches_are_grouped_from_runs() {
 
     let since = now - 7 * DAY;
     let (rows, total) = db
-        .wait(workflows_page(db.db(), 7, "t1", since, None, 10))
+        .wait(workflows_page(db.db(), 7, "t1", 0, since, None, 10))
         .unwrap();
     assert_eq!(total, 2);
     assert_eq!(rows[0].name, "ci");
@@ -192,14 +206,45 @@ fn workflows_and_branches_are_grouped_from_runs() {
         id: rows[0].last_run_id,
     };
     let (rest, _) = db
-        .wait(workflows_page(db.db(), 7, "t1", since, Some(after), 10))
+        .wait(workflows_page(db.db(), 7, "t1", 0, since, Some(after), 10))
         .unwrap();
     assert_eq!(rest.len(), 1);
+    // Once lint's only run is past its 30 days, lint is gone from the
+    // page and the total; ci still has a run inside its retention.
+    let (rows, total) = db
+        .wait(workflows_page(
+            db.db(),
+            7,
+            "t1",
+            now + 28 * DAY,
+            since,
+            None,
+            10,
+        ))
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].name, "ci");
+    // Once the main run is past its 30 days, main leaves the branches.
+    let (rows, total) = db
+        .wait(branches_page(
+            db.db(),
+            7,
+            "t1",
+            now + 20 * DAY,
+            "main",
+            None,
+            None,
+            10,
+        ))
+        .unwrap();
+    assert_eq!(total, 2);
+    assert!(rows.iter().all(|b| b.name != "main"));
 
     // The default branch comes first though dev ran later; the pull
     // request counts for its head branch, and the tag for none.
     let branches = |q: Option<&str>, after| {
-        db.wait(branches_page(db.db(), 7, "t1", "main", q, after, 10))
+        db.wait(branches_page(db.db(), 7, "t1", 0, "main", q, after, 10))
             .unwrap()
     };
     let (rows, total) = branches(None, None);

@@ -1057,6 +1057,7 @@ mod tests {
         );
         let repo = repo_row("t1", 7);
         db.wait(store::upsert_repo(db.db(), &repo, 1)).unwrap();
+        db.wait(store::ensure_partitions(db.db(), 0)).unwrap();
         let audit = |action| NewAudit {
             tenant: "t1",
             actor: "octo",

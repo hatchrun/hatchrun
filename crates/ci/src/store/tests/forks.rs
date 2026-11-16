@@ -42,7 +42,7 @@ fn fork_run(
     new.author_login = author.into();
     new.author_association = "FIRST_TIME_CONTRIBUTOR".into();
     new.gate_status = gate;
-    let run = db.wait(insert_run(db.db(), &new)).unwrap().unwrap();
+    let run = db.wait(make_run(db.db(), &new)).unwrap().unwrap();
     // The webhook records the pull request before it makes the runs; a
     // run is approved only while its pull request is open at its commit.
     // Forced, so a later call for the same pull request wins whatever the
@@ -90,7 +90,7 @@ fn a_run_keeps_its_trust_origin_and_gate() {
         .unwrap();
     assert_eq!(gate, "fork_approval");
     let own = db
-        .wait(insert_run(db.db(), &new_run("push", "ci", 11)))
+        .wait(make_run(db.db(), &new_run("push", "ci", 11)))
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -491,29 +491,37 @@ fn the_app_lists_the_pending_runs_of_the_tenants_readable_repositories() {
     fork_run(&db, "b", 2, "s2", "mallory", GateStatus::Deferred, 6);
     fork_run(&db, "c", 3, "s3", "mallory", GateStatus::NotGated, 7);
     let c = fork_run(&db, "d", 4, "s4", "eve", GateStatus::Pending, 3);
-    let listed = db.wait(pending_gate_runs(db.db(), "t1", &[7], 10)).unwrap();
+    let listed = db
+        .wait(pending_gate_runs(db.db(), "t1", &[7], 0, 10))
+        .unwrap();
     let ids: Vec<u64> = listed.iter().map(|row| row.run.id).collect();
     assert_eq!(ids, [c.id, a.id], "the longest waiting first");
     assert_eq!(listed[0].repository, "acme/app");
     assert_eq!(listed[0].run.trust, Trust::Fork);
     assert_eq!(
-        db.wait(pending_gate_runs(db.db(), "t1", &[8], 10))
+        db.wait(pending_gate_runs(db.db(), "t1", &[8], 0, 10))
             .unwrap()
             .len(),
         0
     );
     assert_eq!(
-        db.wait(pending_gate_runs(db.db(), "t2", &[7], 10))
+        db.wait(pending_gate_runs(db.db(), "t2", &[7], 0, 10))
             .unwrap()
             .len(),
         0
     );
     assert_eq!(
-        db.wait(pending_gate_runs(db.db(), "t1", &[7], 1))
+        db.wait(pending_gate_runs(db.db(), "t1", &[7], 0, 1))
             .unwrap()
             .len(),
         1
     );
+    // Past its 30 days the older run leaves the list.
+    let alive = db
+        .wait(pending_gate_runs(db.db(), "t1", &[7], 30 * DAY + 4, 10))
+        .unwrap();
+    let ids: Vec<u64> = alive.iter().map(|row| row.run.id).collect();
+    assert_eq!(ids, [a.id]);
 }
 
 #[test]
@@ -535,7 +543,7 @@ fn a_fork_job_waits_for_a_place_under_the_repositorys_fork_cap() {
     assert_eq!(db.wait(fork_running(db.db(), ids[2].1)).unwrap(), 2);
     // A job of a trusted run is not held by the fork cap.
     let own = db
-        .wait(insert_run(db.db(), &new_run("push", "ci", 4)))
+        .wait(make_run(db.db(), &new_run("push", "ci", 4)))
         .unwrap()
         .unwrap();
     let own_job = db
@@ -639,7 +647,7 @@ fn queues_count_groups_not_runs() {
         new.trust = Trust::Fork;
         new.author_login = "mallory".into();
         new.gate_status = GateStatus::Pending;
-        db.wait(insert_run(db.db(), &new)).unwrap().unwrap();
+        db.wait(make_run(db.db(), &new)).unwrap().unwrap();
     }
     fork_run(&db, "e", 5, "head", "eve", GateStatus::Pending, 2);
     fork_run(&db, "f", 6, "head", "eve", GateStatus::Deferred, 3);
@@ -660,7 +668,7 @@ fn an_authors_cap_counts_pull_requests_not_runs() {
         new.trust = Trust::Fork;
         new.author_login = "mallory".into();
         new.gate_status = GateStatus::NotGated;
-        db.wait(insert_run(db.db(), &new)).unwrap().unwrap();
+        db.wait(make_run(db.db(), &new)).unwrap().unwrap();
     }
     let waiting = db.wait(fork_waiting(db.db(), 7, "mallory", None)).unwrap();
     assert_eq!(waiting.author_active, 1);
@@ -690,7 +698,7 @@ fn each_run_has_its_own_card_and_the_button_approves_exactly_that_run() {
     lint.trust = Trust::Fork;
     lint.author_login = "mallory".into();
     lint.gate_status = GateStatus::Pending;
-    let lint = db.wait(insert_run(db.db(), &lint)).unwrap().unwrap();
+    let lint = db.wait(make_run(db.db(), &lint)).unwrap().unwrap();
     db.wait(set_gate_check(db.db(), ci.id, 5150)).unwrap();
     db.wait(set_gate_check(db.db(), lint.id, 5151)).unwrap();
     // Another repository's and another tenant's click find nothing.
@@ -932,7 +940,7 @@ fn neither_one_repository_nor_one_author_fills_the_deferred_pass() {
     again.trust = Trust::Fork;
     again.author_login = "mallory".into();
     again.gate_status = GateStatus::Deferred;
-    db.wait(insert_run(db.db(), &again)).unwrap().unwrap();
+    db.wait(make_run(db.db(), &again)).unwrap().unwrap();
     let listed = db.wait(deferred_runs(db.db(), 100, 5, 2)).unwrap();
     let in_repo = |id: u64| listed.iter().filter(|run| run.repo_id == id).count();
     assert_eq!(in_repo(7), 5, "the repository window");
@@ -1252,7 +1260,7 @@ fn a_run_that_ends_while_it_waits_ends_its_gate_and_frees_its_slot() {
     let approved = fork_run(&db, "c", 3, "s3", "mallory", GateStatus::Pending, 3);
     let bare = fork_run(&db, "d", 4, "s4", "mallory", GateStatus::Pending, 4);
     let own = db
-        .wait(insert_run(db.db(), &new_run("push", "ci", 5)))
+        .wait(make_run(db.db(), &new_run("push", "ci", 5)))
         .unwrap()
         .unwrap();
     db.wait(set_gate_check(db.db(), pending.id, 5150)).unwrap();
@@ -1445,7 +1453,7 @@ fn target_run(db: &TestDb, delivery: &str, number: u64, head: &str, gate: GateSt
     new.head_sha = Some(head.into());
     new.lints = Some("one\ntwo".into());
     new.gate_status = gate;
-    db.wait(insert_run(db.db(), &new)).unwrap().unwrap()
+    db.wait(make_run(db.db(), &new)).unwrap().unwrap()
 }
 
 #[test]
@@ -1648,12 +1656,12 @@ fn a_pull_request_and_a_pull_request_target_run_of_one_workflow_both_exist() {
     target.event = "pull_request_target".into();
     target.git_ref = "refs/heads/main".into();
     target.pull_number = Some(4);
-    let a = db.wait(insert_run(db.db(), &pull)).unwrap();
-    let b = db.wait(insert_run(db.db(), &target)).unwrap();
+    let a = db.wait(make_run(db.db(), &pull)).unwrap();
+    let b = db.wait(make_run(db.db(), &target)).unwrap();
     assert!(a.is_some() && b.is_some(), "neither run may be dropped");
     assert_ne!(a.unwrap().id, b.unwrap().id);
     // The same key again finds the run it made instead of a second one.
-    assert!(db.wait(insert_run(db.db(), &target)).unwrap().is_none());
+    assert!(db.wait(make_run(db.db(), &target)).unwrap().is_none());
 }
 
 /// Pins that a comment approves every waiting run at the head and no run at another head.
@@ -1669,7 +1677,7 @@ fn a_comment_approves_every_waiting_run_at_the_head_and_no_other() {
     lint.pull_number = Some(4);
     lint.trust = Trust::Fork;
     lint.gate_status = GateStatus::Deferred;
-    let lint = db.wait(insert_run(db.db(), &lint)).unwrap().unwrap();
+    let lint = db.wait(make_run(db.db(), &lint)).unwrap().unwrap();
     // A run of an older commit of the same pull request, and a command
     // run of the comment event on the same head, are not touched.
     let old = fork_run(&db, "d0", 4, "h0", "mallory", GateStatus::Pending, 9);
@@ -1865,7 +1873,7 @@ fn the_runs_of_a_head_leave_out_what_other_events_made() {
     comment.event = "issue_comment".into();
     comment.pull_number = Some(4);
     comment.head_sha = Some("h1".into());
-    db.wait(insert_run(db.db(), &comment)).unwrap().unwrap();
+    db.wait(make_run(db.db(), &comment)).unwrap().unwrap();
     let seen = db.wait(pull_runs_at(db.db(), 7, 4, "h1")).unwrap();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].id, fork.id);

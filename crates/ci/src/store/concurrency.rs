@@ -253,7 +253,7 @@ pub struct Victim {
 pub async fn victims(db: &Db, repo_id: u64, group_key: &str) -> Result<Vec<Victim>> {
     db.all(
         "SELECT c.run_id, c.job_id, c.attempt, c.state, c.group_name, r.tenant_id, \
-           (r.expires_at - r.created_at) / 86400000 AS retention_days \
+           r.tier AS retention_days \
          FROM ci_concurrency c JOIN ci_runs r ON r.id = c.run_id \
          WHERE c.repo_id = $1 AND c.group_key = $2 \
            AND (c.state = 'superseded' OR (c.state = 'running' AND c.cancel_me)) \
@@ -274,7 +274,7 @@ pub async fn victims(db: &Db, repo_id: u64, group_key: &str) -> Result<Vec<Victi
 pub async fn unfinished_superseded(db: &Db, limit: u32) -> Result<Vec<Victim>> {
     db.all(
         "SELECT c.run_id, c.job_id, c.attempt, c.state, c.group_name, r.tenant_id, \
-           (r.expires_at - r.created_at) / 86400000 AS retention_days \
+           r.tier AS retention_days \
          FROM ci_concurrency c JOIN ci_runs r ON r.id = c.run_id \
          LEFT JOIN ci_jobs j ON j.id = c.job_id \
          WHERE c.state = 'superseded' AND r.status <> 'completed' \

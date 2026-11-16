@@ -221,6 +221,7 @@ pub fn run_filter(
             .number("since")?
             .unwrap_or_else(|| now.saturating_sub(window)),
         until: query.number("until")?,
+        alive_at: now,
     })
 }
 
@@ -358,7 +359,7 @@ async fn needs_you_done(cx: &Cx<'_>, org: &str) -> Done {
     let (tenant, admin, session) = member_tenant(cx, org).await?;
     // Only an admin of the organization can approve a job.
     let approvals = if admin {
-        store::approval_jobs(cx.db, &tenant.id, NEEDS_LIMIT).await?
+        store::approval_jobs(cx.db, &tenant.id, now_ms(), NEEDS_LIMIT).await?
     } else {
         Vec::new()
     };
@@ -367,11 +368,11 @@ async fn needs_you_done(cx: &Cx<'_>, org: &str) -> Done {
     // can write may approve one; the list is the organization admins',
     // like the environment approvals.
     let fork_approvals = if admin {
-        store::pending_gate_runs(cx.db, &tenant.id, &ids, NEEDS_LIMIT).await?
+        store::pending_gate_runs(cx.db, &tenant.id, &ids, now_ms(), NEEDS_LIMIT).await?
     } else {
         Vec::new()
     };
-    let failing: Vec<ListedRun> = store::latest_on_default(cx.db, &tenant.id, &ids)
+    let failing: Vec<ListedRun> = store::latest_on_default(cx.db, &tenant.id, &ids, now_ms())
         .await?
         .into_iter()
         .filter(|row| row.run.conclusion.as_deref() == Some("failure"))
@@ -720,7 +721,7 @@ async fn readable_repo(cx: &Cx<'_>, owner: &str, name: &str) -> Done<RepoRow> {
 
 /// The newest runs `ids` name, as the run lists show them, by id.
 async fn runs_by_id(cx: &Cx<'_>, ids: &[u64]) -> Done<HashMap<u64, Value>> {
-    let rows = store::listed_runs(cx.db, ids).await?;
+    let rows = store::listed_runs(cx.db, ids, now_ms()).await?;
     let found: Vec<u64> = rows.iter().map(|row| row.run.id).collect();
     let counts: HashMap<u64, JobCounts> = store::job_counts(cx.db, &found)
         .await?
@@ -742,7 +743,7 @@ async fn repo_done(cx: &Cx<'_>, owner: &str, name: &str) -> Done {
         .repo_access(owner, name, Access::Read)
         .await?
         .map_err(Fail::Stop)?;
-    let counts = store::repo_counts(cx.db, repo.id, &repo.tenant_id).await?;
+    let counts = store::repo_counts(cx.db, repo.id, &repo.tenant_id, now_ms()).await?;
     let enabled = store::repo_enabled(cx.db, &repo.tenant_id, repo.id).await?;
     Ok(Response::from_json(&repo_body(
         &repo, enabled, &counts, access,
@@ -790,8 +791,16 @@ async fn workflows_done(cx: &Cx<'_>, owner: &str, name: &str, query: Option<&str
         id: c[1],
     });
     let since = now_ms().saturating_sub(WORKFLOW_WINDOW_MS);
-    let (mut rows, total) =
-        store::workflows_page(cx.db, repo.id, &repo.tenant_id, since, after, limit + 1).await?;
+    let (mut rows, total) = store::workflows_page(
+        cx.db,
+        repo.id,
+        &repo.tenant_id,
+        now_ms(),
+        since,
+        after,
+        limit + 1,
+    )
+    .await?;
     let more = rows.len() > limit as usize;
     rows.truncate(limit as usize);
     let next = rows
@@ -853,6 +862,7 @@ async fn branches_done(cx: &Cx<'_>, owner: &str, name: &str, query: Option<&str>
         cx.db,
         repo.id,
         &repo.tenant_id,
+        now_ms(),
         &repo.default_branch,
         text.as_deref(),
         after,
@@ -929,6 +939,7 @@ async fn pulls_done(cx: &Cx<'_>, owner: &str, name: &str, query: Option<&str>) -
         cx.db,
         repo.id,
         &repo.tenant_id,
+        now_ms(),
         state,
         text.as_deref(),
         after,

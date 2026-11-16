@@ -345,19 +345,30 @@ mod tests {
             &[],
         );
         db.run(
+            "CREATE TABLE IF NOT EXISTS ci_runs_t30_197001 PARTITION OF ci_runs_t30 \
+             FOR VALUES FROM (0) TO (2678400000)",
+            &[],
+        );
+        db.run(
+            "CREATE TABLE IF NOT EXISTS ci_jobs_t30_197001 PARTITION OF ci_jobs_t30 \
+             FOR VALUES FROM (0) TO (2678400000)",
+            &[],
+        );
+        db.run(
             "INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, \
-             ref, sha, actor, status, created_at, updated_at, expires_at, trust, author_login, \
+             ref, sha, actor, status, created_at, updated_at, tier, trust, author_login, \
              author_association, gate, gate_status) \
              VALUES ('t1', 7, 'ci', 1, 'd1', 'push', 'refs/heads/main', 'abc', 'octocat', \
-             'queued', 1, 1, 2, 'trusted', 'octocat', '', 'none', 'none')",
+             'queued', 1, 1, 30, 'trusted', 'octocat', '', 'none', 'none')",
             &[],
         );
         for plan in ["a", "b"] {
             db.run(
-                "INSERT INTO ci_jobs (run_id, plan_id, name, status, timeout_minutes, held, \
-                 created_at, updated_at, template, token_permissions, secret_refs, needs) \
-                 SELECT id, $1, $1, 'queued', 10, 'card', 1, 1, 'hatchrun', '{}', '{}', '[]' \
-                 FROM ci_runs",
+                "INSERT INTO ci_jobs (run_id, tier, run_created_at, plan_id, name, status, \
+                 timeout_minutes, held, created_at, updated_at, template, token_permissions, \
+                 secret_refs, needs) \
+                 SELECT id, 30, 1, $1, $1, 'queued', 10, 'card', 1, 1, 'hatchrun', '{}', \
+                 '{}', '[]' FROM ci_runs",
                 &params![plan],
             );
         }
@@ -389,6 +400,11 @@ mod tests {
         tenant(&db, "t1", 11, "acme");
         let ids = held_jobs(&db);
         db.run(
+            "CREATE TABLE IF NOT EXISTS ci_usage_202610 PARTITION OF ci_usage \
+             FOR VALUES FROM (1790812800000) TO (1793491200000)",
+            &[],
+        );
+        db.run(
             "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
              ended_at) VALUES (1, 1, 't1', 'ubuntu-latest', 60, 60, $1)",
             &params![NOW - 1_000],
@@ -413,6 +429,11 @@ mod tests {
     fn an_ending_subscription_closes_the_open_window() {
         let db = Db::new();
         tenant(&db, "t1", 11, "acme");
+        db.run(
+            "CREATE TABLE IF NOT EXISTS ci_usage_202610 PARTITION OF ci_usage \
+             FOR VALUES FROM (1790812800000) TO (1793491200000)",
+            &[],
+        );
         db.run(
             "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
              ended_at) VALUES (1, 1, 't1', 'ubuntu-latest', 60, 60, $1)",
