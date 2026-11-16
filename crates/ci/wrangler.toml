@@ -81,6 +81,37 @@ max_batch_size = 10
 max_batch_timeout = 5
 max_retries = 3
 
+# Deliveries. The webhook stores each verified delivery in ci_deliveries
+# and sends only its id here, since payloads can pass the queue's 128
+# KB message limit. The queues themselves are created with Terraform
+# outside this repository.
+[[queues.producers]]
+binding = "CI_DELIVERIES"
+queue = "hatchrun-ci-deliveries"
+
+# Small batches, sent after a second at most, so a delivery's planning
+# does not wait for other deliveries. Messages that fail max_retries
+# times go to the dead-letter queue. The reconciler sends a stored
+# delivery that no consumer planned again, and fails it after 50 claims
+# and resends, which emails the failed delivery alert
+# (crates/ci/src/alerts).
+[[queues.consumers]]
+queue = "hatchrun-ci-deliveries"
+max_batch_size = 5
+max_batch_timeout = 1
+max_retries = 8
+max_concurrency = 10
+dead_letter_queue = "hatchrun-ci-deliveries-dlq"
+
+# Delivery messages that ran out of retries. This Worker logs each one
+# and acks it; the delivery stays waiting in ci_deliveries for the
+# reconciler.
+[[queues.consumers]]
+queue = "hatchrun-ci-deliveries-dlq"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 3
+
 # Alert emails, sent through Cloudflare Email Service from
 # alerts@notify.hatchrun.io, a subdomain onboarded to Email Sending so
 # hatchrun.io's own mail records stay as they are. The binding sends

@@ -198,10 +198,21 @@ fn upkeep_drops_expired_run_months_and_old_deliveries() {
         .unwrap()
         .unwrap();
     let now = 1_000 + 62 * DAY;
-    db.wait(record_delivery(db.db(), "old", "push", 1_000))
-        .unwrap();
-    db.wait(record_delivery(db.db(), "fresh", "push", now - DAY))
-        .unwrap();
+    let payload = b"{}";
+    assert!(
+        db.wait(accept_delivery(db.db(), "old", "push", payload, 1_000))
+            .unwrap()
+    );
+    assert!(
+        db.wait(accept_delivery(
+            db.db(),
+            "fresh",
+            "push",
+            payload,
+            now - DAY
+        ))
+        .unwrap()
+    );
     let dropped = db
         .wait(drop_expired_partitions(
             db.db(),
@@ -214,7 +225,13 @@ fn upkeep_drops_expired_run_months_and_old_deliveries() {
         "{dropped:?}"
     );
     assert!(
-        !dropped.iter().any(|name| name == "ci_runs_t30_197002"),
+        dropped.contains(&"ci_deliveries_197001".to_owned()),
+        "{dropped:?}"
+    );
+    assert!(
+        !dropped
+            .iter()
+            .any(|name| name == "ci_runs_t30_197002" || name == "ci_deliveries_197003"),
         "{dropped:?}"
     );
     assert!(db.wait(run(db.db(), old.id)).unwrap().is_none());
@@ -223,8 +240,16 @@ fn upkeep_drops_expired_run_months_and_old_deliveries() {
         .column("SELECT COUNT(*) AS n FROM ci_jobs", &[], "n")
         .unwrap();
     assert_eq!(jobs, 0);
-    assert!(!db.wait(delivery_seen(db.db(), "old")).unwrap());
-    assert!(db.wait(delivery_seen(db.db(), "fresh")).unwrap());
+    // January's deliveries went with their month: storing `old` again
+    // is new, while `fresh` is still stored.
+    assert!(
+        db.wait(accept_delivery(db.db(), "old", "push", payload, now))
+            .unwrap()
+    );
+    assert!(
+        !db.wait(accept_delivery(db.db(), "fresh", "push", payload, now))
+            .unwrap()
+    );
 }
 
 #[test]
@@ -694,12 +719,16 @@ fn tenant_row_reads_the_billing_state() {
 }
 
 #[test]
-fn deliveries_are_recorded_once() {
+fn deliveries_are_stored_once() {
     let db = setup();
-    assert!(!db.wait(delivery_seen(db.db(), "g")).unwrap());
-    db.wait(record_delivery(db.db(), "g", "push", 1)).unwrap();
-    db.wait(record_delivery(db.db(), "g", "push", 2)).unwrap();
-    assert!(db.wait(delivery_seen(db.db(), "g")).unwrap());
+    assert!(
+        db.wait(accept_delivery(db.db(), "g", "push", b"{}", 1))
+            .unwrap()
+    );
+    assert!(
+        !db.wait(accept_delivery(db.db(), "g", "push", b"{}", 2))
+            .unwrap()
+    );
 }
 
 #[test]

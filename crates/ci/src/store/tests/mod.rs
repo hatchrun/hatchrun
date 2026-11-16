@@ -7,6 +7,7 @@ mod browse;
 mod cache;
 mod chat;
 mod concurrency;
+mod deliveries;
 mod forks;
 mod jobs;
 mod lists;

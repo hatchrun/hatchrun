@@ -8,8 +8,6 @@ use hatchrun_cloud::db::{Db, params};
 use serde::Deserialize;
 use worker::Result;
 
-use super::exists;
-
 /// A repository CI has seen.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RepoRow {
@@ -49,13 +47,6 @@ const REPO: &str = "SELECT id, tenant_id, installation_id, full_name, default_br
 /// The repository named `$1`, ignoring case.
 const REPO_BY_NAME: &str = "SELECT id, tenant_id, installation_id, full_name, default_branch, \
      private FROM ci_repos WHERE lower(full_name) = lower($1)";
-
-/// Whether delivery `$1` was recorded.
-const DELIVERY_SEEN: &str = "SELECT 1 AS seen FROM ci_deliveries WHERE guid = $1";
-
-/// Records delivery `$1` of event `$2` received at `$3`, once.
-const RECORD_DELIVERY: &str = "INSERT INTO ci_deliveries (guid, event, received_at) \
-     VALUES ($1, $2, $3) ON CONFLICT (guid) DO NOTHING";
 
 /// Records `repo`, or updates it after a rename or a change.
 ///
@@ -128,23 +119,4 @@ pub async fn repo(db: &Db, repo_id: u64) -> Result<Option<RepoRow>> {
 /// Postgres refused the statement.
 pub async fn repo_by_name(db: &Db, full_name: &str) -> Result<Option<RepoRow>> {
     db.first(REPO_BY_NAME, &params![full_name]).await
-}
-
-/// Whether delivery `guid` was recorded.
-///
-/// # Errors
-///
-/// Postgres refused the statement.
-pub async fn delivery_seen(db: &Db, guid: &str) -> Result<bool> {
-    exists(db, DELIVERY_SEEN, &params![guid]).await
-}
-
-/// Records delivery `guid` of `event`, once.
-///
-/// # Errors
-///
-/// Postgres refused the statement.
-pub async fn record_delivery(db: &Db, guid: &str, event: &str, now: u64) -> Result<()> {
-    db.run(RECORD_DELIVERY, &params![guid, event, now]).await?;
-    Ok(())
 }

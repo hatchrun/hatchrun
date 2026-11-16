@@ -10,7 +10,9 @@
 //! land:
 //!
 //! - `POST /github/webhook` takes the `push`, `pull_request` and
-//!   `check_run` deliveries that `hatchrun-cloud` forwards.
+//!   `check_run` deliveries that `hatchrun-cloud` forwards. It stores
+//!   each verified delivery, answers 202, and the
+//!   `hatchrun-ci-deliveries` queue plans it.
 //! - `POST /v1/agent/{claim,events,result}` is what the runner agent on
 //!   a launched instance calls: its job document, log batches and
 //!   heartbeats, and its result.
@@ -29,8 +31,9 @@
 //!   (see [`alerts`]).
 //!
 //! A Cron Trigger runs the reconciler every minute (stuck jobs,
-//! schedules, expiry), and the `hatchrun-ci-launches` queue starts the
-//! instances. Alerts about the reconciler, failed launches, GitHub's
+//! schedules, expiry, deliveries), and the `hatchrun-ci-launches` queue
+//! starts the instances. The webhook stores each verified delivery and
+//! the `hatchrun-ci-deliveries` queue plans it. Alerts about the reconciler, failed launches, GitHub's
 //! rate limit and the database go out by email (see [`alerts`]). Every
 //! other path answers 404.
 
@@ -45,6 +48,7 @@ pub mod chain;
 pub mod chatops;
 pub mod checks;
 pub mod concurrency;
+pub mod deliveries;
 pub mod env;
 pub mod environments;
 pub mod fork;
@@ -130,17 +134,23 @@ async fn healthz(env: &Env) -> Result<Response> {
     Ok(response)
 }
 
-/// The launch queue and its dead-letter queue (see [`launches`]).
+/// The launch and delivery queues and their dead-letter queues (see
+/// [`launches`] and [`deliveries`]). Each queue's messages read as its
+/// own type: the batch arrives untyped and is decoded per queue, so a
+/// batch of one queue never reads as the other's.
 #[event(queue)]
-async fn queue(
-    batch: MessageBatch<launches::LaunchMessage>,
-    env: Env,
-    _ctx: Context,
-) -> Result<()> {
-    if batch.queue() == launches::DEAD_LETTERS {
-        launches::dead_letters(batch, env).await;
-    } else {
-        launches::consume(batch, env).await;
+async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) -> Result<()> {
+    match batch.queue().as_str() {
+        launches::QUEUE => launches::consume(batch, env).await,
+        launches::DEAD_LETTERS => launches::dead_letters(batch, env).await,
+        deliveries::QUEUE => deliveries::consume(batch, env).await,
+        deliveries::DEAD_LETTERS => deliveries::dead_letters(&batch),
+        other => {
+            // No consumer reads this queue: retrying would loop
+            // forever, so the batch is logged and acked.
+            console_error!("queue {other}: no consumer, acking the batch");
+            batch.ack_all();
+        }
     }
     Ok(())
 }

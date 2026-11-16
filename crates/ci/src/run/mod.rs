@@ -183,6 +183,25 @@ pub struct RunInfo {
     /// this, or one no command started, has none.
     #[serde(default)]
     pub command: Option<RunCommand>,
+    /// The webhook deliveries whose rerun reset jobs of this run: a
+    /// delivery the queue plans again resets nothing a second time, however
+    /// late it comes. Each one opened an attempt, so there are
+    /// `run_attempt - 1` at most. A run stored before this has none.
+    #[serde(default)]
+    pub rerun_deliveries: Vec<String>,
+}
+
+impl RunInfo {
+    /// Whether `delivery`'s rerun reset jobs of the run already.
+    #[must_use]
+    pub fn reran_for(&self, delivery: &str) -> bool {
+        self.rerun_deliveries.iter().any(|d| d == delivery)
+    }
+
+    /// Records that `delivery`'s rerun reset jobs.
+    pub fn note_rerun(&mut self, delivery: &str) {
+        self.rerun_deliveries.push(delivery.to_owned());
+    }
 }
 
 /// The chat command a run was started by, as [`RunInfo`] keeps it.
