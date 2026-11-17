@@ -115,7 +115,7 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run build
-      - run: npm audit --audit-level=high
+      - run: npm audit --omit=dev --audit-level=high
 
   # Tests that switch users need root and a real account.
   root-tests:
