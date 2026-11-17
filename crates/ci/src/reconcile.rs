@@ -1021,11 +1021,11 @@ async fn fail_job(env: &Env, db: &Db, row: &JobRow, message: &str, now: u64) -> 
                 "reconcile: job {}: the object did not answer, failing the row",
                 row.id
             );
-            fail_row(env, db, row, now).await
+            fail_stalled_row(env, db, row, now).await
         }
         EndAction::GiveUp => {
             console_error!("reconcile: job {}: no run object, failing the row", row.id);
-            fail_row(env, db, row, now).await
+            fail_stalled_row(env, db, row, now).await
         }
     }
 }
@@ -1050,6 +1050,24 @@ pub(crate) async fn fail_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Resu
     )
     .await
     .map_err(|e| e.to_string())?;
+    row_failed(env, db, row, ended, now).await
+}
+
+/// [`fail_row`] for a stalled job the reconciler read: the row completes
+/// only while it is as the pass read it. The run object may have
+/// answered late or not at all while the job moved on (it started, or
+/// its launch finished), and a job that moved on is not stalled.
+async fn fail_stalled_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Result<(), String> {
+    let ended = store::fail_unchanged_job(db, row, now)
+        .await
+        .map_err(|e| e.to_string())?;
+    row_failed(env, db, row, ended, now).await
+}
+
+/// What follows completing the row of `row`, `ended` saying whether
+/// this call completed it: the job's places are released and the run
+/// ends once every job is over.
+async fn row_failed(env: &Env, db: &Db, row: &JobRow, ended: bool, now: u64) -> Result<(), String> {
     if !ended {
         // An earlier call may have completed the row and failed before
         // it gave up the place. Release it when this attempt is the one

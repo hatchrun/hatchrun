@@ -395,6 +395,31 @@ fn reset_job_clears_the_attempt() {
 }
 
 #[test]
+fn a_stalled_job_fails_only_while_the_row_is_as_read() {
+    let db = setup();
+    let (_, job_id) = run_with_job(&db, "launched");
+    let seen = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    // The agent claims it after the reconciler read the row.
+    db.wait(start_job(db.db(), job_id, 2_000)).unwrap();
+    assert!(!db.wait(fail_unchanged_job(db.db(), &seen, 3_000)).unwrap());
+    let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    assert_eq!(row.status, "running");
+    // Read again, it is still running when the safety net ends it.
+    let seen = row;
+    assert!(db.wait(fail_unchanged_job(db.db(), &seen, 4_000)).unwrap());
+    let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    assert_eq!(
+        (
+            row.status.as_str(),
+            row.conclusion.as_deref(),
+            row.completed_at
+        ),
+        ("completed", Some("failure"), Some(4_000))
+    );
+    assert!(!db.wait(fail_unchanged_job(db.db(), &seen, 5_000)).unwrap());
+}
+
+#[test]
 fn start_job_sets_started_at() {
     let db = setup();
     let (_, job_id) = run_with_job(&db, "launched");

@@ -20,8 +20,8 @@ use hatchrun_workflow::{Conclusion, JobResult, valid_environment_url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use worker::{
-    DurableObject, Env, Method, Request, Response, Result, State, Storage, WebSocket,
-    WebSocketIncomingMessage, durable_object,
+    DurableObject, Env, Method, Request, Response, Result, ScheduledTime, State, Storage,
+    WebSocket, WebSocketIncomingMessage, durable_object,
 };
 
 use crate::chain::{self, Change};
@@ -93,6 +93,12 @@ struct Snapshot {
     info: RunInfo,
     graph: Graph,
     event: Value,
+}
+
+/// The alarm time of `at`, in Unix milliseconds.
+#[allow(clippy::cast_precision_loss)] // Exact below 2^53 ms, far past any date we set.
+fn alarm_time(at: u64) -> ScheduledTime {
+    ScheduledTime::new(js_sys::Date::new(&js_sys::Number::from(at as f64)))
 }
 
 pub(super) fn now_ms() -> u64 {
@@ -751,10 +757,10 @@ impl<'a> Cx<'a> {
             .await?;
         run.dirty = [false; 5];
         match next_alarm(&run.deadlines, &run.outbox, self.now) {
-            Some(at) => {
-                let wait = Duration::from_millis(at.saturating_sub(self.now));
-                storage.set_alarm(wait).await
-            }
+            // The time itself, not a wait from `self.now`: the handler
+            // may have run a while since, and a wait would count that
+            // twice.
+            Some(at) => storage.set_alarm(alarm_time(at)).await,
             None => storage.delete_alarm().await,
         }
     }

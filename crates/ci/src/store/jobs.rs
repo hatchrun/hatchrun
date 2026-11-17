@@ -347,6 +347,14 @@ const FINISH_JOB: &str = "UPDATE ci_jobs SET status = 'completed', conclusion = 
      environment_url = $7::text \
      WHERE id = $1 AND status <> 'completed' AND attempt = $6";
 
+/// Completes attempt `$2` of job `$1` as failed at `$3`, only while the
+/// row still has status `$4` and was last changed at `$5`: what the
+/// reconciler saw when it chose to end it. Steps, log and deployment are
+/// left as they are.
+const FAIL_UNCHANGED_JOB: &str = "UPDATE ci_jobs SET status = 'completed', conclusion = 'failure', \
+     completed_at = $3, updated_at = $3 \
+     WHERE id = $1 AND attempt = $2 AND status = $4 AND updated_at = $5";
+
 /// Records the usage of attempt `$3` of job `$1`, completed at `$2`,
 /// from the row as the update before it left it: nothing is written
 /// when that update did not apply (another attempt, or a job completed
@@ -1061,6 +1069,38 @@ pub async fn finish_job(
                     job_id,
                     now,
                     attempt,
+                    template_prices(),
+                    templates::UNIT_PRICE_MICROS_PER_MINUTE
+                ],
+            ),
+        ])
+        .await?;
+    Ok(changes.first() == Some(&1))
+}
+
+/// Completes attempt `row.attempt` of job `row.id` as failed at `now`,
+/// only while the row is as `row` read it: same status and last change.
+/// A job that moved on since (a launch that reached the agent, a job
+/// that started) keeps what it has. Returns whether this call completed
+/// it; a job that was claimed gets its seconds recorded, as
+/// [`finish_job`] does.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn fail_unchanged_job(db: &Db, row: &JobRow, now: u64) -> Result<bool> {
+    let changes = db
+        .batch(&[
+            (
+                FAIL_UNCHANGED_JOB,
+                params![row.id, row.attempt, now, &row.status, row.updated_at],
+            ),
+            (
+                RECORD_USAGE,
+                params![
+                    row.id,
+                    now,
+                    row.attempt,
                     template_prices(),
                     templates::UNIT_PRICE_MICROS_PER_MINUTE
                 ],
