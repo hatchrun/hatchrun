@@ -72,7 +72,7 @@ use crate::pool::{self, WINDOW_MS, pool_target};
 use crate::run::{LAUNCHES, TIMEOUT_GRACE_MS};
 use crate::runs::{self, Config};
 use crate::secrets;
-use crate::store::{self, CiBilling, JobRow, PoolRow, ScheduleRow};
+use crate::store::{self, CiBilling, JobRow, PoolRow, ScheduleRow, StalledCursor};
 
 /// How long the lease holds, in milliseconds.
 const LEASE_MS: u64 = 55_000;
@@ -835,8 +835,28 @@ async fn start(
     Ok(())
 }
 
+/// The stalled rows one pass handles, at most `limit`: those after the
+/// last pass's cursor first, then from the start once they run short.
+/// Jobs whose object keeps failing to answer take their turn, so they
+/// never hold the head of the scan for the jobs behind them.
+#[must_use]
+pub fn stalled_page(after: Vec<JobRow>, from_start: Vec<JobRow>, limit: usize) -> Vec<JobRow> {
+    let mut rows = after;
+    rows.truncate(limit);
+    for row in from_start {
+        if rows.len() >= limit {
+            break;
+        }
+        if rows.iter().all(|taken| taken.id != row.id) {
+            rows.push(row);
+        }
+    }
+    rows
+}
+
 /// Steps 2 and 3. Stops when `budget` cannot pay for the next fix; the
-/// rest are still stalled next pass.
+/// rest are still stalled next pass. The pass starts where the last one
+/// stopped and records where it stops.
 async fn fix_stalled(
     env: &Env,
     db: &Db,
@@ -844,11 +864,21 @@ async fn fix_stalled(
     budget: &Budget,
     now: u64,
 ) -> Result<u32, String> {
-    let rows = store::stalled_jobs(db, now, MAX_FIXES)
+    let cursor = store::stalled_cursor(db).await.map_err(|e| e.to_string())?;
+    let after = store::stalled_jobs(db, now, cursor, MAX_FIXES)
         .await
         .map_err(|e| e.to_string())?;
+    let from_start = if after.len() < MAX_FIXES as usize && cursor != StalledCursor::default() {
+        store::stalled_jobs(db, now, StalledCursor::default(), MAX_FIXES)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        Vec::new()
+    };
+    let rows = stalled_page(after, from_start, MAX_FIXES as usize);
     let by_id: HashMap<u64, &JobRow> = rows.iter().map(|row| (row.id, row)).collect();
     let mut failed = 0;
+    let mut stopped = StalledCursor::default();
     for fix in stalled(&rows, now) {
         let cost = match &fix {
             Fix::Requeue(_) => REQUEUE_COST,
@@ -869,11 +899,15 @@ async fn fix_stalled(
                 (id, fail_job(env, db, by_id[&id], message, now).await)
             }
         };
+        stopped = StalledCursor::at(by_id[&id]);
         if let Err(err) = result {
             console_error!("reconcile: job {id}: {err}");
             failed += 1;
         }
     }
+    store::set_stalled_cursor(db, stopped)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(failed)
 }
 
@@ -1857,6 +1891,38 @@ mod tests {
                 "i-1".into(),
                 "the runner did not start"
             )]
+        );
+    }
+
+    #[test]
+    fn a_pass_takes_the_rows_after_its_cursor_then_wraps() {
+        let with_id = |id| {
+            let mut job = row("launching");
+            job.id = id;
+            job
+        };
+        let ids = |rows: Vec<JobRow>| rows.iter().map(|r| r.id).collect::<Vec<_>>();
+        // The rows after the cursor come first.
+        assert_eq!(
+            ids(stalled_page(vec![with_id(4), with_id(5)], vec![], 2)),
+            [4, 5]
+        );
+        // Short after the cursor: the start fills the rest, once each.
+        assert_eq!(
+            ids(stalled_page(
+                vec![with_id(5)],
+                vec![with_id(1), with_id(5), with_id(2)],
+                3
+            )),
+            [5, 1, 2]
+        );
+        assert_eq!(
+            ids(stalled_page(
+                vec![with_id(1), with_id(2), with_id(3)],
+                vec![],
+                2
+            )),
+            [1, 2]
         );
     }
 

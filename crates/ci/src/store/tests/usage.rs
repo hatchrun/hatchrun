@@ -330,7 +330,9 @@ fn stalled_jobs_match_the_reconcilers_decisions() {
     }
     set("old-waiting", "waiting", 0, None, None);
     set("old-completed", "completed", 0, None, None);
-    let rows = db.wait(stalled_jobs(db.db(), now, 50)).unwrap();
+    let rows = db
+        .wait(stalled_jobs(db.db(), now, StalledCursor::default(), 50))
+        .unwrap();
     let mut from_sql: Vec<String> = rows.iter().map(|row| row.plan_id.clone()).collect();
     from_sql.sort();
     assert_eq!(
@@ -355,7 +357,44 @@ fn stalled_jobs_match_the_reconcilers_decisions() {
     let mut sql_ids: Vec<u64> = rows.iter().map(|row| row.id).collect();
     sql_ids.sort_unstable();
     assert_eq!(from_rust, sql_ids);
-    assert_eq!(db.wait(stalled_jobs(db.db(), now, 2)).unwrap().len(), 2);
+    assert_eq!(
+        db.wait(stalled_jobs(db.db(), now, StalledCursor::default(), 2))
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn stalled_jobs_page_after_the_cursor_it_keeps() {
+    let db = setup();
+    let run = db
+        .wait(make_run(db.db(), &new_run("d", "ci", 1)))
+        .unwrap()
+        .unwrap();
+    let jobs: Vec<NewJob> = ["a", "b", "c"].iter().map(|name| new_job(name)).collect();
+    let ids = db.wait(insert_jobs(db.db(), run.id, &jobs, 1)).unwrap();
+    let now = 10_000_000u64;
+    for (i, (_, id)) in ids.iter().enumerate() {
+        db.run(
+            "UPDATE ci_jobs SET status = 'launching', updated_at = $2 WHERE id = $1",
+            &params![*id, 1_000 + i as u64],
+        );
+    }
+    assert_eq!(
+        db.wait(stalled_cursor(db.db())).unwrap(),
+        StalledCursor::default()
+    );
+    let first = db
+        .wait(stalled_jobs(db.db(), now, StalledCursor::default(), 2))
+        .unwrap();
+    assert_eq!(first.len(), 2);
+    let cursor = StalledCursor::at(&first[1]);
+    db.wait(set_stalled_cursor(db.db(), cursor)).unwrap();
+    assert_eq!(db.wait(stalled_cursor(db.db())).unwrap(), cursor);
+    let rest = db.wait(stalled_jobs(db.db(), now, cursor, 2)).unwrap();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].id, ids[2].1);
 }
 
 #[test]
