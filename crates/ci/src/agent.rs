@@ -947,7 +947,6 @@ mod tests {
             next_launch_at: None,
             timeout_minutes: 10,
             updated_at: 0,
-            heartbeat_at: None,
             started_at: None,
             completed_at: None,
             steps: serde_json::json!([]),

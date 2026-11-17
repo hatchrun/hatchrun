@@ -17,8 +17,9 @@ use crate::graph::{Action, Graph, Node, State as NodeState};
 use crate::logs::LogWriter;
 
 use super::{
-    Deadlines, HEARTBEAT_WRITE_MS, JobState, JobSummary, MAX_EVENT_BYTES, MAX_SEND_TRIES,
-    MAX_STEPS, MAX_STORED_ANNOTATIONS, RunInfo, RunState, TODO_RETRY_MS, Todo,
+    BEAT_WRITE_MS, Deadlines, Expiry, JobState, JobSummary, LOST_AFTER_MS, Live, MAX_EVENT_BYTES,
+    MAX_SEND_TRIES, MAX_STEPS, MAX_STORED_ANNOTATIONS, RunInfo, RunState, STUCK_LAUNCH_MS,
+    TIMEOUT_GRACE_MS, TODO_RETRY_MS, Todo,
 };
 
 /// Sets or clears the retry deadline of the todo list: items that are
@@ -184,6 +185,7 @@ pub(crate) fn job_document(
 pub(crate) fn next_alarm(deadlines: &Deadlines, outbox: &Outbox, now_ms: u64) -> Option<u64> {
     [
         deadlines.escalate_at,
+        deadlines.jobs_at,
         deadlines.upload_retry_at,
         deadlines.snapshot_at,
         deadlines.purge_at,
@@ -203,6 +205,7 @@ pub(crate) fn next_alarm(deadlines: &Deadlines, outbox: &Outbox, now_ms: u64) ->
 pub(crate) struct Due {
     pub(crate) flush: bool,
     pub(crate) escalate: bool,
+    pub(crate) jobs: bool,
     pub(crate) upload: bool,
     pub(crate) snapshot: bool,
     pub(crate) purge: bool,
@@ -215,6 +218,7 @@ pub(crate) fn due(deadlines: &Deadlines, outbox: &Outbox, now_ms: u64) -> Due {
     Due {
         flush: !outbox.due(now_ms).is_empty() || reached(deadlines.flush_retry_at),
         escalate: reached(deadlines.escalate_at),
+        jobs: reached(deadlines.jobs_at),
         upload: reached(deadlines.upload_retry_at),
         snapshot: reached(deadlines.snapshot_at),
         purge: reached(deadlines.purge_at),
@@ -359,10 +363,89 @@ pub(crate) fn take_drain(flag: &Cell<bool>) -> bool {
     !flag.replace(true)
 }
 
-/// Whether a heartbeat written at `last` is old enough to write again
-/// at `now`, both in Unix milliseconds.
-pub(crate) fn should_write_heartbeat(last: u64, now: u64) -> bool {
-    now.saturating_sub(last) >= HEARTBEAT_WRITE_MS
+/// Whether a beat stored at the last beat, or the start when no beat
+/// was stored yet, is old enough to store again at `now`, both in Unix
+/// milliseconds.
+pub(crate) fn should_store_beat(live: &Live, now: u64) -> bool {
+    let last = live.beat_at.or(live.started_at).unwrap_or(0);
+    now.saturating_sub(last) >= BEAT_WRITE_MS
+}
+
+/// When the job of `live` ends and why: a running job ends at the
+/// earlier of losing contact and running past its timeout, a launched
+/// one that never started ends as stuck, and anything else has no
+/// deadline.
+pub(crate) fn live_deadline(live: &Live) -> Option<(u64, Expiry)> {
+    if let Some(started) = live.started_at {
+        let lost = live.beat_at.unwrap_or(started) + LOST_AFTER_MS;
+        let timed_out = started + live.timeout_ms + TIMEOUT_GRACE_MS;
+        if lost <= timed_out {
+            Some((lost, Expiry::Lost))
+        } else {
+            Some((timed_out, Expiry::TimedOut))
+        }
+    } else {
+        live.launched_at
+            .map(|launched| (launched + STUCK_LAUNCH_MS, Expiry::Stuck))
+    }
+}
+
+/// Why the job of `live` ends at `now`, `None` while its deadline has
+/// not come.
+pub(crate) fn expired(live: &Live, now: u64) -> Option<Expiry> {
+    live_deadline(live)
+        .filter(|(at, _)| *at <= now)
+        .map(|(_, why)| why)
+}
+
+/// Why the job ended, as its check run shows it.
+pub(crate) fn expiry_message(why: Expiry) -> &'static str {
+    match why {
+        Expiry::Stuck => "the runner did not start",
+        Expiry::Lost => "lost contact with the runner",
+        Expiry::TimedOut => "the job ran past its timeout",
+    }
+}
+
+/// The live record of a claim of `attempt`. A claim of the same attempt
+/// again (the agent retried it) keeps when the job launched and its
+/// last beat, so the retry does not pull the lost deadline back to the
+/// start. A new attempt starts from nothing. The timeout is what the
+/// job may run.
+pub(crate) fn claim_live(
+    previous: Option<&Live>,
+    attempt: u32,
+    started_at: Option<u64>,
+    timeout_ms: u64,
+) -> Live {
+    let same = previous.filter(|live| live.attempt == attempt);
+    Live {
+        attempt,
+        launched_at: same.and_then(|live| live.launched_at),
+        started_at,
+        beat_at: same.and_then(|live| live.beat_at),
+        timeout_ms,
+    }
+}
+
+/// Whether `live` is what `node` is doing: the node exists, its attempt
+/// is the record's, and it waits for an agent or runs. The queued state
+/// is only meaningful for a launched record.
+pub(crate) fn live_is_current(node: Option<&Node>, live: &Live) -> bool {
+    node.is_some_and(|node| {
+        node.attempt == live.attempt && matches!(node.state, NodeState::Queued | NodeState::Running)
+    })
+}
+
+/// Lowers the job deadline of `deadlines` to `at` when it is earlier,
+/// or sets it when none is armed.
+pub(crate) fn arm_jobs(deadlines: &mut Deadlines, at: Option<u64>) {
+    let Some(at) = at else {
+        return;
+    };
+    if deadlines.jobs_at.is_none_or(|armed| at < armed) {
+        deadlines.jobs_at = Some(at);
+    }
 }
 
 /// `event`, with its `commits` replaced by an empty list when it is
@@ -668,6 +751,7 @@ pub(crate) fn file_annotations(state: &JobState) -> usize {
 pub(crate) struct Failed {
     pub(crate) flush: bool,
     pub(crate) escalate: bool,
+    pub(crate) jobs: bool,
     pub(crate) upload: bool,
     pub(crate) todo: bool,
     pub(crate) chain: bool,
@@ -681,6 +765,7 @@ pub(crate) struct Failed {
 pub(crate) fn reschedule(deadlines: &mut Deadlines, failed: Failed, now_ms: u64) {
     let any = failed.flush
         || failed.escalate
+        || failed.jobs
         || failed.upload
         || failed.todo
         || failed.chain
@@ -694,6 +779,9 @@ pub(crate) fn reschedule(deadlines: &mut Deadlines, failed: Failed, now_ms: u64)
     let at = now_ms + wait * 1000;
     if failed.escalate {
         deadlines.escalate_at = Some(at);
+    }
+    if failed.jobs {
+        deadlines.jobs_at = Some(at);
     }
     if failed.upload {
         deadlines.upload_retry_at = Some(at);
@@ -1048,10 +1136,189 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
     }
 
     #[test]
-    fn heartbeat_written_every_thirty_seconds() {
-        assert!(!should_write_heartbeat(1_000, 30_999));
-        assert!(should_write_heartbeat(1_000, 31_000));
-        assert!(should_write_heartbeat(0, 1_792_000_000_000));
+    fn a_beat_is_stored_every_thirty_seconds() {
+        let stored = |beat: Option<u64>, started: Option<u64>, now: u64| {
+            should_store_beat(
+                &Live {
+                    attempt: 1,
+                    launched_at: None,
+                    started_at: started,
+                    beat_at: beat,
+                    timeout_ms: 600_000,
+                },
+                now,
+            )
+        };
+        assert!(!stored(Some(1_000), Some(1_000), 30_999));
+        assert!(stored(Some(1_000), Some(1_000), 31_000));
+        assert!(
+            stored(None, Some(1_000), 31_000),
+            "no beat counts from start"
+        );
+        assert!(stored(None, None, 1_792_000_000_000));
+    }
+
+    fn live(started: Option<u64>, beat: Option<u64>, launched: Option<u64>) -> Live {
+        Live {
+            attempt: 1,
+            launched_at: launched,
+            started_at: started,
+            beat_at: beat,
+            timeout_ms: 600_000,
+        }
+    }
+
+    #[test]
+    fn a_quiet_runner_is_lost_two_minutes_after_its_last_beat() {
+        let quiet = live(Some(1_000), Some(2_000), None);
+        assert_eq!(
+            live_deadline(&quiet),
+            Some((2_000 + LOST_AFTER_MS, Expiry::Lost))
+        );
+        assert_eq!(expired(&quiet, 2_000 + LOST_AFTER_MS - 1), None);
+        assert_eq!(expired(&quiet, 2_000 + LOST_AFTER_MS), Some(Expiry::Lost));
+        assert_eq!(expiry_message(Expiry::Lost), "lost contact with the runner");
+    }
+
+    #[test]
+    fn no_beat_counts_from_the_claim() {
+        let quiet = live(Some(1_000), None, None);
+        assert_eq!(
+            live_deadline(&quiet),
+            Some((1_000 + LOST_AFTER_MS, Expiry::Lost))
+        );
+        assert_eq!(expired(&quiet, 1_000 + LOST_AFTER_MS), Some(Expiry::Lost));
+    }
+
+    #[test]
+    fn a_job_that_beats_on_runs_past_its_timeout() {
+        let beating = live(Some(1_000), Some(1_000 + 850_000), None);
+        assert_eq!(
+            live_deadline(&beating),
+            Some((1_000 + 600_000 + TIMEOUT_GRACE_MS, Expiry::TimedOut))
+        );
+        assert_eq!(
+            expired(&beating, 1_000 + 600_000 + TIMEOUT_GRACE_MS),
+            Some(Expiry::TimedOut)
+        );
+        assert_eq!(
+            expiry_message(Expiry::TimedOut),
+            "the job ran past its timeout"
+        );
+    }
+
+    #[test]
+    fn a_launched_job_that_never_starts_is_stuck() {
+        let waiting = live(None, None, Some(1_000));
+        assert_eq!(
+            live_deadline(&waiting),
+            Some((1_000 + STUCK_LAUNCH_MS, Expiry::Stuck))
+        );
+        assert_eq!(
+            expired(&waiting, 1_000 + STUCK_LAUNCH_MS),
+            Some(Expiry::Stuck)
+        );
+        assert_eq!(expiry_message(Expiry::Stuck), "the runner did not start");
+    }
+
+    #[test]
+    fn a_claim_clears_a_stuck_launch() {
+        let claimed = live(Some(2_000), None, Some(1_000));
+        assert!(matches!(
+            live_deadline(&claimed),
+            Some((_, Expiry::Lost | Expiry::TimedOut))
+        ));
+    }
+
+    #[test]
+    fn a_claim_again_keeps_the_beats_of_its_attempt() {
+        let beating = Live {
+            attempt: 1,
+            launched_at: Some(500),
+            started_at: Some(1_000),
+            beat_at: Some(91_000),
+            timeout_ms: 600_000,
+        };
+        let again = claim_live(Some(&beating), 1, Some(1_000), 600_000);
+        assert_eq!(again, beating);
+        assert_eq!(
+            live_deadline(&again),
+            Some((91_000 + LOST_AFTER_MS, Expiry::Lost))
+        );
+        let next = claim_live(Some(&beating), 2, Some(200_000), 600_000);
+        assert_eq!((next.launched_at, next.beat_at), (None, None));
+        assert_eq!(claim_live(None, 1, Some(1_000), 600_000).beat_at, None);
+    }
+
+    #[test]
+    fn nothing_live_has_no_deadline() {
+        assert_eq!(live_deadline(&live(None, None, None)), None);
+        assert_eq!(expired(&live(None, None, None), u64::MAX), None);
+        assert_eq!(live_deadline(&live(None, Some(1_000), None)), None);
+    }
+
+    #[test]
+    fn arming_jobs_keeps_the_earliest_deadline() {
+        let mut deadlines = Deadlines::default();
+        arm_jobs(&mut deadlines, None);
+        assert_eq!(deadlines.jobs_at, None);
+        arm_jobs(&mut deadlines, Some(9_000));
+        assert_eq!(deadlines.jobs_at, Some(9_000));
+        arm_jobs(&mut deadlines, Some(10_000));
+        assert_eq!(deadlines.jobs_at, Some(9_000));
+        arm_jobs(&mut deadlines, Some(8_000));
+        assert_eq!(deadlines.jobs_at, Some(8_000));
+    }
+
+    #[test]
+    fn the_alarm_wakes_for_job_deadlines() {
+        let deadlines = Deadlines {
+            jobs_at: Some(40_000),
+            escalate_at: Some(70_000),
+            ..Deadlines::default()
+        };
+        assert_eq!(next_alarm(&deadlines, &Outbox::default(), 0), Some(40_000));
+        let past = due(&deadlines, &Outbox::default(), 50_000);
+        assert!(past.jobs && !past.escalate);
+        let coming = due(&deadlines, &Outbox::default(), 39_999);
+        assert!(!coming.jobs);
+    }
+
+    #[test]
+    fn a_live_record_is_current_for_the_attempt_that_runs() {
+        let mut g = graph();
+        let ctx = json!({ "ref": "refs/heads/main", "event": {} });
+        let _ = g.advance(&ctx);
+        let current = Live {
+            attempt: 1,
+            launched_at: Some(1_000),
+            started_at: None,
+            beat_at: None,
+            timeout_ms: 600_000,
+        };
+        assert!(live_is_current(g.node(1), &current));
+        g.running(1);
+        let running = Live {
+            started_at: Some(2_000),
+            ..current.clone()
+        };
+        assert!(live_is_current(g.node(1), &running));
+        let old = Live {
+            attempt: 2,
+            ..running.clone()
+        };
+        assert!(!live_is_current(g.node(1), &old), "another attempt");
+        assert!(!live_is_current(g.node(404), &running), "no node");
+        assert!(!live_is_current(g.node(2), &running), "still waiting");
+        let result = JobResult {
+            conclusion: Conclusion::Failure,
+            outputs: std::collections::BTreeMap::new(),
+            steps: vec![],
+            annotations: vec![],
+            environment_url: None,
+        };
+        let _ = g.finished(1, result, &ctx);
+        assert!(!live_is_current(g.node(1), &running), "ended");
     }
 
     #[test]

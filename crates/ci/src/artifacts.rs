@@ -659,7 +659,7 @@ mod tests {
             "id": 5, "run_id": 9, "plan_id": "build", "name": "build", "status": status,
             "conclusion": null, "instance_id": "i-1", "attempt": attempt, "launch_attempts": 1, "capacity_attempts": 0, "capacity_since": null,
             "next_launch_at": null, "timeout_minutes": 10, "updated_at": 1,
-            "heartbeat_at": null, "started_at": null, "completed_at": null, "steps": "[]",
+            "started_at": null, "completed_at": null, "steps": "[]",
             "log_key": null, "template": "ubuntu-latest", "token_permissions": "{}",
             "secret_refs": "{}", "held": null, "environment": null, "approval_attempt": null,
             "approval_decision": null, "approval_by": null, "approval_at": null, "needs": "[]"

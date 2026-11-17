@@ -38,16 +38,18 @@ use crate::store;
 
 use super::decide::{
     Delivery, Failed, Flushed, Gate, JobToken, Rerun, again_work, apply_batch, apply_held,
-    apply_result, arm_chains, arm_todo, bounded_event, delivery, due, file_annotations, gate,
-    github_context, gives_up, job_document, left_out_work, minimal_check, next_alarm,
-    plan_is_current, record_flush, rerun_once, reschedule, run_state, running_for,
-    should_write_heartbeat, snapshot_ready, steps_json, take_drain,
+    apply_result, arm_chains, arm_jobs, arm_todo, bounded_event, claim_live, delivery, due,
+    expired, expiry_message, file_annotations, gate, github_context, gives_up, job_document,
+    left_out_work, live_deadline, live_is_current, minimal_check, next_alarm, plan_is_current,
+    record_flush, rerun_once, reschedule, run_state, running_for, should_store_beat,
+    snapshot_ready, steps_json, take_drain,
 };
 use super::log::{events_message, log_keys, log_prefix, mark_upload_due, tail_key};
 use super::{
     ALARM_FALLBACK_MS, BUCKET, CHAIN_LEASE_MS, DEADLINES, Deadlines, ESCALATE_AFTER_MS, EVENT,
-    GRAPH, INFO, JobState, LAUNCHES, OUTBOX, PendingChain, RESTORED_KEEP_MS, RunCommand, RunInfo,
-    SNAPSHOT_RETRY_MS, Start, TODO, Todo, Work, is_run, job_key, restore_key, snapshot_key,
+    GRAPH, INFO, JobState, LAUNCHES, Live, OUTBOX, PendingChain, RESTORED_KEEP_MS, RunCommand,
+    RunInfo, SNAPSHOT_RETRY_MS, Start, TODO, Todo, Work, is_run, job_key, live_key, restore_key,
+    snapshot_key,
 };
 
 /// The characters of GitHub's reply body a log line keeps.
@@ -444,7 +446,7 @@ impl<'a> Cx<'a> {
                     Held::Other => answer(409),
                 }
             }
-            (Method::Post, "/claim" | "/events" | "/result") => {
+            (Method::Post, "/claim" | "/events" | "/result" | "/launched") => {
                 let Some(attempt) = attempt else {
                     return Response::error("an attempt is needed", 400);
                 };
@@ -456,6 +458,11 @@ impl<'a> Cx<'a> {
                         }
                         Err(_) => Response::error("bad claim", 400),
                     },
+                    "/launched" => {
+                        // The body, if any, is ignored.
+                        let _ = req.bytes().await?;
+                        self.launched(job, attempt).await
+                    }
                     "/events" => match req.json::<Batch>().await {
                         Ok(batch) => self.events(job, attempt, &batch).await,
                         Err(_) => Response::error("bad batch", 400),
@@ -526,6 +533,12 @@ impl<'a> Cx<'a> {
                 failed.escalate = true;
             }
         }
+        if due.jobs
+            && let Err(err) = self.expire_jobs().await
+        {
+            worker::console_error!("alarm: jobs: {err}");
+            failed.jobs = true;
+        }
         if due.todo
             && let Err(err) = self.drain().await
         {
@@ -562,6 +575,67 @@ impl<'a> Cx<'a> {
             run.dirty[3] = true;
         })
         .await
+    }
+
+    /// Ends the jobs whose live record ran out: a queued job whose
+    /// launch never reported back, a running job that went quiet and one
+    /// that ran past its timeout. A record of no attempt that runs is
+    /// dropped. The deadline left is the earliest of the records that
+    /// stay, or none.
+    async fn expire_jobs(&self) -> Result<()> {
+        let revoke = {
+            let _turn = self.turn.lock().await;
+            let Some(mut run) = self.loaded().await? else {
+                return Ok(());
+            };
+            let ctx = self.github_ctx(&run.info).await?;
+            let ids: Vec<u64> = run
+                .graph
+                .jobs
+                .iter()
+                .filter(|node| matches!(node.state, NodeState::Queued | NodeState::Running))
+                .map(|node| node.id)
+                .collect();
+            let mut revoke = Vec::new();
+            let mut earliest = None;
+            let mut ended = Vec::new();
+            for id in ids {
+                let key = live_key(id);
+                let Some(live) = self.storage.get::<Live>(&key).await? else {
+                    continue;
+                };
+                if !live_is_current(run.graph.node(id), &live) {
+                    self.storage.delete(&key).await?;
+                    continue;
+                }
+                if let Some(why) = expired(&live, self.now) {
+                    self.load_vars(&mut run, id).await?;
+                    let actions = run
+                        .graph_mut()
+                        .failed(id, expiry_message(why).to_owned(), &ctx);
+                    revoke.extend(self.apply_actions(&mut run, actions).await?);
+                    ended.push(key);
+                    continue;
+                }
+                if let Some((at, _)) = live_deadline(&live) {
+                    earliest = Some(earliest.map_or(at, |low: u64| low.min(at)));
+                }
+            }
+            run.deadlines_mut().jobs_at = earliest;
+            self.commit(&mut run).await?;
+            // Only once the graph that ended them is stored: a failure
+            // before keeps the records, and the next alarm ends the jobs
+            // again. A record left by a failed delete is of an ended job,
+            // which the next alarm drops.
+            if !ended.is_empty()
+                && let Err(err) = self.storage.delete_multiple(ended).await
+            {
+                worker::console_warn!("alarm: jobs: drop records: {err}");
+            }
+            revoke
+        };
+        self.after(revoke).await;
+        Ok(())
     }
 
     /// Reads the state, lets `change` change it and writes it, with the
@@ -1233,6 +1307,7 @@ impl<'a> Cx<'a> {
     /// is [`left_out_work`] and [`again_work`].
     async fn clear_job(&self, run: &mut Loaded, id: u64) -> Result<()> {
         self.put_job(id, &JobState::default()).await?;
+        self.storage.delete(&live_key(id)).await?;
         self.delete_prefix(&log_prefix(id)).await?;
         self.storage.delete_multiple(log_keys(id)).await?;
         run.outbox_mut().reset(id);
@@ -1481,9 +1556,16 @@ impl<'a> Cx<'a> {
                 .filter(|old| *old != token);
             if was == Some(NodeState::Queued) || state.started_at.is_none() {
                 state.started_at = Some(self.now);
-                state.heartbeat_written_at = self.now;
             }
             self.put_job(job, &state).await?;
+            let previous = self.storage.get::<Live>(&live_key(job)).await?;
+            let timeout_ms = run
+                .graph
+                .node(job)
+                .map_or(0, |node| u64::from(node.job.timeout_minutes) * 60_000);
+            let live = claim_live(previous.as_ref(), attempt, state.started_at, timeout_ms);
+            arm_jobs(run.deadlines_mut(), live_deadline(&live).map(|(at, _)| at));
+            self.storage.put(&live_key(job), &live).await?;
             let document = job_document(
                 &run.info,
                 &self.event().await?,
@@ -1506,8 +1588,38 @@ impl<'a> Cx<'a> {
         Response::from_json(&document)
     }
 
+    /// Records that the launch consumer started the instance of a
+    /// queued job. A job that runs already answers 204 with no change.
+    async fn launched(&self, job: u64, attempt: u32) -> Result<Response> {
+        let _turn = self.turn.lock().await;
+        let Some(mut run) = self.loaded().await? else {
+            return answer(409);
+        };
+        match gate(run.graph.node(job), attempt) {
+            Gate::Queued => {}
+            Gate::Running => return answer(204),
+            Gate::Missing => return Response::error("no such job", 404),
+            Gate::Stale | Gate::Ended => return answer(409),
+        }
+        let timeout_ms = run
+            .graph
+            .node(job)
+            .map_or(0, |node| u64::from(node.job.timeout_minutes) * 60_000);
+        let live = Live {
+            attempt,
+            launched_at: Some(self.now),
+            started_at: None,
+            beat_at: None,
+            timeout_ms,
+        };
+        arm_jobs(run.deadlines_mut(), live_deadline(&live).map(|(at, _)| at));
+        self.storage.put(&live_key(job), &live).await?;
+        self.commit(&mut run).await?;
+        answer(204)
+    }
+
     async fn events(&self, job: u64, attempt: u32, batch: &Batch) -> Result<Response> {
-        let (reply, heartbeat) = {
+        let reply = {
             let _turn = self.turn.lock().await;
             let Some(mut run) = self.loaded().await? else {
                 return answer(409);
@@ -1521,7 +1633,6 @@ impl<'a> Cx<'a> {
             let mut state = self.job_state(job).await?;
             let mut writer = self.load_writer(job).await?.unwrap_or_default();
             let (applied, wrote) = apply_batch(&mut state, &mut writer, batch);
-            let mut changed = applied.fresh;
             if applied.steps_finished > 0 {
                 run.outbox_mut().mark(job);
             }
@@ -1531,30 +1642,24 @@ impl<'a> Cx<'a> {
                 let chunks = writer.take_full_chunks();
                 self.save_log(job, &writer, &chunks).await?;
             }
-            let heartbeat = should_write_heartbeat(state.heartbeat_written_at, self.now);
-            if heartbeat {
-                state.heartbeat_written_at = self.now;
-                changed = true;
-            }
-            if changed {
-                self.put_job(job, &state).await?;
+            // A beat moves the job's deadline later, so it never arms the
+            // alarm: an early alarm re-checks.
+            if let Some(mut live) = self.storage.get::<Live>(&live_key(job)).await?
+                && live.attempt == attempt
+                && should_store_beat(&live, self.now)
+            {
+                live.beat_at = Some(self.now);
+                self.storage.put(&live_key(job), &live).await?;
             }
             if applied.fresh {
+                self.put_job(job, &state).await?;
                 self.send_sockets(job, || events_message(batch));
             }
             if run.dirty.iter().any(|dirty| *dirty) {
                 self.commit(&mut run).await?;
             }
-            (BatchReply { cancel }, heartbeat)
+            BatchReply { cancel }
         };
-        if heartbeat {
-            // The next one is 30 s away; a miss is not worth failing
-            // the batch.
-            let written = async { store::heartbeat(self.db().await?, job, self.now).await }.await;
-            if let Err(err) = written {
-                worker::console_warn!("job {job}: heartbeat: {err}");
-            }
-        }
         Response::from_json(&reply)
     }
 
@@ -1737,6 +1842,7 @@ impl<'a> Cx<'a> {
             for (id, attempt) in reset {
                 revoke.extend(self.job_state(id).await?.github_token);
                 self.put_job(id, &JobState::default()).await?;
+                self.storage.delete(&live_key(id)).await?;
                 self.delete_prefix(&log_prefix(id)).await?;
                 self.storage.delete_multiple(log_keys(id)).await?;
                 run.todo_mut().push(Work::ResetJob { job: id, attempt });

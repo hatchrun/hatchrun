@@ -69,7 +69,7 @@ use crate::intake::Repo;
 use crate::launcher::Backend;
 use crate::launches::{self, EndAction, LaunchMessage};
 use crate::pool::{self, WINDOW_MS, pool_target};
-use crate::run::LAUNCHES;
+use crate::run::{LAUNCHES, TIMEOUT_GRACE_MS};
 use crate::runs::{self, Config};
 use crate::secrets;
 use crate::store::{self, CiBilling, JobRow, PoolRow, ScheduleRow};
@@ -103,8 +103,10 @@ pub const MAX_TERMINATIONS: usize = 50;
 pub const QUEUED_QUIET_MS: u64 = 60_000;
 /// A job launching or launched for this long without moving on fails.
 pub const LAUNCH_QUIET_MS: u64 = 600_000;
-/// A running job without a heartbeat for this long is lost.
-pub const RUNNER_QUIET_MS: u64 = 120_000;
+/// How much longer the reconciler waits before it ends a job whose run
+/// object wedged: the object ends running and launched jobs on its own
+/// deadlines, and this is the grace past them.
+pub const WEDGED_GRACE_MS: u64 = 15 * 60_000;
 /// An instance whose job ended this long ago is terminated.
 const ORPHAN_GRACE_MS: u64 = 180_000;
 /// No instance lives longer than this.
@@ -112,7 +114,7 @@ const MAX_AGE_MS: u64 = 7 * 3_600_000;
 
 const LAUNCH_DID_NOT_FINISH: &str = "the launch did not finish";
 const RUNNER_DID_NOT_START: &str = "the runner did not start";
-const LOST_CONTACT: &str = "lost contact with the runner";
+const TIMED_OUT: &str = "the job ran past its timeout";
 
 /// The subrequests one pass plans to make, below the Worker's limit of
 /// 1000 so that DNS, KV and Postgres setup have room.
@@ -271,18 +273,16 @@ fn fix(row: &JobRow, now: u64) -> Option<Fix> {
         "launching" if quiet_since(row.updated_at, LAUNCH_QUIET_MS) => {
             Some(Fix::Fail(row.id, LAUNCH_DID_NOT_FINISH))
         }
-        "launched" if quiet_since(row.updated_at, LAUNCH_QUIET_MS) => {
+        "launched" if quiet_since(row.updated_at, LAUNCH_QUIET_MS + WEDGED_GRACE_MS) => {
             Some(terminate_and_fail(row, RUNNER_DID_NOT_START))
         }
         "running"
             if quiet_since(
-                row.heartbeat_at
-                    .or(row.started_at)
-                    .unwrap_or(row.updated_at),
-                RUNNER_QUIET_MS,
+                row.started_at.unwrap_or(row.updated_at),
+                u64::from(row.timeout_minutes) * 60_000 + TIMEOUT_GRACE_MS + WEDGED_GRACE_MS,
             ) =>
         {
-            Some(terminate_and_fail(row, LOST_CONTACT))
+            Some(terminate_and_fail(row, TIMED_OUT))
         }
         _ => None,
     }
@@ -1008,13 +1008,21 @@ async fn requeue(env: &Env, row: &JobRow) -> Result<(), String> {
 }
 
 /// Ends the attempt of `row` as failed through its run's object. When
-/// nobody holds the run, the row is completed here, and the run with it
-/// once every job is over. A failed ask is left for the next pass.
+/// nobody holds the run, or the object did not answer, the row is
+/// completed here, and the run with it once every job is over: a job
+/// that reached the safety net is past every limit the object had. A
+/// failed ask is left for the next pass.
 async fn fail_job(env: &Env, db: &Db, row: &JobRow, message: &str, now: u64) -> Result<(), String> {
     let answer = launches::post_failed(env, db, row, message).await;
     match launches::end_action(&answer) {
         EndAction::Done => Ok(()),
-        EndAction::Retry => Err(format!("could not end it: {answer:?}")),
+        EndAction::Retry => {
+            console_error!(
+                "reconcile: job {}: the object did not answer, failing the row",
+                row.id
+            );
+            fail_row(env, db, row, now).await
+        }
         EndAction::GiveUp => {
             console_error!("reconcile: job {}: no run object, failing the row", row.id);
             fail_row(env, db, row, now).await
@@ -1693,7 +1701,7 @@ mod tests {
             "conclusion": null, "instance_id": null, "attempt": 1,
             "launch_attempts": 1, "capacity_attempts": 0, "capacity_since": null,
             "next_launch_at": null,
-            "timeout_minutes": 10, "updated_at": NOW, "heartbeat_at": null,
+            "timeout_minutes": 10, "updated_at": NOW,
             "started_at": null, "completed_at": null, "steps": "[]", "log_key": null,
             "template": "ubuntu-latest", "token_permissions": "{}",
             "secret_refs": "{\"all\":false,\"names\":[]}", "needs": "[]",
@@ -1778,8 +1786,11 @@ mod tests {
         );
         launching.updated_at = NOW - 599_000;
         assert_eq!(stalled(&[launching], NOW), []);
+        // A launched job gets the wedged grace on top of the quiet.
         let mut launched = row("launched");
-        launched.updated_at = NOW - 601_000;
+        launched.updated_at = NOW - LAUNCH_QUIET_MS - WEDGED_GRACE_MS + 1_000;
+        assert_eq!(stalled(&[launched.clone()], NOW), []);
+        launched.updated_at = NOW - LAUNCH_QUIET_MS - WEDGED_GRACE_MS - 1;
         assert_eq!(
             stalled(&[launched.clone()], NOW),
             [Fix::Fail(1, "the runner did not start")]
@@ -1796,25 +1807,26 @@ mod tests {
     }
 
     #[test]
-    fn fails_a_silent_runner() {
+    fn fails_a_runner_past_its_timeout_and_graces() {
+        // Ten minutes of timeout, five of the object's grace and fifteen
+        // of the safety net's.
+        let over = 10 * MIN + TIMEOUT_GRACE_MS + WEDGED_GRACE_MS;
         let mut running = row("running");
         running.instance_id = Some("i-1".into());
-        running.started_at = Some(NOW - 500_000);
-        running.heartbeat_at = Some(NOW - 121_000);
+        running.started_at = Some(NOW - over - 1);
         assert_eq!(
             stalled(&[running.clone()], NOW),
             [Fix::TerminateAndFail(
                 1,
                 "i-1".into(),
-                "lost contact with the runner"
+                "the job ran past its timeout"
             )]
         );
-        running.heartbeat_at = Some(NOW - 119_000);
+        running.started_at = Some(NOW - over + 60_000);
         assert_eq!(stalled(&[running.clone()], NOW), []);
-        // No heartbeat yet: the start counts.
-        running.heartbeat_at = None;
-        assert_eq!(stalled(&[running.clone()], NOW).len(), 1);
-        running.started_at = Some(NOW - 10_000);
+        // A fresh running job is left alone even with no start.
+        running.started_at = None;
+        running.updated_at = NOW - 10_000;
         assert_eq!(stalled(&[running], NOW), []);
         for status in ["waiting", "completed"] {
             let mut old = row(status);

@@ -74,8 +74,6 @@ pub struct JobRow {
     pub timeout_minutes: u32,
     /// When the row last changed.
     pub updated_at: u64,
-    /// The agent's last sign of life.
-    pub heartbeat_at: Option<u64>,
     /// When the agent started it.
     pub started_at: Option<u64>,
     /// When it finished.
@@ -126,7 +124,7 @@ fn json_text<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<serde_json:
 
 /// The columns of a [`JobRow`].
 pub(super) const JOB_COLUMNS: &str = "id, run_id, plan_id, name, status, conclusion, instance_id, attempt, \
-     launch_attempts, capacity_attempts, capacity_since, next_launch_at, timeout_minutes, updated_at, heartbeat_at, started_at, \
+     launch_attempts, capacity_attempts, capacity_since, next_launch_at, timeout_minutes, updated_at, started_at, \
      completed_at, steps::text AS steps, log_key, template, \
      token_permissions::text AS token_permissions, secret_refs::text AS secret_refs, held, \
      environment, environment_url, approval_attempt, approval_decision, approval_by, \
@@ -167,9 +165,10 @@ const JOB: &str = "SELECT {columns} FROM ci_jobs WHERE id = $1";
 const SET_CACHE_SCOPES: &str = "UPDATE ci_jobs SET cache_scopes = COALESCE(cache_scopes, $3) \
      WHERE id = $1 AND attempt = $2 RETURNING cache_scopes";
 
-/// Starts running job `$1` at `$2`, which is also its first heartbeat.
+/// Starts running job `$1` at `$2`. Only a job that is launching or
+/// launched starts; returns whether it did.
 const START_JOB: &str = "UPDATE ci_jobs SET status = 'running', started_at = $2, \
-     heartbeat_at = $2, updated_at = $2 \
+     updated_at = $2 \
      WHERE id = $1 AND status IN ('launching', 'launched')";
 
 /// Sets job `$1` up for attempt `$2` at `$3`: nothing of the earlier
@@ -177,7 +176,7 @@ const START_JOB: &str = "UPDATE ci_jobs SET status = 'running', started_at = $2,
 /// alone, so a late repeat does nothing.
 const RESET_JOB: &str = "UPDATE ci_jobs SET status = 'waiting', attempt = $2, launch_attempts = 0, \
      capacity_attempts = 0, capacity_since = NULL, conclusion = NULL, instance_id = NULL, launch_error = NULL, next_launch_at = NULL, \
-     heartbeat_at = NULL, started_at = NULL, completed_at = NULL, log_key = NULL, \
+     started_at = NULL, completed_at = NULL, log_key = NULL, \
      held = NULL, steps = '[]', environment_url = NULL, superseded = false, cache_scopes = NULL, \
      updated_at = $3 \
      WHERE id = $1 AND attempt < $2";
@@ -340,10 +339,6 @@ const LAUNCH_RETRY: &str = "UPDATE ci_jobs SET status = 'queued', launch_error =
 const LAUNCH_GAVE_UP: &str = "UPDATE ci_jobs SET status = 'completed', conclusion = 'failure', \
      launch_error = $2, next_launch_at = NULL, completed_at = $3, updated_at = $3 \
      WHERE id = $1 AND status = 'launching'";
-
-/// Records the agent's heartbeat for job `$1` at `$2`.
-const HEARTBEAT: &str = "UPDATE ci_jobs SET heartbeat_at = $2, updated_at = $2 \
-     WHERE id = $1 AND status <> 'completed'";
 
 /// Completes attempt `$6` of job `$1` with conclusion `$2`, steps `$3`
 /// (JSON text) and log key `$4` at `$5`.
@@ -686,9 +681,8 @@ pub async fn job(db: &Db, job_id: u64) -> Result<Option<JobRow>> {
         .await
 }
 
-/// Starts job `job_id`: running, with `now` as its start and first
-/// heartbeat. Only a job that is launching or launched starts; returns
-/// whether it did.
+/// Starts job `job_id`: running, with `now` as its start. Only a job
+/// that is launching or launched starts; returns whether it did.
 ///
 /// # Errors
 ///
@@ -1025,16 +1019,6 @@ pub async fn capacity_wait(
         .run(CAPACITY_WAIT, &params![job_id, error, retry_at, now])
         .await?
         == 1)
-}
-
-/// Records the agent's heartbeat for job `job_id`.
-///
-/// # Errors
-///
-/// Postgres refused the statement.
-pub async fn heartbeat(db: &Db, job_id: u64, now: u64) -> Result<()> {
-    db.run(HEARTBEAT, &params![job_id, now]).await?;
-    Ok(())
 }
 
 /// Completes attempt `attempt` of job `job_id` with its `conclusion`,

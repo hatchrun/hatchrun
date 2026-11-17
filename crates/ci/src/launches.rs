@@ -537,7 +537,11 @@ async fn launch(
         return end_job(env, &db, &job, NO_TEMPLATE).await;
     };
     match launch_claimed(&db, settings, backend, &job, template).await {
-        Ok(Launched::Started | Launched::MovedOn) => Ok(()),
+        Ok(Launched::Started) => {
+            post_launched(env, &db, &job).await;
+            Ok(())
+        }
+        Ok(Launched::MovedOn) => Ok(()),
         Err(failure) => {
             console_error!(
                 "job {}: launch {} failed: {}",
@@ -970,6 +974,16 @@ pub(crate) fn end_action(answer: &EndAnswer) -> EndAction {
     }
 }
 
+/// Tells the run's object that the launch started the instance, so its
+/// live record stops the stuck deadline. A post that fails is logged and
+/// left to the reconciler's safety net; the launch still counts.
+async fn post_launched(env: &Env, db: &Db, job: &JobRow) {
+    let answer = post_to_run(env, db, job, "launched", "").await;
+    if !matches!(answer, EndAnswer::Status(200..=299 | 409)) {
+        console_error!("job {}: post launched: {answer:?}", job.id);
+    }
+}
+
 /// Asks the run's object to end attempt `job.attempt` as failed.
 pub(crate) async fn post_failed(env: &Env, db: &Db, job: &JobRow, message: &str) -> EndAnswer {
     post_to_run(env, db, job, "failed", message).await
@@ -1351,7 +1365,7 @@ mod tests {
             "conclusion": null, "instance_id": null, "attempt": attempt,
             "launch_attempts": launch_attempts, "capacity_attempts": 0,
             "capacity_since": null, "next_launch_at": null,
-            "timeout_minutes": 10, "updated_at": 0, "heartbeat_at": null,
+            "timeout_minutes": 10, "updated_at": 0,
             "started_at": null, "completed_at": null, "steps": "[]", "log_key": null,
             "template": "ubuntu-latest", "token_permissions": "{}",
             "secret_refs": "{\"all\":false,\"names\":[]}", "needs": "[]",

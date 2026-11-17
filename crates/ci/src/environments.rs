@@ -374,7 +374,6 @@ mod tests {
             next_launch_at: None,
             timeout_minutes: 10,
             updated_at: 1,
-            heartbeat_at: None,
             started_at: None,
             completed_at: None,
             steps: json!([]),

@@ -9,8 +9,9 @@ use hatchrun_cloud::db::{Db, Param, params};
 use serde::Deserialize;
 use worker::Result;
 
-use super::jobs::{JOB_COLUMNS, JobRow};
-use super::with_columns;
+use crate::run::TIMEOUT_GRACE_MS;
+use crate::store::jobs::{JOB_COLUMNS, JobRow};
+use crate::store::with_columns;
 
 /// How long webhook deliveries are kept, in milliseconds. Like runs,
 /// jobs, usage and audit rows, they go with the month partition they
@@ -72,7 +73,10 @@ pub async fn stalled_jobs(db: &Db, now: u64, limit: u32) -> Result<Vec<JobRow>> 
             now,
             now.saturating_sub(crate::reconcile::QUEUED_QUIET_MS),
             now.saturating_sub(crate::reconcile::LAUNCH_QUIET_MS),
-            now.saturating_sub(crate::reconcile::RUNNER_QUIET_MS),
+            now.saturating_sub(TIMEOUT_GRACE_MS + crate::reconcile::WEDGED_GRACE_MS),
+            now.saturating_sub(
+                crate::reconcile::LAUNCH_QUIET_MS + crate::reconcile::WEDGED_GRACE_MS
+            ),
             limit
         ],
     )
@@ -89,17 +93,18 @@ const LAST_MINUTE: &str = "SELECT last_minute FROM ci_reconciler WHERE id = 1";
 const SET_LAST_MINUTE: &str = "UPDATE ci_reconciler SET last_minute = $1 WHERE id = 1";
 
 /// Jobs a reconciler pass looks at, the least recently changed first, at
-/// most `$5`: queued ones due for a launch (`$1` now) or quiet since
-/// `$2` (a job held for capacity only when due), launching or launched ones quiet since `$3`, and running ones
-/// without a heartbeat since `$4`, or without a start or any change when
-/// the heartbeat is missing. [`crate::reconcile::stalled`] makes the
-/// same decisions over the rows.
+/// most `$6`: queued ones due for a launch (`$1` now) or quiet since
+/// `$2` (a job held for capacity only when due), launching ones quiet
+/// since `$3`, launched ones quiet since `$5`, and running ones past
+/// their timeout and every grace since `$4`. [`crate::reconcile::stalled`]
+/// makes the same decisions over the rows.
 const STALLED_JOBS: &str = "SELECT {columns} FROM ci_jobs WHERE \
      (status = 'queued' AND held IS NULL AND (next_launch_at <= $1 OR updated_at < $2)) \
      OR (status = 'queued' AND held = 'capacity' AND next_launch_at <= $1) \
-     OR (status IN ('launching', 'launched') AND updated_at < $3) \
-     OR (status = 'running' AND COALESCE(heartbeat_at, started_at, updated_at) < $4) \
-     ORDER BY updated_at, id LIMIT $5";
+     OR (status = 'launching' AND updated_at < $3) \
+     OR (status = 'launched' AND updated_at < $5) \
+     OR (status = 'running' AND COALESCE(started_at, updated_at) + timeout_minutes::bigint * 60000 < $4) \
+     ORDER BY updated_at, id LIMIT $6";
 
 /// The month partitions of parent `$1` in this schema, oldest first.
 const PARTITIONS: &str = "SELECT c.relname AS name FROM pg_class c      JOIN pg_inherits i ON i.inhrelid = c.oid      JOIN pg_class p ON p.oid = i.inhparent      JOIN pg_namespace n ON n.oid = c.relnamespace      WHERE p.relname = $1 AND n.nspname = current_schema() ORDER BY 1";
