@@ -1007,22 +1007,16 @@ async fn requeue(env: &Env, row: &JobRow) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Ends the attempt of `row` as failed through its run's object. When
-/// nobody holds the run, or the object did not answer, the row is
-/// completed here, and the run with it once every job is over: a job
-/// that reached the safety net is past every limit the object had. A
-/// failed ask is left for the next pass.
+/// Ends the attempt of `row` as failed through its run's object, which
+/// moves the graph on and records the end. An object that does not
+/// answer is asked again next pass: completing the row here would leave
+/// its graph waiting on the job. When nobody holds the run, the row is
+/// completed here, and the run with it once every job is over.
 async fn fail_job(env: &Env, db: &Db, row: &JobRow, message: &str, now: u64) -> Result<(), String> {
     let answer = launches::post_failed(env, db, row, message).await;
     match launches::end_action(&answer) {
         EndAction::Done => Ok(()),
-        EndAction::Retry => {
-            console_error!(
-                "reconcile: job {}: the object did not answer, failing the row",
-                row.id
-            );
-            fail_stalled_row(env, db, row, now).await
-        }
+        EndAction::Retry => Err(format!("could not end it: {answer:?}")),
         EndAction::GiveUp => {
             console_error!("reconcile: job {}: no run object, failing the row", row.id);
             fail_stalled_row(env, db, row, now).await
@@ -1033,6 +1027,16 @@ async fn fail_job(env: &Env, db: &Db, row: &JobRow, message: &str, now: u64) -> 
 /// Whether `current` is `attempt` of a job that has completed.
 fn attempt_ended(current: Option<&JobRow>, attempt: u32) -> bool {
     current.is_some_and(|job| job.attempt == attempt && job.status == "completed")
+}
+
+/// Whether `current` is the row as `seen` read it: same attempt, status
+/// and last change.
+fn unchanged(current: Option<&JobRow>, seen: &JobRow) -> bool {
+    current.is_some_and(|job| {
+        job.attempt == seen.attempt
+            && job.status == seen.status
+            && job.updated_at == seen.updated_at
+    })
 }
 
 /// Completes the attempt of `row` as failed in the database, for a job
@@ -1050,24 +1054,6 @@ pub(crate) async fn fail_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Resu
     )
     .await
     .map_err(|e| e.to_string())?;
-    row_failed(env, db, row, ended, now).await
-}
-
-/// [`fail_row`] for a stalled job the reconciler read: the row completes
-/// only while it is as the pass read it. The run object may have
-/// answered late or not at all while the job moved on (it started, or
-/// its launch finished), and a job that moved on is not stalled.
-async fn fail_stalled_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Result<(), String> {
-    let ended = store::fail_unchanged_job(db, row, now)
-        .await
-        .map_err(|e| e.to_string())?;
-    row_failed(env, db, row, ended, now).await
-}
-
-/// What follows completing the row of `row`, `ended` saying whether
-/// this call completed it: the job's places are released and the run
-/// ends once every job is over.
-async fn row_failed(env: &Env, db: &Db, row: &JobRow, ended: bool, now: u64) -> Result<(), String> {
     if !ended {
         // An earlier call may have completed the row and failed before
         // it gave up the place. Release it when this attempt is the one
@@ -1096,19 +1082,69 @@ async fn row_failed(env: &Env, db: &Db, row: &JobRow, ended: bool, now: u64) -> 
         .await
         .map_err(|e| e.to_string())?;
     if jobs.iter().all(|job| job.status == "completed") {
-        // No `workflow_run` change is recorded for this run. A run here
-        // has no object (it was purged or never held), so there is no
-        // event payload to read the chain depth from and nowhere to keep
-        // the change until it is sent; this row finishes only once, so
-        // a failed send would not be tried again.
-        store::finish_run(db, run.id, run.run_attempt, "failure", now)
-            .await
-            .map_err(|e| e.to_string())?;
-        concurrency::release(env, db, run.id, None)
-            .await
-            .map_err(|e| e.to_string())?;
+        finish_run_without_object(env, db, &run, now).await?;
     }
     Ok(())
+}
+
+/// [`fail_row`] for a stalled job the reconciler read, whose run no
+/// object holds. Everything that can fail runs before the row completes
+/// and is safe to repeat: until the row completes it stays stalled, and
+/// the next pass does it all again. The row then completes only while
+/// it is as the pass read it, so a job that moved on keeps its state.
+/// The wakes come last; a lost one is caught by the held-job backstop.
+async fn fail_stalled_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Result<(), String> {
+    let current = store::job(db, row.id).await.map_err(|e| e.to_string())?;
+    if !unchanged(current.as_ref(), row) {
+        return Ok(());
+    }
+    concurrency::release(env, db, row.run_id, Some(row.id))
+        .await
+        .map_err(|e| e.to_string())?;
+    let run = store::run(db, row.run_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(run) = &run {
+        let jobs = store::jobs_for_run(db, run.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if last_open(&jobs, row.id) {
+            finish_run_without_object(env, db, run, now).await?;
+        }
+    }
+    store::fail_unchanged_job(db, row, now)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(run) = &run {
+        launches::wake_oldest(env, db, &run.tenant_id).await;
+    }
+    launches::wake_group(env, db, row.id).await;
+    Ok(())
+}
+
+/// Whether every job of `jobs` but `job` has completed.
+fn last_open(jobs: &[JobRow], job: u64) -> bool {
+    jobs.iter().all(|j| j.id == job || j.status == "completed")
+}
+
+/// Completes `run` as failed and gives up its place in its group.
+async fn finish_run_without_object(
+    env: &Env,
+    db: &Db,
+    run: &store::RunRow,
+    now: u64,
+) -> Result<(), String> {
+    // No `workflow_run` change is recorded for this run. A run here
+    // has no object (it was purged or never held), so there is no
+    // event payload to read the chain depth from and nowhere to keep
+    // the change until it is sent; this row finishes only once, so
+    // a failed send would not be tried again.
+    store::finish_run(db, run.id, run.run_attempt, "failure", now)
+        .await
+        .map_err(|e| e.to_string())?;
+    concurrency::release(env, db, run.id, None)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Step 4. Terminates as many orphans as `budget` pays for.
@@ -1822,6 +1858,34 @@ mod tests {
                 "the runner did not start"
             )]
         );
+    }
+
+    #[test]
+    fn a_stalled_row_is_failed_only_while_it_is_as_read() {
+        let seen = row("launched");
+        assert!(unchanged(Some(&seen), &seen));
+        assert!(!unchanged(None, &seen));
+        let mut started = seen.clone();
+        started.status = "running".into();
+        assert!(!unchanged(Some(&started), &seen));
+        let mut touched = seen.clone();
+        touched.updated_at += 1;
+        assert!(!unchanged(Some(&touched), &seen));
+        let mut rerun = seen.clone();
+        rerun.attempt += 1;
+        assert!(!unchanged(Some(&rerun), &seen));
+    }
+
+    #[test]
+    fn the_run_ends_with_its_last_open_job() {
+        let mut stalled = row("launched");
+        stalled.id = 1;
+        let mut done = row("completed");
+        done.id = 2;
+        let mut open = row("running");
+        open.id = 3;
+        assert!(last_open(&[stalled.clone(), done.clone()], 1));
+        assert!(!last_open(&[stalled, done, open], 1));
     }
 
     #[test]
