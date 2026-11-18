@@ -806,54 +806,122 @@ fn a_returned_card_turns_the_holds_into_concurrency_holds_and_wakes_five() {
     assert_eq!(woken_ids(next), card[5..6]);
 }
 
+/// 2026-10-01 and 2026-11-01, UTC, in milliseconds: the period the
+/// test subscription covers, and the calendar months around it.
+const OCT_1: u64 = 1_790_812_800_000;
+const NOV_1: u64 = 1_793_491_200_000;
+/// A hold written in the middle of October.
+const MID_OCT: u64 = OCT_1 + 14 * 86_400_000;
+
+fn billing_candidates(db: &TestDb, now: u64, month_start: u64) -> Vec<(String, String)> {
+    db.wait(hatchrun_cloud::ci_wake::billing_candidates(
+        db.db(),
+        now,
+        month_start,
+        10,
+    ))
+    .unwrap()
+    .into_iter()
+    .map(|row| (row.tenant_id, row.reasons))
+    .collect()
+}
+
 #[test]
-fn billing_holds_list_tenants_in_turns_with_their_reasons() {
-    use hatchrun_cloud::ci_wake;
+fn a_billing_hold_nothing_happened_to_is_not_read() {
     let db = setup();
     let (_, card) = run_with_job_named(&db, "card", "queued");
-    set_held(&db, card, "card", 5);
+    set_held(&db, card, "card", MID_OCT);
     let (_, capped) = run_with_job_named(&db, "capped", "queued");
-    set_held(&db, capped, "spend_cap", 5);
+    set_held(&db, capped, "spend_cap", MID_OCT);
     let (_, busy) = run_with_job_named(&db, "busy", "queued");
-    set_held(&db, busy, "concurrency", 5);
-    let (_, other) = run_with_job_named(&db, "other", "queued");
-    set_held(&db, other, "spend_cap", 5);
+    set_held(&db, busy, "concurrency", 0);
+    // Still October, no card, no cap and no subscription: nothing to read.
+    assert_eq!(billing_candidates(&db, MID_OCT + 1, OCT_1), []);
+}
+
+#[test]
+fn a_card_that_is_back_makes_its_tenant_a_candidate() {
+    let db = setup();
+    let (_, card) = run_with_job_named(&db, "card", "queued");
+    set_held(&db, card, "card", MID_OCT);
+    subscribe(&db, "s1", "canceled");
+    assert_eq!(billing_candidates(&db, MID_OCT + 1, OCT_1), []);
+    // The webhook that brought the card back failed to wake the job.
     db.run(
-        "UPDATE ci_jobs SET tenant_id = 't2' WHERE id = $1",
-        &params![other],
+        "UPDATE subscriptions SET status = 'active' WHERE id = 's1'",
+        &[],
     );
-    let (_, unheld) = run_with_job_named(&db, "plain", "queued");
+    assert_eq!(
+        billing_candidates(&db, MID_OCT + 1, OCT_1),
+        [("t1".to_owned(), "card".to_owned())]
+    );
+    // A beta tenant needs no subscription.
     db.run(
-        "UPDATE ci_jobs SET tenant_id = 't3' WHERE id = $1",
-        &params![unheld],
+        "UPDATE subscriptions SET status = 'canceled' WHERE id = 's1'",
+        &[],
     );
-    let all = db.wait(ci_wake::billing_holds(db.db(), "", 10)).unwrap();
-    let listed: Vec<(&str, &str)> = all
-        .iter()
-        .map(|row| (row.tenant_id.as_str(), row.reasons.as_str()))
-        .collect();
-    assert_eq!(listed, [("t1", "card,spend_cap"), ("t2", "spend_cap")]);
-    // A full page leaves a cursor after its last tenant; the next pass
-    // starts there, and a short page starts over.
-    let first = db.wait(ci_wake::billing_holds(db.db(), "", 1)).unwrap();
-    assert_eq!(first[0].tenant_id, "t1");
-    let after = crate::reconcile::next_billing_cursor(&first, 1);
-    assert_eq!(after, "t1");
-    let second = db.wait(ci_wake::billing_holds(db.db(), &after, 1)).unwrap();
-    assert_eq!(second[0].tenant_id, "t2");
-    let third = db
-        .wait(ci_wake::billing_holds(db.db(), &second[0].tenant_id, 1))
+    db.run("UPDATE tenants SET beta = true WHERE id = 't1'", &[]);
+    assert_eq!(billing_candidates(&db, MID_OCT + 1, OCT_1).len(), 1);
+}
+
+#[test]
+fn a_raised_cap_after_the_hold_makes_its_tenant_a_candidate_until_checked() {
+    let db = setup();
+    let (_, capped) = run_with_job_named(&db, "capped", "queued");
+    set_held(&db, capped, "spend_cap", MID_OCT);
+    db.wait(crate::store::set_spend_cap(db.db(), "t1", 1, MID_OCT - 1))
         .unwrap();
-    assert_eq!(third, []);
-    assert_eq!(crate::reconcile::next_billing_cursor(&third, 1), "");
-    // The cursor is kept between passes.
-    assert_eq!(db.wait(crate::store::billing_cursor(db.db())).unwrap(), "");
-    db.wait(crate::store::set_billing_cursor(db.db(), "t1"))
+    assert_eq!(billing_candidates(&db, MID_OCT + 2, OCT_1), []);
+    db.wait(crate::store::set_spend_cap(db.db(), "t1", 2, MID_OCT + 1))
         .unwrap();
     assert_eq!(
-        db.wait(crate::store::billing_cursor(db.db())).unwrap(),
-        "t1"
+        billing_candidates(&db, MID_OCT + 2, OCT_1),
+        [("t1".to_owned(), "spend_cap".to_owned())]
     );
+    // Read and still over the cap: it leaves the list.
+    db.wait(hatchrun_cloud::ci_wake::billing_checked(
+        db.db(),
+        "t1",
+        MID_OCT + 2,
+    ))
+    .unwrap();
+    assert_eq!(billing_candidates(&db, MID_OCT + 3, OCT_1), []);
+    assert_eq!(held_of(&db, capped).as_deref(), Some("spend_cap"));
+}
+
+#[test]
+fn a_polar_delivery_after_the_hold_makes_its_tenant_a_candidate() {
+    let db = setup();
+    let (_, capped) = run_with_job_named(&db, "capped", "queued");
+    set_held(&db, capped, "spend_cap", MID_OCT);
+    subscribe(&db, "s1", "active");
+    assert_eq!(billing_candidates(&db, MID_OCT + 2, OCT_1), []);
+    db.run(
+        "UPDATE subscriptions SET updated_at = $1 WHERE id = 's1'",
+        &params![MID_OCT + 1],
+    );
+    assert_eq!(billing_candidates(&db, MID_OCT + 2, OCT_1).len(), 1);
+}
+
+#[test]
+fn a_spend_window_that_turned_makes_its_tenant_a_candidate() {
+    let db = setup();
+    let (_, capped) = run_with_job_named(&db, "capped", "queued");
+    set_held(&db, capped, "spend_cap", MID_OCT);
+    // No subscription: the calendar month turned.
+    assert_eq!(billing_candidates(&db, NOV_1 + 1, NOV_1).len(), 1);
+    // A subscription whose period ended with no renewal webhook rolls
+    // forward to November, past the hold.
+    subscribe(&db, "s1", "active");
+    assert_eq!(billing_candidates(&db, MID_OCT + 1, OCT_1), []);
+    assert_eq!(billing_candidates(&db, NOV_1 + 1, NOV_1).len(), 1);
+    db.wait(hatchrun_cloud::ci_wake::billing_checked(
+        db.db(),
+        "t1",
+        NOV_1 + 1,
+    ))
+    .unwrap();
+    assert_eq!(billing_candidates(&db, NOV_1 + 2, NOV_1), []);
 }
 
 #[test]

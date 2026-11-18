@@ -29,7 +29,3 @@ CREATE INDEX ci_jobs_tenant_live ON ci_jobs (tenant_id)
 
 CREATE INDEX ci_jobs_capacity ON ci_jobs (template, id)
   WHERE status = 'queued' AND held = 'capacity';
-
--- Where the held-job backstop stopped in the tenants with card or
--- spend-cap holds, so each pass checks the next ones.
-ALTER TABLE ci_reconciler ADD COLUMN billing_after text NOT NULL DEFAULT '';

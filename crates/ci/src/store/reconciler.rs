@@ -124,43 +124,6 @@ const STALLED_CURSOR: &str =
 const SET_STALLED_CURSOR: &str =
     "UPDATE ci_reconciler SET stalled_after_at = $1, stalled_after_id = $2 WHERE id = 1";
 
-/// Where the last held-job backstop stopped in the tenants with
-/// billing holds.
-const BILLING_CURSOR: &str = "SELECT billing_after FROM ci_reconciler WHERE id = 1";
-
-/// Sets where the held-job backstop stopped in the tenants with billing
-/// holds to `$1`.
-const SET_BILLING_CURSOR: &str = "UPDATE ci_reconciler SET billing_after = $1 WHERE id = 1";
-
-/// Where the last held-job backstop stopped in the tenants with billing
-/// holds; the start when none did.
-///
-/// # Errors
-///
-/// Postgres refused the statement.
-pub async fn billing_cursor(db: &Db) -> Result<String> {
-    #[derive(Deserialize)]
-    struct Row {
-        billing_after: String,
-    }
-    Ok(db
-        .first::<Row>(BILLING_CURSOR, &[])
-        .await?
-        .map(|row| row.billing_after)
-        .unwrap_or_default())
-}
-
-/// Records where this held-job backstop stopped in the tenants with
-/// billing holds.
-///
-/// # Errors
-///
-/// Postgres refused the statement.
-pub async fn set_billing_cursor(db: &Db, after: &str) -> Result<()> {
-    db.run(SET_BILLING_CURSOR, &params![after]).await?;
-    Ok(())
-}
-
 /// Where the last pass stopped in the stalled jobs; the start when none
 /// did.
 ///

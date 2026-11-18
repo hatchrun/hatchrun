@@ -134,23 +134,82 @@ pub struct BillingHolds {
     pub reasons: String,
 }
 
-/// The tenants after `$1` with queued card or spend-cap holds, in
-/// order, at most `$2`, each with its reasons.
-const BILLING_HOLDS: &str = "SELECT tenant_id, string_agg(DISTINCT held, ',' ORDER BY held) \
-       AS reasons FROM ci_jobs \
-     WHERE status = 'queued' AND held IN ('card', 'spend_cap') AND tenant_id > $1 \
-     GROUP BY tenant_id ORDER BY tenant_id LIMIT $2";
+/// The tenants whose card or spend-cap holds something may have freed
+/// since the oldest of them was written, the longest waiting first, at
+/// most `$3`, each with its reasons. `$1` is now and `$2` the start of
+/// the UTC calendar month. Something may have freed them when:
+///
+/// - the tenant has a card (beta, or an active or trialing
+///   subscription) while a job waits for one;
+/// - Polar sent a subscription, or the owner changed the cap, after the
+///   hold;
+/// - a spend-cap hold is older than the start of its window: the
+///   calendar month for a tenant with no subscription, or the current
+///   period rolled forward the way the standing rolls it when the
+///   renewal webhook is late.
+///
+/// A tenant whose holds stand after the check has them marked checked
+/// (see [`BILLING_CHECKED`]), and one whose wake was lost has them
+/// turned into concurrency holds, so either way it leaves the list
+/// until the next such event.
+const BILLING_CANDIDATES: &str = "SELECT h.tenant_id, \
+       string_agg(DISTINCT h.held, ',' ORDER BY h.held) AS reasons \
+     FROM ci_jobs h JOIN tenants t ON t.id = h.tenant_id \
+     WHERE h.status = 'queued' AND h.held IN ('card', 'spend_cap') \
+     GROUP BY h.tenant_id, t.beta \
+     HAVING (bool_or(h.held = 'card') AND (t.beta OR EXISTS (SELECT 1 FROM subscriptions s \
+         WHERE s.tenant_id = h.tenant_id AND s.status IN ('active', 'trialing')))) \
+       OR EXISTS (SELECT 1 FROM subscriptions s \
+         WHERE s.tenant_id = h.tenant_id AND s.updated_at > min(h.updated_at)) \
+       OR EXISTS (SELECT 1 FROM ci_spend_caps c \
+         WHERE c.tenant_id = h.tenant_id AND c.updated_at > min(h.updated_at)) \
+       OR (bool_or(h.held = 'spend_cap') AND ( \
+         (NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.tenant_id = h.tenant_id \
+             AND s.status IN ('active', 'trialing')) \
+           AND $2::bigint > min(h.updated_at)) \
+         OR EXISTS (SELECT 1 FROM (SELECT \
+             (EXTRACT(epoch FROM s.current_period_start::timestamptz) * 1000)::bigint AS start_ms, \
+             CASE WHEN s.current_period_end IS NULL THEN NULL ELSE \
+               (EXTRACT(epoch FROM s.current_period_end::timestamptz) * 1000)::bigint END AS end_ms \
+             FROM subscriptions s WHERE s.tenant_id = h.tenant_id \
+             AND s.status IN ('active', 'trialing')) p \
+           WHERE CASE WHEN p.end_ms IS NOT NULL AND $1::bigint >= p.end_ms \
+             THEN p.start_ms + (($1::bigint - p.start_ms) / GREATEST(p.end_ms - p.start_ms, 1)) \
+               * GREATEST(p.end_ms - p.start_ms, 1) \
+             ELSE p.start_ms END > min(h.updated_at)))) \
+     ORDER BY min(h.updated_at), h.tenant_id LIMIT $3";
 
-/// The tenants after `after` with card or spend-cap holds, at most
-/// `limit`: what the backstop checks for a lost billing wake. The
-/// backstop starts the next pass after the last one, so every tenant
-/// takes its turn however many wait.
+/// Marks the card and spend-cap holds of tenant `$1` checked at `$2`:
+/// the backstop read the standing and the holds stand.
+const BILLING_CHECKED: &str = "UPDATE ci_jobs SET updated_at = $2 \
+     WHERE tenant_id = $1 AND status = 'queued' AND held IN ('card', 'spend_cap')";
+
+/// The tenants whose billing holds an event may have freed without
+/// waking them, at most `limit`: see [`BILLING_CANDIDATES`]. A tenant
+/// with no such event is not read, however long its jobs wait.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn billing_holds(db: &Db, after: &str, limit: u32) -> worker::Result<Vec<BillingHolds>> {
-    db.all(BILLING_HOLDS, &params![after, limit]).await
+pub async fn billing_candidates(
+    db: &Db,
+    now: u64,
+    month_start: u64,
+    limit: u32,
+) -> worker::Result<Vec<BillingHolds>> {
+    db.all(BILLING_CANDIDATES, &params![now, month_start, limit])
+        .await
+}
+
+/// Marks the billing holds of `tenant` checked at `now`, so it leaves
+/// [`billing_candidates`] until the next event.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn billing_checked(db: &Db, tenant: &str, now: u64) -> worker::Result<()> {
+    db.run(BILLING_CHECKED, &params![tenant, now]).await?;
+    Ok(())
 }
 
 /// Marks up to `$4` unwoken held jobs of tenant `$1` (every tenant when

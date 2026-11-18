@@ -996,23 +996,11 @@ pub fn paid_wakes(woken: &[Woken], budget: &Budget) -> Vec<Woken> {
         .collect()
 }
 
-/// The tenants with billing holds one page of the backstop reads.
-pub const BILLING_TENANTS: u32 = 100;
-/// The most tenants with billing holds one backstop pass checks: a lost
-/// billing wake resolves at the next pass while fewer tenants than this
-/// wait on a card or a cap.
+/// The most tenants with billing holds one backstop pass checks. Only
+/// tenants an event may have freed are read, and each leaves the list
+/// once read, so the list holds the events of one pass: more than this
+/// only at a calendar month turn, which the next pass finishes.
 pub const BILLING_TENANTS_PER_PASS: u32 = 1_000;
-
-/// Where the next pass starts in the tenants with billing holds: after
-/// the last of `tenants` when the page was full, from the start when it
-/// was not.
-#[must_use]
-pub fn next_billing_cursor(tenants: &[ci_wake::BillingHolds], limit: u32) -> String {
-    match tenants.last() {
-        Some(last) if tenants.len() >= limit as usize => last.tenant_id.clone(),
-        _ => String::new(),
-    }
-}
 
 /// The billing holds a comma-separated list of `held` words names.
 #[must_use]
@@ -1042,50 +1030,38 @@ async fn wake_held(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), 
     // left to decide. A room-based wake cut by the budget is marked
     // already, and the stalled scan sends it within a minute.
     let mut stale = Vec::new();
-    // The tenants come in pages from where the last pass stopped, up to
-    // BILLING_TENANTS_PER_PASS of them.
-    let mut after = store::billing_cursor(db).await.map_err(|e| e.to_string())?;
-    let mut checked = 0;
-    while checked < BILLING_TENANTS_PER_PASS {
-        let tenants = ci_wake::billing_holds(db, &after, BILLING_TENANTS)
+    // Only the tenants an event may have freed: a card that is back, a
+    // Polar delivery or cap change since the hold, or a spend window
+    // that turned. The rest wait on with no read.
+    let tenants =
+        ci_wake::billing_candidates(db, now, billing::month_start(now), BILLING_TENANTS_PER_PASS)
             .await
             .map_err(|e| e.to_string())?;
-        // The last pass stopped at the final tenant: start over now, so
-        // this pass is not spent on an empty page.
-        if checked == 0 && tenants.is_empty() && !after.is_empty() {
-            after.clear();
-            continue;
-        }
-        checked += BILLING_TENANTS;
-        for tenant in &tenants {
-            let holds = billing_reasons(&tenant.reasons);
-            let Some(standing) = store::tenant_standing(
-                db,
-                &tenant.tenant_id,
-                now,
-                hatchrun_workflow::DEFAULT_SPEND_CAP_MICROS,
-            )
-            .await
-            .map_err(|e| e.to_string())?
-            else {
-                continue;
-            };
-            if billing::billing_wake_lost(&standing, &holds) {
+    for tenant in &tenants {
+        let holds = billing_reasons(&tenant.reasons);
+        let standing = store::tenant_standing(
+            db,
+            &tenant.tenant_id,
+            now,
+            hatchrun_workflow::DEFAULT_SPEND_CAP_MICROS,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        match standing {
+            Some(standing) if billing::billing_wake_lost(&standing, &holds) => {
                 stale.extend(
                     ci_wake::standing_improved(db, &tenant.tenant_id, now)
                         .await
                         .map_err(|e| e.to_string())?,
                 );
             }
-        }
-        after = next_billing_cursor(&tenants, BILLING_TENANTS);
-        if after.is_empty() {
-            break;
+            // The holds stand: marked checked, the tenant leaves the
+            // list until its next event.
+            _ => ci_wake::billing_checked(db, &tenant.tenant_id, now)
+                .await
+                .map_err(|e| e.to_string())?,
         }
     }
-    store::set_billing_cursor(db, &after)
-        .await
-        .map_err(|e| e.to_string())?;
     // An approval hold whose environment is gone or has approval off, or
     // whose attempt was decided, has nobody to wait for; the change that
     // freed it may have failed to wake it.
