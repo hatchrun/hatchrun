@@ -560,12 +560,109 @@ fn a_fork_job_waits_for_a_place_under_the_repositorys_fork_cap() {
     // A job that ends makes room, and the held one is the one to wake.
     db.wait(set_job(db.db(), ids[0].1, "completed", Some("success"), 7))
         .unwrap();
-    db.wait(hold(db.db(), ids[2].1, 1, "fork_limit", 100, 8))
+    db.wait(hold(db.db(), ids[2].1, 1, "fork_limit", 8))
         .unwrap();
-    let woken = db.wait(held_fork_jobs(db.db(), ids[1].1)).unwrap();
+    let woken = db.wait(held_fork_jobs(db.db(), ids[1].1, 9)).unwrap();
     assert_eq!(woken.len(), 1);
     assert_eq!(woken[0].job_id, ids[2].1);
     assert!(matches!(claim(ids[2].1), Claim::Claimed(_)));
+}
+
+#[test]
+fn the_lost_wake_query_wakes_room_under_the_repositorys_fork_cap() {
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    let run = fork_run(&db, "a", 1, "s1", "mallory", GateStatus::NotGated, 1);
+    let jobs: Vec<NewJob> = ["one", "two", "three"].map(new_job).into();
+    let ids = db.wait(insert_jobs(db.db(), run.id, &jobs, 1)).unwrap();
+    for (_, id) in &ids {
+        db.wait(set_job(db.db(), *id, "queued", None, 2)).unwrap();
+    }
+    let claim = |id| {
+        db.wait(claim_launch(db.db(), id, "t1", 5, true, Some(2), 3))
+            .unwrap()
+    };
+    assert!(matches!(claim(ids[0].1), Claim::Claimed(_)));
+    assert!(matches!(claim(ids[1].1), Claim::Claimed(_)));
+    assert_eq!(claim(ids[2].1), Claim::ForkLimit);
+    db.wait(hold(db.db(), ids[2].1, 1, "fork_limit", 4))
+        .unwrap();
+    // Two of two places run: nothing is free.
+    let none = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40))
+        .unwrap();
+    assert_eq!(none, Vec::new());
+    // A job ends: the held one is the one to wake.
+    db.wait(set_job(
+        db.db(),
+        ids[0].1,
+        "completed",
+        Some("success"),
+        101,
+    ))
+    .unwrap();
+    let woken = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 102, 40))
+        .unwrap();
+    assert_eq!(
+        woken.iter().map(|w| w.job_id).collect::<Vec<_>>(),
+        [ids[2].1]
+    );
+    // Marked already: a second pass wakes nothing.
+    let none = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 103, 40))
+        .unwrap();
+    assert_eq!(none, Vec::new());
+}
+
+#[test]
+fn raising_the_fork_policy_wakes_the_waiting_fork_jobs() {
+    let db = setup();
+    let run = fork_run(&db, "a", 1, "s1", "mallory", GateStatus::NotGated, 1);
+    let jobs: Vec<NewJob> = ["one", "two", "three"].map(new_job).into();
+    let ids = db.wait(insert_jobs(db.db(), run.id, &jobs, 1)).unwrap();
+    for (_, id) in &ids {
+        db.wait(set_job(db.db(), *id, "queued", None, 2)).unwrap();
+        db.wait(hold(db.db(), *id, 1, "fork_limit", 3)).unwrap();
+    }
+    let policy = RepoPolicy {
+        fork_max_running: 2,
+        ..RepoPolicy::default_for(false)
+    };
+    let woken = db
+        .wait(held_fork_repo_jobs(
+            db.db(),
+            7,
+            policy.fork_max_running,
+            100,
+        ))
+        .unwrap();
+    assert_eq!(woken.len(), 2);
+    assert_eq!(
+        woken.iter().map(|w| w.job_id).collect::<Vec<_>>(),
+        [ids[0].1, ids[1].1]
+    );
+    let rest = db
+        .wait(held_fork_repo_jobs(
+            db.db(),
+            7,
+            policy.fork_max_running,
+            101,
+        ))
+        .unwrap();
+    assert_eq!(
+        rest.iter().map(|w| w.job_id).collect::<Vec<_>>(),
+        [ids[2].1]
+    );
+    let none = db
+        .wait(held_fork_repo_jobs(
+            db.db(),
+            7,
+            policy.fork_max_running,
+            102,
+        ))
+        .unwrap();
+    assert_eq!(none, Vec::new());
 }
 
 #[test]
@@ -586,10 +683,9 @@ fn jobs_held_for_a_runs_approval_are_found_by_run() {
         .unwrap();
     for (_, id) in ids.iter().chain(&theirs) {
         db.wait(set_job(db.db(), *id, "queued", None, 2)).unwrap();
-        db.wait(hold(db.db(), *id, 1, "fork_approval", 99, 3))
-            .unwrap();
+        db.wait(hold(db.db(), *id, 1, "fork_approval", 3)).unwrap();
     }
-    let woken = db.wait(fork_approval_held(db.db(), run.id)).unwrap();
+    let woken = db.wait(fork_approval_held(db.db(), run.id, 4)).unwrap();
     let got: Vec<u64> = woken.iter().map(|w| w.job_id).collect();
     assert_eq!(got, [ids[0].1, ids[1].1]);
 }

@@ -1096,6 +1096,7 @@ impl Cx<'_> {
                 &repo,
                 &approved,
                 &approval.sender,
+                self.now,
             )
             .await;
         }
@@ -2424,6 +2425,7 @@ impl Cx<'_> {
                 &repo,
                 &approved,
                 &comment.actor,
+                self.now,
             )
             .await;
         }

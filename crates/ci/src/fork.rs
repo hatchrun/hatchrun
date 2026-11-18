@@ -609,6 +609,7 @@ async fn end_gone_run(env: &Env, db: &Db, run: &RunRow, now: u64) -> Result<(), 
 /// After `runs` were approved by `by`: wakes the jobs held for the
 /// approval and marks the card. A failed wake is left to the
 /// reconciler.
+#[allow(clippy::too_many_arguments)] // one per connection the wake needs
 pub async fn after_approval(
     env: &Env,
     db: &Db,
@@ -617,9 +618,10 @@ pub async fn after_approval(
     repo: &RepoRow,
     runs: &[RunRow],
     by: &str,
+    now: u64,
 ) {
     for run in runs {
-        match store::fork_approval_held(db, run.id).await {
+        match store::fork_approval_held(db, run.id, now).await {
             Ok(woken) => {
                 if let Err(err) = launches::send_wakes(env, &woken).await {
                     console_error!("run {}: wake after approval: {err}", run.id);
@@ -1174,7 +1176,7 @@ async fn admit_group(
         );
     }
     if let Some(by) = by {
-        after_approval(env, db, settings, tokens, repo, &admitted, by).await;
+        after_approval(env, db, settings, tokens, repo, &admitted, by, now).await;
         return Ok(count(admitted.len()));
     }
     // The file list is the same for the whole group: read it once.

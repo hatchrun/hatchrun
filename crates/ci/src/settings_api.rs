@@ -496,7 +496,8 @@ async fn cap(cx: &Cx<'_>, org: &str, req: &mut Request, max_body: usize) -> Resu
     // The jobs waiting on the old cap re-check it now, the rest drain in
     // order as jobs end. A failure here leaves them to the reconciler's
     // backstop: the cap is saved.
-    match ci_wake::standing_improved(cx.db, &tenant.id).await {
+    let now = now_ms();
+    match ci_wake::standing_improved(cx.db, &tenant.id, now).await {
         Ok(woken) => {
             if let Err(err) = launches::send_wakes(cx.env, &woken).await {
                 console_error!("tenant {}: wake held jobs: {err}", tenant.id);
@@ -959,6 +960,18 @@ async fn put_fork_policy(
         &repo.full_name,
     );
     store::put_repo_policy(cx.db, repo.id, &policy, now_ms(), &audit).await?;
+    // A raised cap frees fork jobs held for the old one, up to the new
+    // cap. A failure leaves them to the reconciler's backstop: the
+    // policy is saved.
+    let now = now_ms();
+    match store::held_fork_repo_jobs(cx.db, repo.id, policy.fork_max_running, now).await {
+        Ok(woken) => {
+            if let Err(err) = launches::send_wakes(cx.env, &woken).await {
+                console_error!("repo {}: wake jobs held for the fork cap: {err}", repo.id);
+            }
+        }
+        Err(err) => console_error!("repo {}: find jobs held for the fork cap: {err}", repo.id),
+    }
     reply(200, &serde_json::to_value(policy)?).map(Ok)
 }
 

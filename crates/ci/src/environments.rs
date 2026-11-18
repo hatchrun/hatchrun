@@ -362,6 +362,7 @@ mod tests {
         let mut job = JobRow {
             id: 1,
             run_id: 12,
+            tenant_id: "t1".into(),
             plan_id: "deploy".into(),
             name: "deploy".into(),
             status: "queued".into(),

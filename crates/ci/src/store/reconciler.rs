@@ -86,7 +86,8 @@ pub async fn stalled_jobs(
             ),
             after.updated_at,
             after.id,
-            limit
+            limit,
+            now.saturating_sub(crate::reconcile::QUEUED_QUIET_MS),
         ],
     )
     .await
@@ -159,13 +160,15 @@ const SET_LAST_MINUTE: &str = "UPDATE ci_reconciler SET last_minute = $1 WHERE i
 /// Jobs a reconciler pass looks at, the least recently changed first,
 /// after `($6, $7)` in the order of `(updated_at, id)`, at most `$8`:
 /// queued ones due for a launch (`$1` now) or quiet since `$2` (a job
-/// held for capacity only when due), launching ones quiet since `$3`,
+/// held for capacity only when due, a woken held job only once its mark
+/// is quiet since `$9`), launching ones quiet since `$3`,
 /// launched ones quiet since `$5`, and running ones past their timeout
 /// and every grace since `$4`. [`crate::reconcile::stalled`] makes the
 /// same decisions over the rows.
 const STALLED_JOBS: &str = "SELECT {columns} FROM ci_jobs WHERE \
      ((status = 'queued' AND held IS NULL AND (next_launch_at <= $1 OR updated_at < $2)) \
      OR (status = 'queued' AND held = 'capacity' AND next_launch_at <= $1) \
+     OR (status = 'queued' AND held IS NOT NULL AND held <> 'capacity' AND next_launch_at <= $9) \
      OR (status = 'launching' AND updated_at < $3) \
      OR (status = 'launched' AND updated_at < $5) \
      OR (status = 'running' AND COALESCE(started_at, updated_at) + timeout_minutes::bigint * 60000 < $4)) \

@@ -709,17 +709,73 @@ fn the_oldest_held_job_wakes_first() {
     let (_, card) = run_with_job_named(&db, "card", "queued");
     set_held(&db, card, "card", 1);
     let one = db
-        .wait(ci_wake::held(db.db(), "t1", "concurrency", 1))
+        .wait(ci_wake::held(db.db(), "t1", "concurrency", 1, 200))
         .unwrap();
     assert_eq!(woken_ids(one), [ids[0]]);
-    let all = db
-        .wait(ci_wake::held(db.db(), "t1", "concurrency", 5))
+    // The first wake marked its job, so the next wake picks the rest.
+    let rest = db
+        .wait(ci_wake::held(db.db(), "t1", "concurrency", 5, 201))
         .unwrap();
-    assert_eq!(woken_ids(all), ids);
+    assert_eq!(woken_ids(rest), ids[1..]);
     let other = db
-        .wait(ci_wake::held(db.db(), "t2", "concurrency", 5))
+        .wait(ci_wake::held(db.db(), "t2", "concurrency", 5, 202))
         .unwrap();
     assert_eq!(woken_ids(other), Vec::<u64>::new());
+}
+
+#[test]
+fn two_wakes_in_a_row_pick_different_jobs() {
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    let (_, first) = run_with_job_named(&db, "a", "queued");
+    set_held(&db, first, "concurrency", 1);
+    let (_, second) = run_with_job_named(&db, "b", "queued");
+    set_held(&db, second, "concurrency", 1);
+    let one = db
+        .wait(ci_wake::held(db.db(), "t1", "concurrency", 5, 100))
+        .unwrap();
+    assert_eq!(woken_ids(one), [first, second]);
+    let none = db
+        .wait(ci_wake::held(db.db(), "t1", "concurrency", 5, 101))
+        .unwrap();
+    assert_eq!(woken_ids(none), Vec::<u64>::new());
+    let marked: Option<u64> = db
+        .column(
+            "SELECT next_launch_at AS n FROM ci_jobs WHERE id = $1",
+            &params![first],
+            "n",
+        )
+        .unwrap();
+    assert_eq!(marked, Some(100));
+}
+
+#[test]
+fn a_claim_is_not_blocked_by_an_older_woken_concurrency_hold() {
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    for n in 0..4 {
+        run_with_job_named(&db, &format!("r{n}"), "running");
+    }
+    let (_, older) = run_with_job_named(&db, "older", "queued");
+    let (_, newer) = run_with_job_named(&db, "newer", "queued");
+    set_held(&db, older, "concurrency", 5);
+    // One place is free, and the older job waits for it.
+    assert_eq!(
+        db.wait(claim_launch(db.db(), newer, "t1", 5, true, None, 10))
+            .unwrap(),
+        Claim::Busy
+    );
+    // A wake picked the older job: the line is gone, and the newer one
+    // may take the free place.
+    let woken = db
+        .wait(ci_wake::held(db.db(), "t1", "concurrency", 1, 11))
+        .unwrap();
+    assert_eq!(woken_ids(woken), [older]);
+    assert!(matches!(
+        db.wait(claim_launch(db.db(), newer, "t1", 5, true, None, 12))
+            .unwrap(),
+        Claim::Claimed(_)
+    ));
 }
 
 #[test]
@@ -737,7 +793,7 @@ fn a_returned_card_turns_the_holds_into_concurrency_holds_and_wakes_five() {
     set_held(&db, capped, "spend_cap", 5);
     let (_, other) = run_with_job_named(&db, "plain", "queued");
     subscribe(&db, "s1", "active");
-    let woken = db.wait(ci_wake::card_returned(db.db(), "t1")).unwrap();
+    let woken = db.wait(ci_wake::card_returned(db.db(), "t1", 100)).unwrap();
     assert_eq!(woken_ids(woken), card[..5]);
     for id in card.iter().chain([&capped]) {
         assert_eq!(held_of(&db, *id).as_deref(), Some("concurrency"));
@@ -745,60 +801,194 @@ fn a_returned_card_turns_the_holds_into_concurrency_holds_and_wakes_five() {
     assert_eq!(held_of(&db, other), None, "an unheld job stays unheld");
     // A finishing job wakes the next one in order.
     let next = db
-        .wait(ci_wake::held(db.db(), "t1", "concurrency", 1))
+        .wait(ci_wake::held(db.db(), "t1", "concurrency", 1, 101))
         .unwrap();
-    assert_eq!(woken_ids(next), card[..1]);
+    assert_eq!(woken_ids(next), card[5..6]);
+}
+
+/// 2026-10-01 and 2026-11-01, UTC, in milliseconds: the period the
+/// test subscription covers, and the calendar months around it.
+const OCT_1: u64 = 1_790_812_800_000;
+const NOV_1: u64 = 1_793_491_200_000;
+/// A hold written in the middle of October.
+const MID_OCT: u64 = OCT_1 + 14 * 86_400_000;
+
+fn billing_candidates(db: &TestDb, now: u64, month_start: u64) -> Vec<(String, String)> {
+    db.wait(hatchrun_cloud::ci_wake::billing_candidates(
+        db.db(),
+        now,
+        month_start,
+        10,
+    ))
+    .unwrap()
+    .into_iter()
+    .map(|row| (row.tenant_id, row.reasons))
+    .collect()
 }
 
 #[test]
-fn a_new_month_turns_old_spend_cap_holds_into_concurrency_holds() {
-    use hatchrun_cloud::ci_wake;
+fn a_billing_hold_nothing_happened_to_is_not_read() {
     let db = setup();
-    let (_, old) = run_with_job_named(&db, "old", "queued");
-    set_held(&db, old, "spend_cap", 100);
-    let (_, recent) = run_with_job_named(&db, "recent", "queued");
-    set_held(&db, recent, "spend_cap", 10_000);
     let (_, card) = run_with_job_named(&db, "card", "queued");
-    set_held(&db, card, "card", 100);
-    db.wait(ci_wake::release_spend_caps(db.db(), 5_000))
-        .unwrap();
-    assert_eq!(held_of(&db, old).as_deref(), Some("concurrency"));
-    assert_eq!(held_of(&db, recent).as_deref(), Some("spend_cap"));
-    assert_eq!(held_of(&db, card).as_deref(), Some("card"));
+    set_held(&db, card, "card", MID_OCT);
+    let (_, capped) = run_with_job_named(&db, "capped", "queued");
+    set_held(&db, capped, "spend_cap", MID_OCT);
+    let (_, busy) = run_with_job_named(&db, "busy", "queued");
+    set_held(&db, busy, "concurrency", 0);
+    // Still October, no card, no cap and no subscription: nothing to read.
+    assert_eq!(billing_candidates(&db, MID_OCT + 1, OCT_1), []);
 }
 
 #[test]
-fn the_backstop_picks_quiet_held_jobs_per_tenant() {
+fn a_card_that_is_back_makes_its_tenant_a_candidate() {
+    let db = setup();
+    let (_, card) = run_with_job_named(&db, "card", "queued");
+    set_held(&db, card, "card", MID_OCT);
+    subscribe(&db, "s1", "canceled");
+    assert_eq!(billing_candidates(&db, MID_OCT + 1, OCT_1), []);
+    // The webhook that brought the card back failed to wake the job.
+    db.run(
+        "UPDATE subscriptions SET status = 'active' WHERE id = 's1'",
+        &[],
+    );
+    assert_eq!(
+        billing_candidates(&db, MID_OCT + 1, OCT_1),
+        [("t1".to_owned(), "card".to_owned())]
+    );
+    // A beta tenant needs no subscription.
+    db.run(
+        "UPDATE subscriptions SET status = 'canceled' WHERE id = 's1'",
+        &[],
+    );
+    db.run("UPDATE tenants SET beta = true WHERE id = 't1'", &[]);
+    assert_eq!(billing_candidates(&db, MID_OCT + 1, OCT_1).len(), 1);
+}
+
+#[test]
+fn a_raised_cap_after_the_hold_makes_its_tenant_a_candidate_until_checked() {
+    let db = setup();
+    let (_, capped) = run_with_job_named(&db, "capped", "queued");
+    set_held(&db, capped, "spend_cap", MID_OCT);
+    db.wait(crate::store::set_spend_cap(db.db(), "t1", 1, MID_OCT - 1))
+        .unwrap();
+    assert_eq!(billing_candidates(&db, MID_OCT + 2, OCT_1), []);
+    // A change in the same millisecond as the hold counts.
+    db.wait(crate::store::set_spend_cap(db.db(), "t1", 2, MID_OCT))
+        .unwrap();
+    assert_eq!(
+        billing_candidates(&db, MID_OCT + 2, OCT_1),
+        [("t1".to_owned(), "spend_cap".to_owned())]
+    );
+    // Read and still over the cap: it leaves the list.
+    db.wait(hatchrun_cloud::ci_wake::billing_checked(
+        db.db(),
+        "t1",
+        MID_OCT + 2,
+    ))
+    .unwrap();
+    assert_eq!(billing_candidates(&db, MID_OCT + 3, OCT_1), []);
+    assert_eq!(held_of(&db, capped).as_deref(), Some("spend_cap"));
+}
+
+#[test]
+fn a_polar_delivery_after_the_hold_makes_its_tenant_a_candidate() {
+    let db = setup();
+    let (_, capped) = run_with_job_named(&db, "capped", "queued");
+    set_held(&db, capped, "spend_cap", MID_OCT);
+    subscribe(&db, "s1", "active");
+    assert_eq!(billing_candidates(&db, MID_OCT + 2, OCT_1), []);
+    db.run(
+        "UPDATE subscriptions SET updated_at = $1 WHERE id = 's1'",
+        &params![MID_OCT],
+    );
+    assert_eq!(billing_candidates(&db, MID_OCT + 2, OCT_1).len(), 1);
+}
+
+#[test]
+fn a_spend_window_that_turned_makes_its_tenant_a_candidate() {
+    let db = setup();
+    let (_, capped) = run_with_job_named(&db, "capped", "queued");
+    set_held(&db, capped, "spend_cap", MID_OCT);
+    // No subscription: the calendar month turned.
+    assert_eq!(billing_candidates(&db, NOV_1 + 1, NOV_1).len(), 1);
+    // A subscription whose period ended with no renewal webhook rolls
+    // forward to November, past the hold.
+    subscribe(&db, "s1", "active");
+    assert_eq!(billing_candidates(&db, MID_OCT + 1, OCT_1), []);
+    assert_eq!(billing_candidates(&db, NOV_1 + 1, NOV_1).len(), 1);
+    db.wait(hatchrun_cloud::ci_wake::billing_checked(
+        db.db(),
+        "t1",
+        NOV_1 + 1,
+    ))
+    .unwrap();
+    assert_eq!(billing_candidates(&db, NOV_1 + 2, NOV_1), []);
+}
+
+#[test]
+fn the_lost_wake_query_wakes_room_in_the_tenant() {
     use hatchrun_cloud::ci_wake;
     let db = setup();
-    let mut ids = Vec::new();
-    for n in 0..8 {
-        let (_, id) = run_with_job_named(&db, &format!("h{n}"), "queued");
-        set_held(&db, id, if n % 2 == 0 { "card" } else { "spend_cap" }, 100);
-        ids.push(id);
+    for n in 0..4 {
+        run_with_job_named(&db, &format!("r{n}"), "running");
     }
-    let (_, recent) = run_with_job_named(&db, "recent", "queued");
-    set_held(&db, recent, "card", 10_000);
-    let (_, plain) = run_with_job_named(&db, "plain", "queued");
-    let _ = plain;
-    let picked = db.wait(ci_wake::stale(db.db(), 5_000, 5, 40)).unwrap();
-    assert_eq!(woken_ids(picked), ids[..5], "5 per tenant, oldest first");
-    let capped = db.wait(ci_wake::stale(db.db(), 5_000, 5, 2)).unwrap();
-    assert_eq!(woken_ids(capped), ids[..2], "at most the limit");
-    let none = db.wait(ci_wake::stale(db.db(), 50, 5, 40)).unwrap();
-    assert!(none.is_empty(), "nothing is quiet that long");
+    let (_, first) = run_with_job_named(&db, "first", "queued");
+    set_held(&db, first, "concurrency", 1);
+    let (_, second) = run_with_job_named(&db, "second", "queued");
+    set_held(&db, second, "concurrency", 1);
+    // One of five places is free.
+    let woken = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40))
+        .unwrap();
+    assert_eq!(woken_ids(woken), [first]);
+    let marked: Option<u64> = db
+        .column(
+            "SELECT next_launch_at AS n FROM ci_jobs WHERE id = $1",
+            &params![first],
+            "n",
+        )
+        .unwrap();
+    assert_eq!(marked, Some(100));
+    // Nothing is free now that the first wake marked its job.
+    let none = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 101, 40))
+        .unwrap();
+    assert_eq!(woken_ids(none), Vec::<u64>::new());
+    // Another tenant's room does not wake this tenant's jobs.
+    let other = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t2"), 5, 102, 40))
+        .unwrap();
+    assert_eq!(woken_ids(other), Vec::<u64>::new());
 }
 
 #[test]
-fn the_backstop_skips_approval_holds() {
+fn the_lost_wake_query_wakes_nothing_when_the_tenant_is_full() {
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    for n in 0..5 {
+        run_with_job_named(&db, &format!("r{n}"), "running");
+    }
+    let (_, held) = run_with_job_named(&db, "held", "queued");
+    set_held(&db, held, "concurrency", 1);
+    let none = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40))
+        .unwrap();
+    assert_eq!(woken_ids(none), Vec::<u64>::new());
+}
+#[test]
+fn the_lost_wake_query_skips_holds_no_event_frees() {
     use hatchrun_cloud::ci_wake;
     let db = setup();
     let (_, approval) = run_with_job_named(&db, "a", "queued");
     set_held(&db, approval, "approval", 100);
     let (_, card) = run_with_job_named(&db, "c", "queued");
     set_held(&db, card, "card", 100);
-    let picked = db.wait(ci_wake::stale(db.db(), 5_000, 5, 40)).unwrap();
-    assert_eq!(woken_ids(picked), [card]);
+    let (_, capped) = run_with_job_named(&db, "s", "queued");
+    set_held(&db, capped, "spend_cap", 100);
+    let picked = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 200, 40))
+        .unwrap();
+    assert_eq!(woken_ids(picked), Vec::<u64>::new());
 }
 
 #[test]
@@ -872,21 +1062,18 @@ fn an_approval_hold_does_not_land_on_a_decided_attempt() {
     let attempt: u32 = 1;
     decide(&db, job, attempt);
     assert!(
-        !db.wait(hold(db.db(), job, attempt, "approval", 9_000, 2_000))
+        !db.wait(hold(db.db(), job, attempt, "approval", 2_000))
             .unwrap()
     );
     assert_eq!(held_of(&db, job), None);
     // A billing hold still lands on an approved attempt.
-    assert!(
-        db.wait(hold(db.db(), job, attempt, "card", 9_000, 2_000))
-            .unwrap()
-    );
+    assert!(db.wait(hold(db.db(), job, attempt, "card", 2_000)).unwrap());
     assert_eq!(held_of(&db, job).as_deref(), Some("card"));
     // A decision of an earlier attempt does not count.
     let (_, other) = run_with_job_named(&db, "rerun", "queued");
     decide(&db, other, 0);
     assert!(
-        db.wait(hold(db.db(), other, attempt, "approval", 9_000, 2_000))
+        db.wait(hold(db.db(), other, attempt, "approval", 2_000))
             .unwrap()
     );
 }
@@ -977,11 +1164,11 @@ fn the_backstop_frees_approval_holds_without_a_rule() {
 }
 
 #[test]
-fn held_jobs_are_not_stalled() {
+fn unwoken_held_jobs_are_not_stalled() {
     let db = setup();
     let (_, held) = run_with_job_named(&db, "held", "queued");
     db.run(
-        "UPDATE ci_jobs SET held = 'card', next_launch_at = 1, updated_at = 1 WHERE id = $1",
+        "UPDATE ci_jobs SET held = 'card', next_launch_at = NULL, updated_at = 1 WHERE id = $1",
         &params![held],
     );
     let (_, plain) = run_with_job_named(&db, "plain", "queued");
@@ -1001,10 +1188,45 @@ fn held_jobs_are_not_stalled() {
 }
 
 #[test]
+fn a_woken_held_job_is_stalled_once_its_mark_is_quiet() {
+    use crate::reconcile::QUEUED_QUIET_MS;
+    let db = setup();
+    let now = 10_000_000;
+    let (_, woken) = run_with_job_named(&db, "woken", "queued");
+    db.run(
+        "UPDATE ci_jobs SET held = 'concurrency', next_launch_at = $2, updated_at = $2 \
+         WHERE id = $1",
+        &params![woken, now - QUEUED_QUIET_MS - 1],
+    );
+    let (_, fresh) = run_with_job_named(&db, "fresh", "queued");
+    db.run(
+        "UPDATE ci_jobs SET held = 'concurrency', next_launch_at = $2, updated_at = $2 \
+         WHERE id = $1",
+        &params![fresh, now],
+    );
+    let (_, capacity) = run_with_job_named(&db, "capacity", "queued");
+    db.run(
+        "UPDATE ci_jobs SET held = 'capacity', next_launch_at = $2, updated_at = $2 \
+         WHERE id = $1",
+        &params![capacity, now + 1],
+    );
+    let (_, due) = run_with_job_named(&db, "due", "queued");
+    db.run(
+        "UPDATE ci_jobs SET held = 'capacity', next_launch_at = $2, updated_at = $2 \
+         WHERE id = $1",
+        &params![due, now - 1],
+    );
+    let rows = db
+        .wait(stalled_jobs(db.db(), now, StalledCursor::default(), 50))
+        .unwrap();
+    assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [woken, due]);
+}
+
+#[test]
 fn claim_clears_the_hold() {
     let db = setup();
     let (_, job_id) = run_with_job(&db, "queued");
-    assert!(db.wait(hold(db.db(), job_id, 1, "card", 50, 5)).unwrap());
+    assert!(db.wait(hold(db.db(), job_id, 1, "card", 5)).unwrap());
     assert_eq!(held_of(&db, job_id).as_deref(), Some("card"));
     claim(&db, job_id, 10);
     assert_eq!(held_of(&db, job_id), None);
@@ -1014,32 +1236,40 @@ fn claim_clears_the_hold() {
 fn hold_reports_a_change_once() {
     let db = setup();
     let (_, job_id) = run_with_job(&db, "queued");
-    assert!(db.wait(hold(db.db(), job_id, 1, "card", 500, 5)).unwrap());
-    assert!(!db.wait(hold(db.db(), job_id, 1, "card", 530, 6)).unwrap());
+    assert!(db.wait(hold(db.db(), job_id, 1, "card", 5)).unwrap());
+    assert!(!db.wait(hold(db.db(), job_id, 1, "card", 6)).unwrap());
     let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
-    assert_eq!((row.next_launch_at, row.updated_at), (Some(530), 6));
-    assert!(
-        db.wait(hold(db.db(), job_id, 1, "concurrency", 560, 7))
-            .unwrap()
-    );
+    assert_eq!((row.next_launch_at, row.updated_at), (None, 6));
+    assert!(db.wait(hold(db.db(), job_id, 1, "concurrency", 7)).unwrap());
     assert_eq!(held_of(&db, job_id).as_deref(), Some("concurrency"));
     let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
-    assert_eq!(row.next_launch_at, Some(560));
+    assert_eq!(row.next_launch_at, None);
+    assert_eq!(row.updated_at, 7);
+}
+
+#[test]
+fn hold_clears_any_wake_mark() {
+    let db = setup();
+    let (_, job_id) = run_with_job(&db, "queued");
+    db.run(
+        "UPDATE ci_jobs SET next_launch_at = 99 WHERE id = $1",
+        &params![job_id],
+    );
+    assert!(db.wait(hold(db.db(), job_id, 1, "card", 5)).unwrap());
+    let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    assert_eq!(row.next_launch_at, None);
 }
 
 #[test]
 fn hold_leaves_another_attempt_alone() {
     let db = setup();
     let (_, job_id) = run_with_job(&db, "queued");
-    assert!(!db.wait(hold(db.db(), job_id, 2, "card", 500, 5)).unwrap());
+    assert!(!db.wait(hold(db.db(), job_id, 2, "card", 5)).unwrap());
     assert_eq!(held_of(&db, job_id), None);
     let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
     assert_eq!((row.next_launch_at, row.updated_at), (None, 1_001));
     let (_, launching) = run_with_job_named(&db, "d2", "launching");
-    assert!(
-        !db.wait(hold(db.db(), launching, 1, "card", 500, 5))
-            .unwrap()
-    );
+    assert!(!db.wait(hold(db.db(), launching, 1, "card", 5)).unwrap());
     assert_eq!(held_of(&db, launching), None);
 }
 
@@ -1047,8 +1277,7 @@ fn hold_leaves_another_attempt_alone() {
 fn a_rerun_clears_the_hold() {
     let db = setup();
     let (_, job_id) = run_with_job(&db, "queued");
-    db.wait(hold(db.db(), job_id, 1, "spend_cap", 50, 5))
-        .unwrap();
+    db.wait(hold(db.db(), job_id, 1, "spend_cap", 5)).unwrap();
     db.wait(reset_job(db.db(), job_id, 2, 40)).unwrap();
     assert_eq!(held_of(&db, job_id), None);
 }
@@ -1181,7 +1410,7 @@ fn a_new_job_does_not_jump_an_older_one_held_for_max_parallel() {
         Claim::Claimed(_)
     ));
     assert!(
-        db.wait(hold(db.db(), ids[1], 1, "max_parallel", 40, 11))
+        db.wait(hold(db.db(), ids[1], 1, "max_parallel", 11))
             .unwrap()
     );
     db.wait(set_job(db.db(), ids[0], "completed", Some("success"), 12))
@@ -1221,19 +1450,18 @@ fn an_ending_job_wakes_the_oldest_held_job_of_its_matrix() {
         Claim::Claimed(_)
     ));
     for id in [ids[2], ids[1], other[1]] {
-        db.wait(hold(db.db(), id, 1, "max_parallel", 40, 11))
-            .unwrap();
+        db.wait(hold(db.db(), id, 1, "max_parallel", 11)).unwrap();
     }
-    db.wait(hold(db.db(), ids[3], 1, "concurrency", 40, 11))
+    db.wait(hold(db.db(), ids[3], 1, "concurrency", 11))
         .unwrap();
-    let woken = db.wait(held_siblings(db.db(), ids[0])).unwrap();
+    let woken = db.wait(held_siblings(db.db(), ids[0], 12)).unwrap();
     assert_eq!(
         woken_ids(woken),
         [ids[1]],
         "one place, the oldest of this matrix"
     );
     assert_eq!(
-        woken_ids(db.wait(held_siblings(db.db(), other[0])).unwrap()),
+        woken_ids(db.wait(held_siblings(db.db(), other[0], 12)).unwrap()),
         [other[1]]
     );
 }
@@ -1243,9 +1471,208 @@ fn a_job_outside_a_matrix_wakes_nothing() {
     let db = setup();
     let (_, id) = run_with_job_named(&db, "plain", "queued");
     assert_eq!(
-        woken_ids(db.wait(held_siblings(db.db(), id)).unwrap()),
+        woken_ids(db.wait(held_siblings(db.db(), id, 12)).unwrap()),
         Vec::<u64>::new()
     );
+}
+
+#[test]
+fn the_lost_wake_query_wakes_room_in_a_matrix() {
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    let ids = matrix_run(&db, "room", 3, Some(2));
+    assert!(matches!(
+        claim_group(&db, ids[0], true, 10),
+        Claim::Claimed(_)
+    ));
+    db.wait(hold(db.db(), ids[1], 1, "max_parallel", 11))
+        .unwrap();
+    db.wait(hold(db.db(), ids[2], 1, "max_parallel", 12))
+        .unwrap();
+    // One of two places is free.
+    let woken = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40))
+        .unwrap();
+    assert_eq!(woken_ids(woken), [ids[1]]);
+    // The mark took the room: the next job waits for a job to end.
+    let none = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 101, 40))
+        .unwrap();
+    assert_eq!(woken_ids(none), Vec::<u64>::new());
+}
+
+#[test]
+fn the_lost_wake_query_wakes_nothing_for_a_full_matrix() {
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    let ids = matrix_run(&db, "full", 2, Some(1));
+    assert!(matches!(
+        claim_group(&db, ids[0], true, 10),
+        Claim::Claimed(_)
+    ));
+    db.wait(hold(db.db(), ids[1], 1, "max_parallel", 11))
+        .unwrap();
+    let none = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40))
+        .unwrap();
+    assert_eq!(woken_ids(none), Vec::<u64>::new());
+}
+
+#[test]
+fn the_lost_wake_query_wakes_a_group_whose_holder_left_quietly() {
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    let (run_a, _) = run_with_job_named(&db, "holder", "queued");
+    let (run_b, job_b) = run_with_job_named(&db, "waiter", "queued");
+    for run in [run_a.id, run_b.id] {
+        db.wait(register(
+            db.db(),
+            &NewSlot {
+                repo_id: 7,
+                run_id: run,
+                job_id: None,
+                attempt: 1,
+                group: Ok(("g".to_owned(), false)),
+                now: 10,
+            },
+        ))
+        .unwrap();
+    }
+    let slot_of = |run| {
+        db.wait(slots(db.db(), run, 0))
+            .unwrap()
+            .into_iter()
+            .find(|s| s.job_id.is_none())
+            .unwrap()
+    };
+    assert_eq!(
+        db.wait(enter(db.db(), &slot_of(run_a.id)))
+            .unwrap()
+            .unwrap()
+            .state,
+        "running"
+    );
+    assert_eq!(
+        db.wait(enter(db.db(), &slot_of(run_b.id)))
+            .unwrap()
+            .unwrap()
+            .state,
+        "pending"
+    );
+    db.wait(hold(db.db(), job_b, 1, "group", 11)).unwrap();
+    // The holder left and the waiter was promoted, but the wake was
+    // lost: its slot runs while the job still waits.
+    assert_eq!(
+        db.wait(leave(db.db(), run_a.id, None)).unwrap(),
+        Some((7, "g".to_owned()))
+    );
+    assert_eq!(
+        db.wait(slots(db.db(), run_b.id, 0)).unwrap()[0].state,
+        "running"
+    );
+    let woken = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40))
+        .unwrap();
+    assert_eq!(woken_ids(woken), [job_b]);
+    // Marked already: a second pass wakes nothing.
+    let none = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 101, 40))
+        .unwrap();
+    assert_eq!(woken_ids(none), Vec::<u64>::new());
+}
+
+#[test]
+fn a_group_job_with_a_row_that_still_waits_is_not_woken() {
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    let (run, job) = run_with_job_named(&db, "both", "queued");
+    db.wait(hold(db.db(), job, 1, "group", 11)).unwrap();
+    // The run's own group runs, but the job's group still waits behind
+    // another holder: the gate would hold the job again.
+    let slot = |job_id: Option<u64>, attempt: u32, key: &str, state: &str| {
+        db.run(
+            "INSERT INTO ci_concurrency (repo_id, run_id, job_id, attempt, group_key, \
+             group_name, state, created_at) VALUES (7, $1, $2, $3, $4, $4, $5, 10)",
+            &params![run.id, job_id, attempt, key, state],
+        );
+    };
+    slot(None, 1, "run-group", "running");
+    slot(Some(job), 1, "job-group", "pending");
+    let woken = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40))
+        .unwrap();
+    assert_eq!(woken_ids(woken), Vec::<u64>::new());
+    // Once the job's own row runs too, the wake was lost and is sent.
+    db.run(
+        "UPDATE ci_concurrency SET state = 'running' WHERE job_id = $1",
+        &params![job],
+    );
+    let woken = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 101, 40))
+        .unwrap();
+    assert_eq!(woken_ids(woken), [job]);
+}
+
+#[test]
+fn a_left_over_row_of_another_attempt_does_not_keep_a_group_job_waiting() {
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    let (run, job) = run_with_job_named(&db, "rerun", "queued");
+    db.run(
+        "UPDATE ci_jobs SET attempt = 2 WHERE id = $1",
+        &params![job],
+    );
+    db.wait(hold(db.db(), job, 2, "group", 11)).unwrap();
+    db.run(
+        "INSERT INTO ci_concurrency (repo_id, run_id, job_id, attempt, group_key, group_name, \
+         state, created_at) VALUES (7, $1, NULL, 2, 'run-group', 'run-group', 'running', 10), \
+         (7, $1, $2, 1, 'job-group', 'job-group', 'pending', 10)",
+        &params![run.id, job],
+    );
+    let woken = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40))
+        .unwrap();
+    assert_eq!(woken_ids(woken), [job]);
+}
+
+#[test]
+fn an_ending_job_wakes_a_capacity_held_job_on_its_template() {
+    let db = setup();
+    let (_, first) = run_with_job_named(&db, "first", "queued");
+    db.run(
+        "UPDATE ci_jobs SET held = 'capacity', \
+         next_launch_at = 500, capacity_attempts = 1, template = 'ubuntu-latest' \
+         WHERE id = $1",
+        &params![first],
+    );
+    let (_, waiting) = run_with_job_named(&db, "waiting", "queued");
+    db.run(
+        "UPDATE ci_jobs SET held = 'capacity', \
+         next_launch_at = 500, capacity_attempts = 1, template = 'ubuntu-26.04-8core' \
+         WHERE id = $1",
+        &params![waiting],
+    );
+    let (_, ended) = run_with_job_named(&db, "ended", "completed");
+    db.run(
+        "UPDATE ci_jobs SET template = 'ubuntu-latest' WHERE id = $1",
+        &params![ended],
+    );
+    let (_, other) = run_with_job_named(&db, "other", "completed");
+    db.run(
+        "UPDATE ci_jobs SET template = 'ubuntu-26.04-4core' WHERE id = $1",
+        &params![other],
+    );
+    // The ended job ran ubuntu-latest: only its template's waiter wakes.
+    let woken = db.wait(wake_capacity_job(db.db(), other, 100)).unwrap();
+    assert_eq!(woken_ids(woken), Vec::<u64>::new());
+    let woken = db.wait(wake_capacity_job(db.db(), ended, 100)).unwrap();
+    assert_eq!(woken_ids(woken), [first]);
+    let row = db.wait(job(db.db(), first)).unwrap().unwrap();
+    assert_eq!(row.next_launch_at, Some(100));
+    assert_eq!(row.held.as_deref(), Some("capacity"));
+    // A second end wakes nothing: the mark is not in the future.
+    let again = db.wait(wake_capacity_job(db.db(), ended, 101)).unwrap();
+    assert_eq!(woken_ids(again), Vec::<u64>::new());
 }
 
 #[test]

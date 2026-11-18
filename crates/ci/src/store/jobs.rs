@@ -48,6 +48,8 @@ pub struct JobRow {
     pub id: u64,
     /// The run it belongs to.
     pub run_id: u64,
+    /// The tenant that owns the run.
+    pub tenant_id: String,
     /// The planned job's id in its workflow.
     pub plan_id: String,
     /// Its display name.
@@ -123,7 +125,7 @@ fn json_text<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<serde_json:
 }
 
 /// The columns of a [`JobRow`].
-pub(super) const JOB_COLUMNS: &str = "id, run_id, plan_id, name, status, conclusion, instance_id, attempt, \
+pub(super) const JOB_COLUMNS: &str = "id, run_id, tenant_id, plan_id, name, status, conclusion, instance_id, attempt, \
      launch_attempts, capacity_attempts, capacity_since, next_launch_at, timeout_minutes, updated_at, started_at, \
      completed_at, steps::text AS steps, log_key, template, \
      token_permissions::text AS token_permissions, secret_refs::text AS secret_refs, held, \
@@ -213,23 +215,24 @@ pub(super) const LOCK_TENANT: &str = "SELECT id FROM tenants WHERE id = $1 FOR U
 
 /// Takes the launch of job `$1` at `$2`, if it is queued and fewer than
 /// `$4` jobs of tenant `$3` are launching, launched or running, and no
-/// older job of the tenant waits for a place (held for `concurrency`),
-/// so new jobs do not jump the line; run after [`LOCK_TENANT`]. The
-/// hold is over. With `$5` a job with a `max_parallel` also needs fewer
-/// than that many launching, launched or running jobs in its group, and
-/// no older job of the group held for `max_parallel`. With `$6` set, a job
+/// older unwoken job of the tenant waits for a place (held for
+/// `concurrency` with no wake picked yet), so new jobs do not jump the
+/// line; run after [`LOCK_TENANT`]. The hold is over. With `$5` a job
+/// with a `max_parallel` also needs fewer than that many launching,
+/// launched or running jobs in its group, and no older unwoken job of
+/// the group held for `max_parallel`. With `$6` set, a job
 /// of a fork run also needs fewer than that many fork-run jobs of its
 /// repository launching, launched or running.
 const CLAIM_LAUNCH: &str = "UPDATE ci_jobs SET status = 'launching', held = NULL, \
-     launch_attempts = launch_attempts + 1, updated_at = $2 \
+     next_launch_at = NULL, launch_attempts = launch_attempts + 1, updated_at = $2 \
      WHERE id = $1 AND status = 'queued' \
-     AND (SELECT count(*) FROM ci_jobs other JOIN ci_runs ON ci_runs.id = other.run_id \
-          WHERE ci_runs.tenant_id = $3 \
+     AND (SELECT count(*) FROM ci_jobs other \
+          WHERE other.tenant_id = $3 \
           AND other.status IN ('launching', 'launched', 'running')) < $4 \
-     AND NOT EXISTS (SELECT 1 FROM ci_jobs older JOIN ci_runs older_run \
-          ON older_run.id = older.run_id \
-          WHERE older_run.tenant_id = $3 AND older.status = 'queued' \
-          AND older.held = 'concurrency' AND older.id < ci_jobs.id) \
+     AND NOT EXISTS (SELECT 1 FROM ci_jobs older \
+          WHERE older.tenant_id = $3 AND older.status = 'queued' \
+          AND older.held = 'concurrency' AND older.next_launch_at IS NULL \
+          AND older.id < ci_jobs.id) \
      AND (NOT $5::boolean OR ci_jobs.max_parallel IS NULL OR \
           ((SELECT count(*) FROM ci_jobs sibling \
             WHERE sibling.run_id = ci_jobs.run_id \
@@ -239,6 +242,7 @@ const CLAIM_LAUNCH: &str = "UPDATE ci_jobs SET status = 'launching', held = NULL
             WHERE older_sibling.run_id = ci_jobs.run_id \
             AND older_sibling.strategy_group = ci_jobs.strategy_group \
             AND older_sibling.status = 'queued' AND older_sibling.held = 'max_parallel' \
+            AND older_sibling.next_launch_at IS NULL \
             AND older_sibling.id < ci_jobs.id))) \
      AND ($6::bigint IS NULL OR (SELECT count(*) FROM ci_jobs fork_job \
           JOIN ci_runs fork_run ON fork_run.id = fork_job.run_id \
@@ -258,19 +262,32 @@ const FORK_RUNNING: &str = "SELECT count(*) AS n FROM ci_jobs fork_job \
           WHERE j.id = $1) \
      AND fork_job.status IN ('launching', 'launched', 'running')";
 
-/// The oldest queued job held for `fork_limit` in the repository of the
-/// fork run job `$1` belongs to, at most `$2`: what a fork job ending
-/// makes room for.
-const HELD_FORK_JOBS: &str = "SELECT held.id AS job_id, held.attempt FROM ci_jobs ended \
-     JOIN ci_runs ended_run ON ended_run.id = ended.run_id AND ended_run.trust = 'fork' \
-     JOIN ci_runs held_run ON held_run.repo_id = ended_run.repo_id AND held_run.trust = 'fork' \
-     JOIN ci_jobs held ON held.run_id = held_run.id \
-     WHERE ended.id = $1 AND held.status = 'queued' AND held.held = 'fork_limit' \
-     ORDER BY held.id LIMIT $2";
+/// Marks the oldest queued job held for `fork_limit` in the repository
+/// of the fork run job `$1` belongs to that no wake picked yet, and
+/// returns it: what a fork job ending makes room for. The mark keeps
+/// the hold.
+const HELD_FORK_JOBS: &str = "UPDATE ci_jobs SET next_launch_at = $3 WHERE id IN (\
+      SELECT held.id FROM ci_jobs ended \
+      JOIN ci_runs ended_run ON ended_run.id = ended.run_id AND ended_run.trust = 'fork' \
+      JOIN ci_jobs held ON held.tenant_id = ended_run.tenant_id \
+      JOIN ci_runs held_run ON held_run.id = held.run_id \
+      WHERE ended.id = $1 AND held_run.repo_id = ended_run.repo_id \
+      AND held_run.trust = 'fork' \
+      AND held.status = 'queued' AND held.held = 'fork_limit' \
+      AND held.next_launch_at IS NULL \
+      ORDER BY held.id LIMIT $2 FOR UPDATE OF held SKIP LOCKED) \
+    AND status = 'queued' AND held = 'fork_limit' AND next_launch_at IS NULL \
+    RETURNING id AS job_id, attempt";
 
-/// The queued jobs of run `$1` held for its approval.
-const FORK_APPROVAL_HELD: &str = "SELECT id AS job_id, attempt FROM ci_jobs \
-     WHERE run_id = $1 AND status = 'queued' AND held = 'fork_approval' ORDER BY id";
+/// Marks the queued jobs of run `$1` held for its approval that no wake
+/// picked yet, and returns them: what a decision on the run wakes. The
+/// mark keeps the hold.
+const FORK_APPROVAL_HELD: &str = "UPDATE ci_jobs SET next_launch_at = $2 WHERE id IN (\
+      SELECT id FROM ci_jobs \
+      WHERE run_id = $1 AND status = 'queued' AND held = 'fork_approval' \
+      AND next_launch_at IS NULL ORDER BY id FOR UPDATE SKIP LOCKED) \
+    AND status = 'queued' AND held = 'fork_approval' AND next_launch_at IS NULL \
+    RETURNING id AS job_id, attempt";
 
 /// Whether queued job `$1` is over its group's limit now, and the limit:
 /// the same test as [`CLAIM_LAUNCH`], for telling a held group from a
@@ -287,29 +304,60 @@ const GROUP_FULL: &str = "SELECT ci_jobs.max_parallel AS max_parallel FROM ci_jo
            WHERE older_sibling.run_id = ci_jobs.run_id \
            AND older_sibling.strategy_group = ci_jobs.strategy_group \
            AND older_sibling.status = 'queued' AND older_sibling.held = 'max_parallel' \
+           AND older_sibling.next_launch_at IS NULL \
            AND older_sibling.id < ci_jobs.id))";
 
-/// The oldest queued job held for `max_parallel` in the group of job
-/// `$1`, at most `$2`: what a job of the group ending makes room for.
-const HELD_SIBLINGS: &str = "SELECT held.id AS job_id, held.attempt FROM ci_jobs ended \
-     JOIN ci_jobs held ON held.run_id = ended.run_id \
-       AND held.strategy_group = ended.strategy_group \
-     WHERE ended.id = $1 AND ended.strategy_group IS NOT NULL \
-     AND held.status = 'queued' AND held.held = 'max_parallel' \
-     ORDER BY held.id LIMIT $2";
+/// Marks the oldest queued job held for `max_parallel` in the group of
+/// job `$1` that no wake picked yet, and returns it: what a job of the
+/// group ending makes room for. The mark keeps the hold.
+const HELD_SIBLINGS: &str = "UPDATE ci_jobs SET next_launch_at = $3 WHERE id IN (\
+      SELECT held.id FROM ci_jobs ended \
+      JOIN ci_jobs held ON held.run_id = ended.run_id \
+        AND held.strategy_group = ended.strategy_group \
+      WHERE ended.id = $1 AND ended.strategy_group IS NOT NULL \
+      AND held.status = 'queued' AND held.held = 'max_parallel' \
+      AND held.next_launch_at IS NULL \
+      ORDER BY held.id LIMIT $2 FOR UPDATE OF held SKIP LOCKED) \
+    AND status = 'queued' AND held = 'max_parallel' AND next_launch_at IS NULL \
+    RETURNING id AS job_id, attempt";
 
-/// Keeps attempt `$2` of queued job `$1` held for reason `$3` until
-/// `$4`, at `$5`. Returns whether the reason changed. An approval hold
-/// never lands on an attempt that has a decision already: the consumer
-/// may have read the job before the admin answered.
+/// Keeps attempt `$2` of queued job `$1` held for reason `$3`, with no
+/// wake picked yet, at `$4`. Returns whether the reason changed. An
+/// approval hold never lands on an attempt that has a decision already:
+/// the consumer may have read the job before the admin answered.
 const HOLD: &str = "WITH prior AS (SELECT held FROM ci_jobs \
        WHERE id = $1 AND attempt = $2 AND status = 'queued' \
        AND NOT ($3::text = 'approval' AND approval_attempt = attempt \
                 AND approval_decision IS NOT NULL) FOR UPDATE) \
-     UPDATE ci_jobs SET held = $3::text, next_launch_at = $4, updated_at = $5, \
+     UPDATE ci_jobs SET held = $3::text, next_launch_at = NULL, updated_at = $4, \
        capacity_since = CASE WHEN $3::text = 'capacity' THEN capacity_since ELSE NULL END \
      FROM prior WHERE ci_jobs.id = $1 \
      RETURNING (prior.held IS DISTINCT FROM $3::text) AS changed";
+
+/// Marks the oldest capacity-held job on the template of job `$1`
+/// whose wait has not run out yet, and returns it: what the job ending
+/// makes room for. The mark keeps the hold; the consumer tries the
+/// launch again at once.
+const WAKE_CAPACITY_JOB: &str = "UPDATE ci_jobs SET next_launch_at = $2 WHERE id IN (\
+      SELECT held.id FROM ci_jobs ended \
+      JOIN ci_jobs held ON held.template IS NOT DISTINCT FROM ended.template \
+      WHERE ended.id = $1 \
+      AND held.status = 'queued' AND held.held = 'capacity' \
+      AND held.next_launch_at > $2 AND held.id <> ended.id \
+      ORDER BY held.id LIMIT 1 FOR UPDATE OF held SKIP LOCKED) \
+    AND status = 'queued' AND held = 'capacity' AND next_launch_at > $2 \
+    RETURNING id AS job_id, attempt";
+
+/// Marks up to `$2` oldest queued jobs held for `fork_limit` in
+/// repository `$1` that no wake picked yet, and returns them: what
+/// raising the repository's fork cap wakes. The mark keeps the hold.
+const HELD_FORK_REPO_JOBS: &str = "UPDATE ci_jobs SET next_launch_at = $3 WHERE id IN (\
+      SELECT held.id FROM ci_jobs held JOIN ci_runs held_run ON held_run.id = held.run_id \
+      WHERE held_run.repo_id = $1 AND held.status = 'queued' AND held.held = 'fork_limit' \
+      AND held.next_launch_at IS NULL \
+      ORDER BY held.id LIMIT $2 FOR UPDATE OF held SKIP LOCKED) \
+    AND status = 'queued' AND held = 'fork_limit' AND next_launch_at IS NULL \
+    RETURNING id AS job_id, attempt";
 
 /// Records `$2` as the launch error of job `$1` while it is queued, at `$3`.
 const NOTE_QUEUED_ERROR: &str = "UPDATE ci_jobs SET launch_error = $2, updated_at = $3 \
@@ -409,7 +457,8 @@ pub async fn insert_jobs(
         let base = 3 + i * 10;
         highest = base + 9;
         values.push(format!(
-            "($1, (SELECT tier FROM ci_runs WHERE id = $1), \
+            "($1, (SELECT tenant_id FROM ci_runs WHERE id = $1), \
+             (SELECT tier FROM ci_runs WHERE id = $1), \
              (SELECT created_at FROM ci_runs WHERE id = $1), \
              ${}, ${}, ${}, ${}, ${}::jsonb, ${}::jsonb, ${}, ${}, ${}, ${}::jsonb, \
              'waiting', $2, $2)",
@@ -443,7 +492,7 @@ pub async fn insert_jobs(
     }
     debug_assert_eq!(bound.len(), highest);
     let sql = format!(
-        "INSERT INTO ci_jobs (run_id, tier, run_created_at, plan_id, name, timeout_minutes, \
+        "INSERT INTO ci_jobs (run_id, tenant_id, tier, run_created_at, plan_id, name, timeout_minutes, \
          template, token_permissions, secret_refs, environment, strategy_group, max_parallel, \
          needs, status, created_at, updated_at) \
          VALUES {} RETURNING plan_id, id",
@@ -905,58 +954,80 @@ pub async fn fork_running(db: &Db, job_id: u64) -> Result<u64> {
 }
 
 /// The oldest queued job of a fork run held for `fork_limit` in the
-/// repository of fork job `job_id`, to wake when `job_id` ends and
-/// leaves a place.
+/// repository of fork job `job_id`, marked for a wake: what `job_id`
+/// ending makes room for.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn held_fork_jobs(db: &Db, job_id: u64) -> Result<Vec<Woken>> {
-    db.all(HELD_FORK_JOBS, &params![job_id, 1_u32]).await
+pub async fn held_fork_jobs(db: &Db, job_id: u64, now: u64) -> Result<Vec<Woken>> {
+    db.all(HELD_FORK_JOBS, &params![job_id, 1_u32, now]).await
 }
 
-/// The queued jobs of run `run_id` held for its approval, which a
-/// decision on the run wakes.
+/// The queued jobs of run `run_id` held for its approval, marked for a
+/// wake: what a decision on the run wakes.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn fork_approval_held(db: &Db, run_id: u64) -> Result<Vec<Woken>> {
-    db.all(FORK_APPROVAL_HELD, &params![run_id]).await
+pub async fn fork_approval_held(db: &Db, run_id: u64, now: u64) -> Result<Vec<Woken>> {
+    db.all(FORK_APPROVAL_HELD, &params![run_id, now]).await
 }
 
 /// The oldest queued job held for `max_parallel` in the group of job
-/// `job_id`, to wake when `job_id` ends and leaves a place.
+/// `job_id`, marked for a wake: what `job_id` ending makes room for.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn held_siblings(db: &Db, job_id: u64) -> Result<Vec<Woken>> {
-    db.all(HELD_SIBLINGS, &params![job_id, 1_u32]).await
+pub async fn held_siblings(db: &Db, job_id: u64, now: u64) -> Result<Vec<Woken>> {
+    db.all(HELD_SIBLINGS, &params![job_id, 1_u32, now]).await
 }
 
-/// Keeps attempt `attempt` of job `job_id` queued with reason `hold`
-/// until `retry_at`, and bumps its `updated_at`. Returns whether the
-/// reason changed; another attempt, or a job that is not queued, is
+/// Marks the oldest capacity-held job on the template of job `job_id`
+/// whose wait has not run out yet, and returns it: what `job_id`
+/// ending makes room for. The mark keeps the hold; the consumer tries
+/// the launch again and waits on when the timer says.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn wake_capacity_job(db: &Db, job_id: u64, now: u64) -> Result<Vec<Woken>> {
+    db.all(WAKE_CAPACITY_JOB, &params![job_id, now]).await
+}
+
+/// Marks up to `limit` oldest queued jobs held for `fork_limit` in
+/// `repo_id` that no wake picked yet, and returns them: what raising
+/// the repository's fork cap wakes. The mark keeps the hold.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn held_fork_repo_jobs(
+    db: &Db,
+    repo_id: u64,
+    limit: u32,
+    now: u64,
+) -> Result<Vec<Woken>> {
+    db.all(HELD_FORK_REPO_JOBS, &params![repo_id, limit, now])
+        .await
+}
+
+/// Keeps attempt `attempt` of job `job_id` queued with reason `hold`,
+/// with no wake picked yet, and bumps its `updated_at`. Returns whether
+/// the reason changed; another attempt, or a job that is not queued, is
 /// left alone and the answer is `false`.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn hold(
-    db: &Db,
-    job_id: u64,
-    attempt: u32,
-    hold: &str,
-    retry_at: u64,
-    now: u64,
-) -> Result<bool> {
+pub async fn hold(db: &Db, job_id: u64, attempt: u32, hold: &str, now: u64) -> Result<bool> {
     #[derive(Deserialize)]
     struct Changed {
         changed: bool,
     }
     Ok(db
-        .first::<Changed>(HOLD, &params![job_id, attempt, hold, retry_at, now])
+        .first::<Changed>(HOLD, &params![job_id, attempt, hold, now])
         .await?
         .is_some_and(|row| row.changed))
 }

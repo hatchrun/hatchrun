@@ -74,6 +74,7 @@ pub mod settings_api;
 pub mod store;
 pub mod token;
 pub mod trust;
+pub mod wake;
 pub mod webhook;
 
 use hatchrun_cloud::db::Db;

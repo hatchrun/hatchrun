@@ -61,6 +61,7 @@ use serde_json::json;
 use worker::{Env, Method, RequestInit, console_error, console_log};
 
 use crate::alerts;
+use crate::billing;
 use crate::cache;
 use crate::concurrency;
 use crate::deliveries::{self, DeliveryMessage};
@@ -90,9 +91,9 @@ pub const MAX_FIXES: u32 = 50;
 pub const HELD_BUDGET: u32 = 40;
 /// The backstop runs in the passes of every 15th minute.
 const HELD_EVERY_MINUTES: u64 = 15;
-/// The backstop leaves a held job alone for this long after its last
-/// hold.
-pub const HELD_QUIET_MS: u64 = 10 * 60_000;
+/// The backstop frees an approval hold nobody decided or released for
+/// this long.
+const ORPHAN_QUIET_MS: u64 = 10 * 60_000;
 /// The most cancels of superseded runs and jobs one pass sends again,
 /// apart from [`BUDGET`].
 pub const MAX_RECANCELS: u32 = 10;
@@ -262,11 +263,24 @@ fn fix(row: &JobRow, now: u64) -> Option<Fix> {
         {
             Some(Fix::Requeue(row.id))
         }
-        // A held job is woken, not requeued: see [`wake_held`].
+        // A woken held job whose message was lost is sent again once
+        // it has been quiet: the wake marked it, and nothing else did.
         "queued"
-            if row.held.is_none()
-                && (row.next_launch_at.is_some_and(|at| at <= now)
-                    || quiet_since(row.updated_at, QUEUED_QUIET_MS)) =>
+            if row
+                .held
+                .as_deref()
+                .is_some_and(|held| held != launches::CAPACITY_HOLD)
+                && row
+                    .next_launch_at
+                    .is_some_and(|at| at <= now.saturating_sub(QUEUED_QUIET_MS)) =>
+        {
+            Some(Fix::Requeue(row.id))
+        }
+        // A held job that no wake picked waits for its event.
+        "queued" if row.held.is_some() => None,
+        "queued"
+            if row.next_launch_at.is_some_and(|at| at <= now)
+                || quiet_since(row.updated_at, QUEUED_QUIET_MS) =>
         {
             Some(Fix::Requeue(row.id))
         }
@@ -982,31 +996,79 @@ pub fn paid_wakes(woken: &[Woken], budget: &Budget) -> Vec<Woken> {
         .collect()
 }
 
+/// The most tenants with billing holds one backstop pass checks. Only
+/// tenants an event may have freed are read, and each leaves the list
+/// once read, so the list holds the events of one pass: more than this
+/// only at a calendar month turn, which the next pass finishes.
+pub const BILLING_TENANTS_PER_PASS: u32 = 1_000;
+
+/// The billing holds a comma-separated list of `held` words names.
+#[must_use]
+pub fn billing_reasons(reasons: &str) -> Vec<billing::Hold> {
+    reasons
+        .split(',')
+        .filter_map(|reason| match reason {
+            "card" => Some(billing::Hold::Card),
+            "spend_cap" => Some(billing::Hold::SpendCap),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The slow backstop for held jobs, which the stalled-job step leaves
-/// alone. Wakes come from the Polar webhook (card), the end of a job
-/// (concurrency) and the owner raising the cap; this catches a wake that
-/// was lost, and releases spend-cap holds when the month turns. It sends
-/// the oldest held jobs of each tenant, at most [`MAX_RUNNING_JOBS`]
-/// each, that nobody looked at for [`HELD_QUIET_MS`], paid from its own
-/// `budget`. The consumer checks the caps again and holds a job that
+/// alone. Wakes come from the events themselves: the Polar webhook
+/// (card), the end of a job (concurrency, matrix, capacity), the owner
+/// raising the cap, and the approval decisions. This catches a wake
+/// that was lost: unwoken held jobs whose condition is clear now, and
+/// billing holds whose admission changed. Approval holds nobody
+/// decided or released are freed too. Every wake is paid from its own
+/// `budget`; the consumer checks the caps again and holds a job that
 /// still waits.
 async fn wake_held(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), String> {
-    // A spend-cap hold may have ended with the month: let it drain in
-    // order through the concurrency path.
-    ci_wake::release_spend_caps(db, now.saturating_sub(HELD_QUIET_MS))
+    // Events that do not come again go first: billing holds whose
+    // admission changed without waking them, then approvals nobody is
+    // left to decide. A room-based wake cut by the budget is marked
+    // already, and the stalled scan sends it within a minute.
+    let mut stale = Vec::new();
+    // Only the tenants an event may have freed: a card that is back, a
+    // Polar delivery or cap change since the hold, or a spend window
+    // that turned. The rest wait on with no read.
+    let tenants =
+        ci_wake::billing_candidates(db, now, billing::month_start(now), BILLING_TENANTS_PER_PASS)
+            .await
+            .map_err(|e| e.to_string())?;
+    for tenant in &tenants {
+        let holds = billing_reasons(&tenant.reasons);
+        let standing = store::tenant_standing(
+            db,
+            &tenant.tenant_id,
+            now,
+            hatchrun_workflow::DEFAULT_SPEND_CAP_MICROS,
+        )
         .await
         .map_err(|e| e.to_string())?;
+        match standing {
+            Some(standing) if billing::billing_wake_lost(&standing, &holds) => {
+                stale.extend(
+                    ci_wake::standing_improved(db, &tenant.tenant_id, now)
+                        .await
+                        .map_err(|e| e.to_string())?,
+                );
+            }
+            // The holds stand: marked checked, the tenant leaves the
+            // list until its next event.
+            _ => ci_wake::billing_checked(db, &tenant.tenant_id, now)
+                .await
+                .map_err(|e| e.to_string())?,
+        }
+    }
     // An approval hold whose environment is gone or has approval off, or
     // whose attempt was decided, has nobody to wait for; the change that
     // freed it may have failed to wake it.
-    let mut stale =
-        ci_wake::release_orphan_approvals(db, now.saturating_sub(HELD_QUIET_MS), now, HELD_BUDGET)
-            .await
-            .map_err(|e| e.to_string())?;
     stale.extend(
-        ci_wake::release_orphan_fork_approvals(
+        ci_wake::release_orphan_approvals(
             db,
-            now.saturating_sub(HELD_QUIET_MS),
+            now.saturating_sub(ORPHAN_QUIET_MS),
             now,
             HELD_BUDGET,
         )
@@ -1014,14 +1076,20 @@ async fn wake_held(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), 
         .map_err(|e| e.to_string())?,
     );
     stale.extend(
-        ci_wake::stale(
+        ci_wake::release_orphan_fork_approvals(
             db,
-            now.saturating_sub(HELD_QUIET_MS),
-            MAX_RUNNING_JOBS,
+            now.saturating_sub(ORPHAN_QUIET_MS),
+            now,
             HELD_BUDGET,
         )
         .await
         .map_err(|e| e.to_string())?,
+    );
+    // Held jobs whose condition is clear now, across every tenant.
+    stale.extend(
+        ci_wake::lost_wakes(db, None, MAX_RUNNING_JOBS, now, HELD_BUDGET)
+            .await
+            .map_err(|e| e.to_string())?,
     );
     let wakes = paid_wakes(&stale, budget);
     if wakes.len() < stale.len() {
@@ -1094,14 +1162,14 @@ pub(crate) async fn fail_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Resu
         // that ended; a later attempt holds its own place.
         let now_row = store::job(db, row.id).await.map_err(|e| e.to_string())?;
         if attempt_ended(now_row.as_ref(), row.attempt) {
-            concurrency::release(env, db, row.run_id, Some(row.id))
+            concurrency::release(env, db, row.run_id, Some(row.id), now)
                 .await
                 .map_err(|e| e.to_string())?;
         }
         return Ok(());
     }
     // The job is over, so its place in a concurrency group is free.
-    concurrency::release(env, db, row.run_id, Some(row.id))
+    concurrency::release(env, db, row.run_id, Some(row.id), now)
         .await
         .map_err(|e| e.to_string())?;
     let Some(run) = store::run(db, row.run_id)
@@ -1110,8 +1178,7 @@ pub(crate) async fn fail_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Resu
     else {
         return Ok(());
     };
-    launches::wake_oldest(env, db, &run.tenant_id).await;
-    launches::wake_group(env, db, row.id).await;
+    launches::wake_after_end(env, db, &run.tenant_id, row.id, now).await;
     let jobs = store::jobs_for_run(db, run.id)
         .await
         .map_err(|e| e.to_string())?;
@@ -1132,7 +1199,7 @@ async fn fail_stalled_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Result<
     if !unchanged(current.as_ref(), row) {
         return Ok(());
     }
-    concurrency::release(env, db, row.run_id, Some(row.id))
+    concurrency::release(env, db, row.run_id, Some(row.id), now)
         .await
         .map_err(|e| e.to_string())?;
     let run = store::run(db, row.run_id)
@@ -1150,9 +1217,10 @@ async fn fail_stalled_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Result<
         .await
         .map_err(|e| e.to_string())?;
     if let Some(run) = &run {
-        launches::wake_oldest(env, db, &run.tenant_id).await;
+        launches::wake_after_end(env, db, &run.tenant_id, row.id, now).await;
+    } else {
+        launches::wake_group(env, db, row.id, now).await;
     }
-    launches::wake_group(env, db, row.id).await;
     Ok(())
 }
 
@@ -1176,7 +1244,7 @@ async fn finish_run_without_object(
     store::finish_run(db, run.id, run.run_attempt, "failure", now)
         .await
         .map_err(|e| e.to_string())?;
-    concurrency::release(env, db, run.id, None)
+    concurrency::release(env, db, run.id, None, now)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1785,7 +1853,7 @@ mod tests {
 
     fn row(status: &str) -> JobRow {
         let mut row: JobRow = serde_json::from_value(json!({
-            "id": 1, "run_id": 2, "plan_id": "a", "name": "a", "status": status,
+            "id": 1, "run_id": 2, "tenant_id": "t1", "plan_id": "a", "name": "a", "status": status,
             "conclusion": null, "instance_id": null, "attempt": 1,
             "launch_attempts": 1, "capacity_attempts": 0, "capacity_since": null,
             "next_launch_at": null,
@@ -1800,14 +1868,35 @@ mod tests {
     }
 
     #[test]
-    fn a_held_job_is_woken_not_requeued() {
+    fn an_unwoken_held_job_waits_for_its_event() {
         let mut held = row("queued");
         held.held = Some("concurrency".into());
-        held.next_launch_at = Some(NOW - 1);
+        held.next_launch_at = None;
         held.updated_at = NOW - 3_600_000;
-        assert_eq!(stalled(&[held.clone()], NOW), []);
-        held.held = None;
-        assert_eq!(stalled(&[held], NOW), [Fix::Requeue(1)]);
+        assert_eq!(stalled(&[held], NOW), []);
+    }
+
+    #[test]
+    fn billing_reasons_read_the_listed_words_only() {
+        assert_eq!(
+            billing_reasons("card,spend_cap"),
+            [billing::Hold::Card, billing::Hold::SpendCap]
+        );
+        assert_eq!(billing_reasons("spend_cap"), [billing::Hold::SpendCap]);
+        assert_eq!(billing_reasons(""), []);
+        assert_eq!(billing_reasons("concurrency"), []);
+    }
+
+    #[test]
+    fn a_woken_held_job_whose_message_was_lost_is_requeued() {
+        let mut woken = row("queued");
+        woken.held = Some("concurrency".into());
+        woken.next_launch_at = Some(NOW - QUEUED_QUIET_MS - 1);
+        woken.updated_at = NOW;
+        assert_eq!(stalled(&[woken.clone()], NOW), [Fix::Requeue(1)]);
+        // Freshly marked: its message may still be on its way.
+        woken.next_launch_at = Some(NOW);
+        assert_eq!(stalled(&[woken], NOW), []);
     }
 
     #[test]

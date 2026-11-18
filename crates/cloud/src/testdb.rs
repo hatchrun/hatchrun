@@ -451,6 +451,137 @@ mod tests {
             .collect()
     }
 
+    /// 0031 records the tenant on each job, backfilled from its run, and
+    /// drops the recheck time of jobs held for anything but capacity.
+    #[test]
+    fn migration_0031_records_the_tenant_on_each_job() {
+        let _lock = super::MIGRATING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("start a runtime");
+        let schema = format!(
+            "mig31_{}_{}",
+            std::process::id(),
+            MIGRATION_SCHEMA_NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        runtime.block_on(async {
+            let (client, connection) = tokio_postgres::connect(&url(), tokio_postgres::NoTls)
+                .await
+                .unwrap_or_else(|err| panic!("connect to {}: {err}", url()));
+            tokio::spawn(connection);
+            client
+                .batch_execute(&format!(
+                    "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; \
+                     SET search_path TO {schema}"
+                ))
+                .await
+                .expect("create the schema");
+            let files = migration_files();
+            for (name, sql) in files
+                .iter()
+                .filter(|(name, _)| name.as_str() < "0031_ci_jobs_tenant_wakes.sql")
+            {
+                client
+                    .batch_execute(sql)
+                    .await
+                    .unwrap_or_else(|err| panic!("migrate {name}: {err:?}"));
+            }
+            client
+                .batch_execute(MIGRATION_0031_SEED)
+                .await
+                .expect("seed old rows");
+            let (_, latest) = files
+                .iter()
+                .find(|(name, _)| name == "0031_ci_jobs_tenant_wakes.sql")
+                .expect("0031 exists");
+            client.batch_execute(latest).await.expect("apply 0031");
+
+            let rows = client
+                .query(
+                    "SELECT tenant_id, held, next_launch_at FROM ci_jobs ORDER BY id",
+                    &[],
+                )
+                .await
+                .expect("read jobs");
+            assert_eq!(rows.len(), 2);
+            let first: (String, Option<String>, Option<i64>) =
+                (rows[0].get(0), rows[0].get(1), rows[0].get(2));
+            let second: (String, Option<String>, Option<i64>) =
+                (rows[1].get(0), rows[1].get(1), rows[1].get(2));
+            assert_eq!(
+                first,
+                ("t1".to_owned(), Some("concurrency".to_owned()), None)
+            );
+            assert_eq!(
+                second,
+                ("t1".to_owned(), Some("capacity".to_owned()), Some(60_000))
+            );
+            // A job without a tenant no longer inserts.
+            let missing = client
+                .query(
+                    "INSERT INTO ci_jobs (run_id, tier, run_created_at, plan_id, name, status, \
+                     timeout_minutes, token_permissions, secret_refs, needs, created_at, \
+                     updated_at) \
+                     SELECT id, 30, 0, 'late', 'late', 'queued', 10, '{}', \
+                     '{\"all\":false,\"names\":[]}', '[]', 0, 0 FROM ci_runs LIMIT 1",
+                    &[],
+                )
+                .await
+                .unwrap_err();
+            assert!(format!("{missing:?}").contains("tenant_id"), "{missing:?}");
+            for index in ["ci_jobs_held", "ci_jobs_tenant_live", "ci_jobs_capacity"] {
+                let count: i64 = client
+                    .query_one(
+                        "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = current_schema() \
+                         AND tablename = 'ci_jobs' AND indexname = $1",
+                        &[&index],
+                    )
+                    .await
+                    .expect("indexes")
+                    .get(0);
+                assert_eq!(count, 1, "{index}");
+            }
+            client
+                .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+                .await
+                .expect("drop the schema");
+        });
+    }
+
+    /// Old rows for the 0031 migration: a run with a concurrency-held
+    /// job that still has its 30 s recheck time, and a capacity-held
+    /// job whose backoff stays.
+    const MIGRATION_0031_SEED: &str = "
+        INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at, \
+                             retention_days) \
+        VALUES ('t1', 1, 'acme', 99, 0, 0, 30);
+        INSERT INTO ci_repos (id, tenant_id, installation_id, full_name, default_branch, \
+                              private, updated_at) \
+        VALUES (7, 't1', 99, 'acme/app', 'main', false, 0);
+        CREATE TABLE ci_runs_t30_197001 PARTITION OF ci_runs_t30 \
+          FOR VALUES FROM (0) TO (2678400000);
+        CREATE TABLE ci_jobs_t30_197001 PARTITION OF ci_jobs_t30 \
+          FOR VALUES FROM (0) TO (2678400000);
+        INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, ref, \
+                             sha, actor, status, created_at, updated_at, tier, trust, \
+                             author_login, author_association, gate, gate_status) \
+        VALUES ('t1', 7, 'ci', 1, 'd1', 'push', 'refs/heads/main', 'abc', 'me', 'queued', \
+                0, 0, 30, 'trusted', 'me', '', 'none', 'none');
+        INSERT INTO ci_jobs (run_id, tier, run_created_at, plan_id, name, status, \
+                             timeout_minutes, token_permissions, secret_refs, needs, held, \
+                             next_launch_at, created_at, updated_at) \
+        SELECT id, 30, 0, 'build', 'build', 'queued', 10, '{}'::jsonb, \
+               '{\"all\":false,\"names\":[]}'::jsonb, '[]'::jsonb, 'concurrency', 30000, \
+               0, 0 FROM ci_runs
+        UNION ALL \
+        SELECT id, 30, 0, 'test', 'test', 'queued', 10, '{}'::jsonb, \
+               '{\"all\":false,\"names\":[]}'::jsonb, '[]'::jsonb, 'capacity', 60000, \
+               0, 0 FROM ci_runs;";
+
     /// 0027 moves the old rows into tiered month partitions: the runs,
     /// jobs, usage and audit rows land with the tier their tenant had,
     /// in the month they were recorded, and the dropped foreign keys

@@ -10,8 +10,8 @@
 //! (the job was re-run since) or the job is not queued any more. Then
 //! it checks the tenant's caps (see [`crate::billing::admission`]): a
 //! tenant without a card, at its spend cap or running its most jobs
-//! has the job held, queued with its reason and looked at again 30 s
-//! later (see [`hold_job`]). Otherwise it claims the launch, which only
+//! has the job held, queued with its reason, until its event wakes it
+//! (see [`hold_job`]). Otherwise it claims the launch, which only
 //! one consumer can, and:
 //!
 //! 1. signs the job token and a one-use ticket;
@@ -53,7 +53,7 @@ use worker::{
 };
 
 use crate::alerts;
-use crate::billing::{self, HOLD_RECHECK_MS, Hold};
+use crate::billing::{self, Hold};
 use crate::concurrency::{self, Gate as GroupGate};
 use crate::env::{Settings, run_stub};
 use crate::environments::{self, Gate};
@@ -280,7 +280,7 @@ async fn start(env: &Env) -> Result<(Settings, Backend), String> {
 /// Asks the job's concurrency groups whether it may go on. A `false`
 /// means the job was held, ended or cancelled and nothing is left to do.
 async fn group_open(env: &Env, db: &Db, job: &JobRow, now: u64) -> Result<bool, String> {
-    match concurrency::gate(env, db, job.run_id, job.id, job.attempt).await? {
+    match concurrency::gate(env, db, job.run_id, job.id, job.attempt, now).await? {
         GroupGate::Pass => Ok(true),
         GroupGate::Hold(message) => {
             hold_job(env, db, job, concurrency::HOLD, &message, now).await?;
@@ -357,17 +357,16 @@ async fn fork_open(
             hold_job(env, db, job, FORK_APPROVAL_HOLD, &message, now).await?;
             // A decision between the read above and the hold looked for
             // held jobs before this one was held, and woke nothing. The
-            // gate is read again after the hold: a wake that was lost is
-            // sent here.
+            // gate is read again after the hold: the jobs held of this
+            // run that no wake picked are sent here.
             let after = store::run(db, run.id)
                 .await
                 .map_err(|err| err.to_string())?
                 .map(|run| run.gate_status);
             if lost_wake(after) {
-                let woken = [Woken {
-                    job_id: job.id,
-                    attempt: job.attempt,
-                }];
+                let woken = store::fork_approval_held(db, run.id, now)
+                    .await
+                    .map_err(|err| err.to_string())?;
                 send_wakes(env, &woken).await?;
             }
             return Ok(ForkGate::Done);
@@ -570,10 +569,16 @@ async fn hold_for(
 }
 
 /// Keeps the queued job held for `reason` (the word `ci_jobs.held`
-/// stores), to be looked at again after [`HOLD_RECHECK_MS`], and tells
-/// the run's object `message` every time, changed or not: a post that
-/// fails is made again when the reconciler requeues the job. The message
-/// is acked either way, so an error is only a database one.
+/// stores), until its event wakes it, and tells the run's object
+/// `message`. A wake sends the job to the launch queue, which holds it
+/// again and posts again when the caps still bind. A post that fails is
+/// logged and left at that: the hold stands either way, and so an error
+/// is only a database one.
+///
+/// A hold for `concurrency`, `max_parallel`, `fork_limit` or `group`
+/// then rechecks its tenant for a lost wake: the job's end and the
+/// hold raced, and nothing wakes the held job. The fork approval hold
+/// keeps its own recheck where it is written (see [`fork_open`]).
 async fn hold_job(
     env: &Env,
     db: &Db,
@@ -582,11 +587,17 @@ async fn hold_job(
     message: &str,
     now: u64,
 ) -> Result<(), String> {
-    let changed = store::hold(db, job.id, job.attempt, reason, now + HOLD_RECHECK_MS, now)
+    let changed = store::hold(db, job.id, job.attempt, reason, now)
         .await
         .map_err(|err| err.to_string())?;
     if changed {
         console_log!("job {}: held, {reason}", job.id);
+    }
+    // The job's end and the hold raced when the place was already
+    // free: the end woke nothing, since this job was not held yet.
+    // The recheck finds it.
+    if crate::wake::HoldReason::parse(reason).is_some_and(crate::wake::HoldReason::rechecks) {
+        recheck_tenant(env, db, &job.tenant_id, now).await;
     }
     let answer = post_to_run(env, db, job, "held", message).await;
     if !matches!(answer, EndAnswer::Status(200..=299 | 409)) {
@@ -615,12 +626,36 @@ pub(crate) async fn send_wakes(env: &Env, woken: &[Woken]) -> Result<(), String>
     Ok(())
 }
 
+/// A hold and a job end raced: runs the lost-wake query for the
+/// tenant and sends what it marks. A failure is logged and left to the
+/// reconciler's backstop.
+async fn recheck_tenant(env: &Env, db: &Db, tenant_id: &str, now: u64) {
+    let woken = match ci_wake::lost_wakes(
+        db,
+        Some(tenant_id),
+        hatchrun_workflow::MAX_RUNNING_JOBS,
+        now,
+        ci_wake::WAKE_LIMIT,
+    )
+    .await
+    {
+        Ok(woken) => woken,
+        Err(err) => {
+            console_error!("tenant {tenant_id}: recheck held jobs: {err}");
+            return;
+        }
+    };
+    if let Err(err) = send_wakes(env, &woken).await {
+        console_error!("tenant {tenant_id}: wake the held job: {err}");
+    }
+}
+
 /// A job of `tenant_id` ended: wakes its oldest job held for the
 /// concurrency cap, which the freed place is for. A failure is logged
 /// and left to the reconciler's backstop, since the job's end is
 /// recorded already.
-pub(crate) async fn wake_oldest(env: &Env, db: &Db, tenant_id: &str) {
-    let woken = match ci_wake::held(db, tenant_id, Hold::Concurrency.as_str(), 1).await {
+pub(crate) async fn wake_oldest(env: &Env, db: &Db, tenant_id: &str, now: u64) {
+    let woken = match ci_wake::held(db, tenant_id, Hold::Concurrency.as_str(), 1, now).await {
         Ok(woken) => woken,
         Err(err) => {
             console_error!("tenant {tenant_id}: find the held job: {err}");
@@ -636,8 +671,8 @@ pub(crate) async fn wake_oldest(env: &Env, db: &Db, tenant_id: &str) {
 /// place under `max-parallel`, which the freed place is for. A failure
 /// is logged and left to the reconciler's backstop, since the job's end
 /// is recorded already.
-pub(crate) async fn wake_group(env: &Env, db: &Db, job_id: u64) {
-    let mut woken = match store::held_siblings(db, job_id).await {
+pub(crate) async fn wake_group(env: &Env, db: &Db, job_id: u64, now: u64) {
+    let mut woken = match store::held_siblings(db, job_id, now).await {
         Ok(woken) => woken,
         Err(err) => {
             console_error!("job {job_id}: find the held job of its matrix: {err}");
@@ -646,13 +681,31 @@ pub(crate) async fn wake_group(env: &Env, db: &Db, job_id: u64) {
     };
     // A fork job that ended also frees a place under the repository's
     // cap on fork jobs.
-    match store::held_fork_jobs(db, job_id).await {
+    match store::held_fork_jobs(db, job_id, now).await {
         Ok(more) => woken.extend(more),
         Err(err) => console_error!("job {job_id}: find the held fork job: {err}"),
     }
     if let Err(err) = send_wakes(env, &woken).await {
         console_error!("job {job_id}: wake the held job of its matrix: {err}");
     }
+}
+
+/// A job ended: wakes what its end frees, every caller the same way. A
+/// capacity-held job on its template gets the freed capacity, a
+/// concurrency-held job of its tenant the freed place, and a held
+/// sibling the freed matrix place. Failures are logged and left to the
+/// reconciler's backstop, since the job's end is recorded already.
+pub(crate) async fn wake_after_end(env: &Env, db: &Db, tenant_id: &str, job_id: u64, now: u64) {
+    match store::wake_capacity_job(db, job_id, now).await {
+        Ok(woken) => {
+            if let Err(err) = send_wakes(env, &woken).await {
+                console_error!("job {job_id}: wake the held capacity job: {err}");
+            }
+        }
+        Err(err) => console_error!("job {job_id}: find the held capacity job: {err}"),
+    }
+    wake_oldest(env, db, tenant_id, now).await;
+    wake_group(env, db, job_id, now).await;
 }
 
 /// The word `ci_jobs.held` stores for a job of a fork run whose
@@ -905,11 +958,14 @@ async fn record_failure(env: &Env, db: &Db, job: &JobRow, failure: &Failure) -> 
             if waiting {
                 console_log!("job {}: held, {CAPACITY_HOLD}", job.id);
                 // The job gave back its place in the tenant and its
-                // matrix, which a job held for them waits for.
+                // matrix, which a job held for them waits for. It freed
+                // no EC2 capacity, so no capacity hold is brought
+                // forward: two of them on one template would wake each
+                // other at queue speed.
                 if let Ok(Some(run)) = store::run(db, job.run_id).await {
-                    wake_oldest(env, db, &run.tenant_id).await;
+                    wake_oldest(env, db, &run.tenant_id, now).await;
                 }
-                wake_group(env, db, job.id).await;
+                wake_group(env, db, job.id, now).await;
                 let message = capacity_message(&failure.cause);
                 let answer = post_to_run(env, db, job, "held", &message).await;
                 if !matches!(answer, EndAnswer::Status(200..=299 | 409)) {
@@ -1041,15 +1097,15 @@ pub(crate) async fn end_job(env: &Env, db: &Db, job: &JobRow, message: &str) -> 
                 // The group place and the matrix wake do not need the run
                 // row, so a read that fails cannot skip them (the order
                 // `reconcile::fail_row` keeps).
-                wake_group(env, db, job.id).await;
                 match store::run(db, job.run_id).await {
-                    Ok(Some(run)) => wake_oldest(env, db, &run.tenant_id).await,
-                    Ok(None) => {}
+                    Ok(Some(run)) => wake_after_end(env, db, &run.tenant_id, job.id, now).await,
+                    Ok(None) => wake_group(env, db, job.id, now).await,
                     Err(err) => {
                         console_error!("job {}: read its run to wake the tenant: {err}", job.id);
+                        wake_group(env, db, job.id, now).await;
                     }
                 }
-                return concurrency::release(env, db, job.run_id, Some(job.id))
+                return concurrency::release(env, db, job.run_id, Some(job.id), now)
                     .await
                     .map_err(|err| err.to_string());
             }
@@ -1361,7 +1417,7 @@ mod tests {
 
     fn row(status: &str, attempt: u32, launch_attempts: u32) -> JobRow {
         serde_json::from_value(json!({
-            "id": 1, "run_id": 2, "plan_id": "a", "name": "a", "status": status,
+            "id": 1, "run_id": 2, "tenant_id": "t1", "plan_id": "a", "name": "a", "status": status,
             "conclusion": null, "instance_id": null, "attempt": attempt,
             "launch_attempts": launch_attempts, "capacity_attempts": 0,
             "capacity_since": null, "next_launch_at": null,

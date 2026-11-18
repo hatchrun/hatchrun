@@ -957,11 +957,11 @@ impl<'a> Cx<'a> {
                 if ended {
                     // The freed place goes to the oldest held job, and
                     // to the oldest job of its matrix held for
-                    // max-parallel.
-                    launches::wake_oldest(&self.env, db, &info.tenant_id).await;
-                    launches::wake_group(&self.env, db, *job).await;
+                    // max-parallel, and to a capacity-held job on its
+                    // template.
+                    launches::wake_after_end(&self.env, db, &info.tenant_id, *job, self.now).await;
                 }
-                concurrency::release(&self.env, db, info.run_id, Some(*job)).await
+                concurrency::release(&self.env, db, info.run_id, Some(*job), self.now).await
             }
             Work::FinishRun {
                 attempt,
@@ -975,7 +975,7 @@ impl<'a> Cx<'a> {
                     self.now,
                 )
                 .await?;
-                concurrency::release(&self.env, db, info.run_id, None).await?;
+                concurrency::release(&self.env, db, info.run_id, None, self.now).await?;
                 self.chain(*attempt, &["completed"], Some(conclusion_word(*conclusion)))
                     .await
             }
