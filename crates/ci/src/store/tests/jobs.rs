@@ -872,7 +872,8 @@ fn a_raised_cap_after_the_hold_makes_its_tenant_a_candidate_until_checked() {
     db.wait(crate::store::set_spend_cap(db.db(), "t1", 1, MID_OCT - 1))
         .unwrap();
     assert_eq!(billing_candidates(&db, MID_OCT + 2, OCT_1), []);
-    db.wait(crate::store::set_spend_cap(db.db(), "t1", 2, MID_OCT + 1))
+    // A change in the same millisecond as the hold counts.
+    db.wait(crate::store::set_spend_cap(db.db(), "t1", 2, MID_OCT))
         .unwrap();
     assert_eq!(
         billing_candidates(&db, MID_OCT + 2, OCT_1),
@@ -898,7 +899,7 @@ fn a_polar_delivery_after_the_hold_makes_its_tenant_a_candidate() {
     assert_eq!(billing_candidates(&db, MID_OCT + 2, OCT_1), []);
     db.run(
         "UPDATE subscriptions SET updated_at = $1 WHERE id = 's1'",
-        &params![MID_OCT + 1],
+        &params![MID_OCT],
     );
     assert_eq!(billing_candidates(&db, MID_OCT + 2, OCT_1).len(), 1);
 }

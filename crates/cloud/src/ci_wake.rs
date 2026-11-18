@@ -142,7 +142,7 @@ pub struct BillingHolds {
 /// - the tenant has a card (beta, or an active or trialing
 ///   subscription) while a job waits for one;
 /// - Polar sent a subscription, or the owner changed the cap, after the
-///   hold;
+///   hold or in the same millisecond;
 /// - a spend-cap hold is older than the start of its window: the
 ///   calendar month for a tenant with no subscription, or the current
 ///   period rolled forward the way the standing rolls it when the
@@ -160,9 +160,9 @@ const BILLING_CANDIDATES: &str = "SELECT h.tenant_id, \
      HAVING (bool_or(h.held = 'card') AND (t.beta OR EXISTS (SELECT 1 FROM subscriptions s \
          WHERE s.tenant_id = h.tenant_id AND s.status IN ('active', 'trialing')))) \
        OR EXISTS (SELECT 1 FROM subscriptions s \
-         WHERE s.tenant_id = h.tenant_id AND s.updated_at > min(h.updated_at)) \
+         WHERE s.tenant_id = h.tenant_id AND s.updated_at >= min(h.updated_at)) \
        OR EXISTS (SELECT 1 FROM ci_spend_caps c \
-         WHERE c.tenant_id = h.tenant_id AND c.updated_at > min(h.updated_at)) \
+         WHERE c.tenant_id = h.tenant_id AND c.updated_at >= min(h.updated_at)) \
        OR (bool_or(h.held = 'spend_cap') AND ( \
          (NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.tenant_id = h.tenant_id \
              AND s.status IN ('active', 'trialing')) \
