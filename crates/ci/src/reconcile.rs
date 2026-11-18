@@ -1050,6 +1050,12 @@ async fn wake_held(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), 
         let tenants = ci_wake::billing_holds(db, &after, BILLING_TENANTS)
             .await
             .map_err(|e| e.to_string())?;
+        // The last pass stopped at the final tenant: start over now, so
+        // this pass is not spent on an empty page.
+        if checked == 0 && tenants.is_empty() && !after.is_empty() {
+            after.clear();
+            continue;
+        }
         checked += BILLING_TENANTS;
         for tenant in &tenants {
             let holds = billing_reasons(&tenant.reasons);

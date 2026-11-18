@@ -1513,6 +1513,60 @@ fn the_lost_wake_query_wakes_a_group_whose_holder_left_quietly() {
 }
 
 #[test]
+fn a_group_job_with_a_row_that_still_waits_is_not_woken() {
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    let (run, job) = run_with_job_named(&db, "both", "queued");
+    db.wait(hold(db.db(), job, 1, "group", 11)).unwrap();
+    // The run's own group runs, but the job's group still waits behind
+    // another holder: the gate would hold the job again.
+    let slot = |job_id: Option<u64>, attempt: u32, key: &str, state: &str| {
+        db.run(
+            "INSERT INTO ci_concurrency (repo_id, run_id, job_id, attempt, group_key, \
+             group_name, state, created_at) VALUES (7, $1, $2, $3, $4, $4, $5, 10)",
+            &params![run.id, job_id, attempt, key, state],
+        );
+    };
+    slot(None, 1, "run-group", "running");
+    slot(Some(job), 1, "job-group", "pending");
+    let woken = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40))
+        .unwrap();
+    assert_eq!(woken_ids(woken), Vec::<u64>::new());
+    // Once the job's own row runs too, the wake was lost and is sent.
+    db.run(
+        "UPDATE ci_concurrency SET state = 'running' WHERE job_id = $1",
+        &params![job],
+    );
+    let woken = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 101, 40))
+        .unwrap();
+    assert_eq!(woken_ids(woken), [job]);
+}
+
+#[test]
+fn a_left_over_row_of_another_attempt_does_not_keep_a_group_job_waiting() {
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    let (run, job) = run_with_job_named(&db, "rerun", "queued");
+    db.run(
+        "UPDATE ci_jobs SET attempt = 2 WHERE id = $1",
+        &params![job],
+    );
+    db.wait(hold(db.db(), job, 2, "group", 11)).unwrap();
+    db.run(
+        "INSERT INTO ci_concurrency (repo_id, run_id, job_id, attempt, group_key, group_name, \
+         state, created_at) VALUES (7, $1, NULL, 2, 'run-group', 'run-group', 'running', 10), \
+         (7, $1, $2, 1, 'job-group', 'job-group', 'pending', 10)",
+        &params![run.id, job],
+    );
+    let woken = db
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40))
+        .unwrap();
+    assert_eq!(woken_ids(woken), [job]);
+}
+
+#[test]
 fn an_ending_job_wakes_a_capacity_held_job_on_its_template() {
     let db = setup();
     let (_, first) = run_with_job_named(&db, "first", "queued");

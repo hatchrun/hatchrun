@@ -958,10 +958,14 @@ async fn record_failure(env: &Env, db: &Db, job: &JobRow, failure: &Failure) -> 
             if waiting {
                 console_log!("job {}: held, {CAPACITY_HOLD}", job.id);
                 // The job gave back its place in the tenant and its
-                // matrix, which a job held for them waits for.
+                // matrix, which a job held for them waits for. It freed
+                // no EC2 capacity, so no capacity hold is brought
+                // forward: two of them on one template would wake each
+                // other at queue speed.
                 if let Ok(Some(run)) = store::run(db, job.run_id).await {
-                    wake_after_end(env, db, &run.tenant_id, job.id, now).await;
+                    wake_oldest(env, db, &run.tenant_id, now).await;
                 }
+                wake_group(env, db, job.id, now).await;
                 let message = capacity_message(&failure.cause);
                 let answer = post_to_run(env, db, job, "held", &message).await;
                 if !matches!(answer, EndAnswer::Status(200..=299 | 409)) {

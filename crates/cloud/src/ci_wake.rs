@@ -164,7 +164,11 @@ pub async fn billing_holds(db: &Db, after: &str, limit: u32) -> worker::Result<V
 ///   its live siblings minus its marked holds;
 /// - `fork_limit`: per repository, at most the policy's cap (2 by
 ///   default) minus its live fork-run jobs minus its marked holds;
-/// - `group`: whose concurrency row runs and none waits.
+/// - `group`: one of the job's concurrency rows runs and none of them
+///   waits or is still new, as the launch gate reads them (a job's own
+///   row of another attempt is left over and does not count). A job
+///   with a row that still waits would only be held again, and its
+///   recheck would wake it again.
 ///
 /// A row two wakers pick at once is marked once: the update only marks
 /// jobs still unmarked.
@@ -238,8 +242,13 @@ const LOST_WAKES: &str = "WITH candidates AS (\
       WHERE j.status = 'queued' AND j.held = 'group' AND j.next_launch_at IS NULL \
         AND ($1::text IS NULL OR j.tenant_id = $1) \
         AND EXISTS (SELECT 1 FROM ci_concurrency c WHERE c.repo_id = r.repo_id \
-          AND (c.job_id = j.id OR (c.job_id IS NULL AND c.run_id = j.run_id)) \
-          AND c.state = 'running')) \
+          AND ((c.job_id = j.id AND c.attempt = j.attempt) \
+            OR (c.job_id IS NULL AND c.run_id = j.run_id)) \
+          AND c.state = 'running') \
+        AND NOT EXISTS (SELECT 1 FROM ci_concurrency c WHERE c.repo_id = r.repo_id \
+          AND ((c.job_id = j.id AND c.attempt = j.attempt) \
+            OR (c.job_id IS NULL AND c.run_id = j.run_id)) \
+          AND c.state IN ('new', 'pending'))) \
     UPDATE ci_jobs SET next_launch_at = $2 WHERE id IN (\
       SELECT id FROM candidates ORDER BY id LIMIT $4) \
     AND status = 'queued' AND held IN ('concurrency', 'max_parallel', 'fork_limit', 'group') \
