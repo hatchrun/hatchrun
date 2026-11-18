@@ -497,7 +497,7 @@ async fn cap(cx: &Cx<'_>, org: &str, req: &mut Request, max_body: usize) -> Resu
     // order as jobs end. A failure here leaves them to the reconciler's
     // backstop: the cap is saved.
     let now = now_ms();
-    match ci_wake::standing_improved(cx.db, &tenant.id, now).await {
+    match ci_wake::standing_improved(cx.db, &tenant.id, now, None).await {
         Ok(woken) => {
             if let Err(err) = launches::send_wakes(cx.env, &woken).await {
                 console_error!("tenant {}: wake held jobs: {err}", tenant.id);

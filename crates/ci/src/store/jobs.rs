@@ -461,7 +461,7 @@ pub async fn insert_jobs(
              (SELECT tier FROM ci_runs WHERE id = $1), \
              (SELECT created_at FROM ci_runs WHERE id = $1), \
              ${}, ${}, ${}, ${}, ${}::jsonb, ${}::jsonb, ${}, ${}, ${}, ${}::jsonb, \
-             'waiting', $2, $2)",
+             'waiting', $2, $2, (SELECT ci_shard_bucket(repo_id) FROM ci_runs WHERE id = $1))",
             base,
             base + 1,
             base + 2,
@@ -494,7 +494,7 @@ pub async fn insert_jobs(
     let sql = format!(
         "INSERT INTO ci_jobs (run_id, tenant_id, tier, run_created_at, plan_id, name, timeout_minutes, \
          template, token_permissions, secret_refs, environment, strategy_group, max_parallel, \
-         needs, status, created_at, updated_at) \
+         needs, status, created_at, updated_at, bucket) \
          VALUES {} RETURNING plan_id, id",
         values.join(", ")
     );

@@ -27,6 +27,7 @@ mod reconciler;
 mod repos;
 mod runs;
 mod secrets;
+mod shards;
 mod tenants;
 
 pub use self::artifacts::{
@@ -88,8 +89,8 @@ pub use self::pool::{
 };
 pub use self::reconciler::{
     ScheduleRow, StalledCursor, drop_expired_partitions, ensure_partitions, expired_run_partitions,
-    last_minute, lease, mark_purged, replace_schedules, runs_needing_purge, schedules,
-    schedules_after, set_last_minute, set_stalled_cursor, stalled_cursor, stalled_jobs,
+    lease, mark_purged, replace_schedules, runs_needing_purge, schedules, schedules_after,
+    stalled_jobs,
 };
 pub use self::repos::{RepoRow, repo, repo_by_name, upsert_repo};
 pub use self::runs::{
@@ -102,6 +103,11 @@ pub use self::secrets::{
     Owner, Put, SealedRow, SecretItem, StaleRow, VarItem, delete_secret, delete_var, job_var_rows,
     job_vars, mark_used, put_secret, put_var, repo_ids, reseal, sealed_secrets, secret_names,
     stale_secrets, tenant_repos, vars, winners,
+};
+pub use self::shards::{
+    ShardHealth, ensure_shard, schedule_finished, schedule_lease, set_shard_last_minute,
+    set_shard_stalled_cursor, shard_finished, shard_health, shard_last_minute, shard_lease,
+    shard_stalled_cursor,
 };
 pub use self::tenants::{
     CiBilling, TenantRow, has_card, tenant, tenant_by_org_id, tenant_for_installation,

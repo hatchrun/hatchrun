@@ -819,6 +819,7 @@ fn billing_candidates(db: &TestDb, now: u64, month_start: u64) -> Vec<(String, S
         now,
         month_start,
         10,
+        None,
     ))
     .unwrap()
     .into_iter()
@@ -884,6 +885,7 @@ fn a_raised_cap_after_the_hold_makes_its_tenant_a_candidate_until_checked() {
         db.db(),
         "t1",
         MID_OCT + 2,
+        None,
     ))
     .unwrap();
     assert_eq!(billing_candidates(&db, MID_OCT + 3, OCT_1), []);
@@ -905,6 +907,66 @@ fn a_polar_delivery_after_the_hold_makes_its_tenant_a_candidate() {
 }
 
 #[test]
+fn candidates_past_one_pass_are_read_by_the_next() {
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    let (run, job) = run_with_job_named(&db, "first", "queued");
+    // 1001 tenants whose card came back, each with a job still held for
+    // one: one more than a pass reads.
+    db.run(
+        "INSERT INTO tenants (id, org_id, org_login, created_at, updated_at, beta) \
+         SELECT 'b' || lpad(n::text, 4, '0'), 900000 + n, 'org' || n, 0, 0, true \
+         FROM generate_series(1, 1001) n",
+        &[],
+    );
+    db.run(
+        "INSERT INTO ci_jobs (run_id, tenant_id, tier, run_created_at, plan_id, name, status, \
+           timeout_minutes, token_permissions, secret_refs, needs, held, created_at, \
+           updated_at, bucket) \
+         SELECT j.run_id, 'b' || lpad(n::text, 4, '0'), j.tier, j.run_created_at, \
+           'p' || n, 'p' || n, 'queued', 10, j.token_permissions, j.secret_refs, j.needs, \
+           'card', 0, n, j.bucket \
+         FROM generate_series(1, 1001) n, ci_jobs j WHERE j.id = $1",
+        &params![job],
+    );
+    let _ = run;
+    let page = |now: u64| {
+        db.wait(ci_wake::billing_candidates(
+            db.db(),
+            now,
+            OCT_1,
+            crate::reconcile::BILLING_TENANTS_PER_PASS,
+            None,
+        ))
+        .unwrap()
+    };
+    let first = page(MID_OCT);
+    assert_eq!(first.len(), 1_000);
+    // The longest waiting go first, so the last tenant is left over.
+    assert!(first.iter().all(|row| row.tenant_id != "b1001"));
+    // This pass reads them: a card is back, so each would be woken and
+    // its holds turned into concurrency holds.
+    for row in &first {
+        db.wait(ci_wake::standing_improved(
+            db.db(),
+            &row.tenant_id,
+            MID_OCT,
+            None,
+        ))
+        .unwrap();
+    }
+    // The next pass, a minute later, reads the one left over.
+    let second = page(MID_OCT + 60_000);
+    assert_eq!(
+        second
+            .into_iter()
+            .map(|row| row.tenant_id)
+            .collect::<Vec<_>>(),
+        ["b1001"]
+    );
+}
+
+#[test]
 fn a_spend_window_that_turned_makes_its_tenant_a_candidate() {
     let db = setup();
     let (_, capped) = run_with_job_named(&db, "capped", "queued");
@@ -920,6 +982,7 @@ fn a_spend_window_that_turned_makes_its_tenant_a_candidate() {
         db.db(),
         "t1",
         NOV_1 + 1,
+        None,
     ))
     .unwrap();
     assert_eq!(billing_candidates(&db, NOV_1 + 2, NOV_1), []);
@@ -938,7 +1001,7 @@ fn the_lost_wake_query_wakes_room_in_the_tenant() {
     set_held(&db, second, "concurrency", 1);
     // One of five places is free.
     let woken = db
-        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40))
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40, None))
         .unwrap();
     assert_eq!(woken_ids(woken), [first]);
     let marked: Option<u64> = db
@@ -951,12 +1014,12 @@ fn the_lost_wake_query_wakes_room_in_the_tenant() {
     assert_eq!(marked, Some(100));
     // Nothing is free now that the first wake marked its job.
     let none = db
-        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 101, 40))
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 101, 40, None))
         .unwrap();
     assert_eq!(woken_ids(none), Vec::<u64>::new());
     // Another tenant's room does not wake this tenant's jobs.
     let other = db
-        .wait(ci_wake::lost_wakes(db.db(), Some("t2"), 5, 102, 40))
+        .wait(ci_wake::lost_wakes(db.db(), Some("t2"), 5, 102, 40, None))
         .unwrap();
     assert_eq!(woken_ids(other), Vec::<u64>::new());
 }
@@ -971,7 +1034,7 @@ fn the_lost_wake_query_wakes_nothing_when_the_tenant_is_full() {
     let (_, held) = run_with_job_named(&db, "held", "queued");
     set_held(&db, held, "concurrency", 1);
     let none = db
-        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40))
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40, None))
         .unwrap();
     assert_eq!(woken_ids(none), Vec::<u64>::new());
 }
@@ -986,7 +1049,7 @@ fn the_lost_wake_query_skips_holds_no_event_frees() {
     let (_, capped) = run_with_job_named(&db, "s", "queued");
     set_held(&db, capped, "spend_cap", 100);
     let picked = db
-        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 200, 40))
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 200, 40, None))
         .unwrap();
     assert_eq!(woken_ids(picked), Vec::<u64>::new());
 }
@@ -1096,13 +1159,25 @@ fn the_backstop_frees_decided_approval_holds_up_to_the_limit() {
     decide(&db, decided[0], 1);
     decide(&db, decided[1], 1);
     let freed = woken_ids(
-        db.wait(ci_wake::release_orphan_approvals(db.db(), 5_000, 6_000, 1))
-            .unwrap(),
+        db.wait(ci_wake::release_orphan_approvals(
+            db.db(),
+            5_000,
+            6_000,
+            1,
+            None,
+        ))
+        .unwrap(),
     );
     assert_eq!(freed, [decided[0]], "limit of one, oldest first");
     let freed = woken_ids(
-        db.wait(ci_wake::release_orphan_approvals(db.db(), 5_000, 6_000, 10))
-            .unwrap(),
+        db.wait(ci_wake::release_orphan_approvals(
+            db.db(),
+            5_000,
+            6_000,
+            10,
+            None,
+        ))
+        .unwrap(),
     );
     assert_eq!(freed, [decided[1]]);
     assert_eq!(held_of(&db, decided[2]).as_deref(), Some("approval"));
@@ -1151,8 +1226,14 @@ fn the_backstop_frees_approval_holds_without_a_rule() {
     let guarded = held("guarded", "guarded", 100);
     let recent = held("recent", "deleted", 9_000);
     let mut freed = woken_ids(
-        db.wait(ci_wake::release_orphan_approvals(db.db(), 5_000, 6_000, 10))
-            .unwrap(),
+        db.wait(ci_wake::release_orphan_approvals(
+            db.db(),
+            5_000,
+            6_000,
+            10,
+            None,
+        ))
+        .unwrap(),
     );
     freed.sort_unstable();
     assert_eq!(freed, [gone, off]);
@@ -1180,6 +1261,7 @@ fn unwoken_held_jobs_are_not_stalled() {
         .wait(stalled_jobs(
             db.db(),
             10_000_000,
+            None,
             StalledCursor::default(),
             50,
         ))
@@ -1217,7 +1299,13 @@ fn a_woken_held_job_is_stalled_once_its_mark_is_quiet() {
         &params![due, now - 1],
     );
     let rows = db
-        .wait(stalled_jobs(db.db(), now, StalledCursor::default(), 50))
+        .wait(stalled_jobs(
+            db.db(),
+            now,
+            None,
+            StalledCursor::default(),
+            50,
+        ))
         .unwrap();
     assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [woken, due]);
 }
@@ -1491,12 +1579,12 @@ fn the_lost_wake_query_wakes_room_in_a_matrix() {
         .unwrap();
     // One of two places is free.
     let woken = db
-        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40))
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40, None))
         .unwrap();
     assert_eq!(woken_ids(woken), [ids[1]]);
     // The mark took the room: the next job waits for a job to end.
     let none = db
-        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 101, 40))
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 101, 40, None))
         .unwrap();
     assert_eq!(woken_ids(none), Vec::<u64>::new());
 }
@@ -1513,7 +1601,7 @@ fn the_lost_wake_query_wakes_nothing_for_a_full_matrix() {
     db.wait(hold(db.db(), ids[1], 1, "max_parallel", 11))
         .unwrap();
     let none = db
-        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40))
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40, None))
         .unwrap();
     assert_eq!(woken_ids(none), Vec::<u64>::new());
 }
@@ -1571,12 +1659,12 @@ fn the_lost_wake_query_wakes_a_group_whose_holder_left_quietly() {
         "running"
     );
     let woken = db
-        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40))
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40, None))
         .unwrap();
     assert_eq!(woken_ids(woken), [job_b]);
     // Marked already: a second pass wakes nothing.
     let none = db
-        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 101, 40))
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 101, 40, None))
         .unwrap();
     assert_eq!(woken_ids(none), Vec::<u64>::new());
 }
@@ -1599,7 +1687,7 @@ fn a_group_job_with_a_row_that_still_waits_is_not_woken() {
     slot(None, 1, "run-group", "running");
     slot(Some(job), 1, "job-group", "pending");
     let woken = db
-        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40))
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40, None))
         .unwrap();
     assert_eq!(woken_ids(woken), Vec::<u64>::new());
     // Once the job's own row runs too, the wake was lost and is sent.
@@ -1608,7 +1696,7 @@ fn a_group_job_with_a_row_that_still_waits_is_not_woken() {
         &params![job],
     );
     let woken = db
-        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 101, 40))
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 101, 40, None))
         .unwrap();
     assert_eq!(woken_ids(woken), [job]);
 }
@@ -1630,7 +1718,7 @@ fn a_left_over_row_of_another_attempt_does_not_keep_a_group_job_waiting() {
         &params![run.id, job],
     );
     let woken = db
-        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40))
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40, None))
         .unwrap();
     assert_eq!(woken_ids(woken), [job]);
 }
@@ -2119,4 +2207,262 @@ fn cache_scopes_text_parses_to_a_list_or_an_error() {
     );
     assert!(parse_cache_scopes(Some("not json")).is_err());
     assert!(parse_cache_scopes(Some(r#"{"a":1}"#)).is_err());
+}
+
+/// A concurrency-held job of tenant `tenant_id` in repository `repo_id`,
+/// with room to wake: no job of the tenant runs.
+fn held_concurrency_job(db: &TestDb, tenant_id: &str, repo_id: u64, delivery: &str) -> u64 {
+    let run = db
+        .wait(make_run(
+            db.db(),
+            &NewRun {
+                tenant_id: tenant_id.into(),
+                repo_id,
+                ..new_run(delivery, "ci", 1_000)
+            },
+        ))
+        .unwrap()
+        .unwrap();
+    let id = db
+        .wait(insert_jobs(db.db(), run.id, &[new_job("build")], 1_000))
+        .unwrap()[0]
+        .1;
+    db.wait(set_job(db.db(), id, "queued", None, 1_001))
+        .unwrap();
+    set_held(db, id, "concurrency", 1);
+    id
+}
+
+#[test]
+fn the_lost_wake_query_with_a_range_never_leaves_it() {
+    use crate::shard::Shard;
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    db.run(
+        "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
+         VALUES ('t2', 2, 'other', 98, 0, 0)",
+        &[],
+    );
+    db.run(
+        "INSERT INTO ci_repos (id, tenant_id, installation_id, full_name, default_branch, \
+         private, updated_at) VALUES (8, 't2', 98, 'other/app', 'main', false, 1)",
+        &[],
+    );
+    let seven = held_concurrency_job(&db, "t1", 7, "seven");
+    let eight = held_concurrency_job(&db, "t2", 8, "eight");
+    let a = Shard::of_repo(7);
+    let b = Shard::of_repo(8);
+    assert_ne!(a, b);
+    let in_a = db
+        .wait(ci_wake::lost_wakes(
+            db.db(),
+            None,
+            5,
+            100,
+            40,
+            Some(a.range()),
+        ))
+        .unwrap();
+    assert_eq!(woken_ids(in_a), [seven]);
+    let untouched: Option<u64> = db
+        .column(
+            "SELECT next_launch_at AS n FROM ci_jobs WHERE id = $1",
+            &params![eight],
+            "n",
+        )
+        .unwrap();
+    assert_eq!(untouched, None, "the other shard's mark is untouched");
+    let in_b = db
+        .wait(ci_wake::lost_wakes(
+            db.db(),
+            None,
+            5,
+            101,
+            40,
+            Some(b.range()),
+        ))
+        .unwrap();
+    assert_eq!(woken_ids(in_b), [eight]);
+}
+
+#[test]
+fn billing_wakes_with_a_range_stay_inside_it() {
+    use crate::shard::Shard;
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    db.run("UPDATE tenants SET beta = true WHERE id = 't1'", &[]);
+    db.run(
+        "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at, \
+         beta) VALUES ('t2', 2, 'other', 98, 0, 0, true)",
+        &[],
+    );
+    db.run(
+        "INSERT INTO ci_repos (id, tenant_id, installation_id, full_name, default_branch, \
+         private, updated_at) VALUES (8, 't2', 98, 'other/app', 'main', false, 1)",
+        &[],
+    );
+    let (_, seven) = run_with_job_named(&db, "seven", "queued");
+    set_held(&db, seven, "card", MID_OCT);
+    let eight = held_concurrency_job(&db, "t2", 8, "eight");
+    set_held(&db, eight, "card", MID_OCT);
+    let a = Shard::of_repo(7);
+    let b = Shard::of_repo(8);
+    assert_ne!(a, b);
+    let candidates = |db: &TestDb, range: Option<(u16, u16)>| {
+        db.wait(ci_wake::billing_candidates(
+            db.db(),
+            MID_OCT + 1,
+            OCT_1,
+            10,
+            range,
+        ))
+        .unwrap()
+        .into_iter()
+        .map(|row| row.tenant_id)
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(candidates(&db, Some(a.range())), ["t1".to_owned()]);
+    assert_eq!(candidates(&db, Some(b.range())), ["t2".to_owned()]);
+    assert_eq!(candidates(&db, None).len(), 2);
+    db.wait(ci_wake::billing_checked(
+        db.db(),
+        "t1",
+        MID_OCT + 2,
+        Some(a.range()),
+    ))
+    .unwrap();
+    let stamped: u64 = db
+        .column(
+            "SELECT updated_at AS n FROM ci_jobs WHERE id = $1",
+            &params![seven],
+            "n",
+        )
+        .unwrap();
+    assert_eq!(stamped, MID_OCT + 2, "the shard's own row is stamped");
+    let updated: u64 = db
+        .column(
+            "SELECT updated_at AS n FROM ci_jobs WHERE id = $1",
+            &params![eight],
+            "n",
+        )
+        .unwrap();
+    assert_eq!(updated, MID_OCT, "the other shard's row is unstamped");
+    // A beta tenant's card hold stays listed after the check: only a
+    // wake turns it into a concurrency hold. The untouched shard still
+    // lists its own tenant.
+    assert_eq!(candidates(&db, Some(a.range())), ["t1".to_owned()]);
+    assert_eq!(candidates(&db, Some(b.range())), ["t2".to_owned()]);
+}
+
+/// A second repository of tenant `t1`, 9, whose shard is not 7's.
+fn second_repo_of_t1(db: &TestDb) {
+    db.run(
+        "INSERT INTO ci_repos (id, tenant_id, installation_id, full_name, default_branch, \
+         private, updated_at) VALUES (9, 't1', 99, 'acme/other', 'main', false, 1)",
+        &[],
+    );
+    assert_ne!(
+        crate::shard::Shard::of_repo(7),
+        crate::shard::Shard::of_repo(9)
+    );
+}
+
+#[test]
+fn a_tenant_wake_with_a_range_frees_only_its_shards_holds() {
+    use crate::shard::Shard;
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    db.run("UPDATE tenants SET beta = true WHERE id = 't1'", &[]);
+    second_repo_of_t1(&db);
+    let seven = held_concurrency_job(&db, "t1", 7, "seven");
+    let nine = held_concurrency_job(&db, "t1", 9, "nine");
+    set_held(&db, seven, "card", MID_OCT);
+    set_held(&db, nine, "card", MID_OCT);
+    let woken = db
+        .wait(ci_wake::standing_improved(
+            db.db(),
+            "t1",
+            MID_OCT + 1,
+            Some(Shard::of_repo(7).range()),
+        ))
+        .unwrap();
+    assert_eq!(woken_ids(woken), [seven]);
+    assert_eq!(held_of(&db, seven).as_deref(), Some("concurrency"));
+    assert_eq!(
+        held_of(&db, nine).as_deref(),
+        Some("card"),
+        "the other shard's hold is left for its own pass"
+    );
+}
+
+#[test]
+fn orphan_approval_releases_with_a_range_stay_inside_it() {
+    use crate::shard::Shard;
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    second_repo_of_t1(&db);
+    // Neither repository has an environment that asks for approval,
+    // so both holds are orphans.
+    let seven = held_concurrency_job(&db, "t1", 7, "seven");
+    let nine = held_concurrency_job(&db, "t1", 9, "nine");
+    for id in [seven, nine] {
+        db.run(
+            "UPDATE ci_jobs SET held = 'approval', environment = 'gone', updated_at = 100 \
+             WHERE id = $1",
+            &params![id],
+        );
+    }
+    let release = |range: (u16, u16)| {
+        woken_ids(
+            db.wait(ci_wake::release_orphan_approvals(
+                db.db(),
+                5_000,
+                6_000,
+                10,
+                Some(range),
+            ))
+            .unwrap(),
+        )
+    };
+    assert_eq!(release(Shard::of_repo(7).range()), [seven]);
+    assert_eq!(held_of(&db, nine).as_deref(), Some("approval"));
+    assert_eq!(release(Shard::of_repo(9).range()), [nine]);
+    // A row freed already is not freed again.
+    assert_eq!(release(Shard::of_repo(7).range()), [] as [u64; 0]);
+}
+
+#[test]
+fn orphan_fork_approval_releases_with_a_range_stay_inside_it() {
+    use crate::shard::Shard;
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    second_repo_of_t1(&db);
+    let seven = held_concurrency_job(&db, "t1", 7, "seven");
+    let nine = held_concurrency_job(&db, "t1", 9, "nine");
+    for id in [seven, nine] {
+        db.run(
+            "UPDATE ci_jobs SET held = 'fork_approval', updated_at = 100 WHERE id = $1",
+            &params![id],
+        );
+        db.run(
+            "UPDATE ci_runs SET gate_status = 'approved' \
+             WHERE id = (SELECT run_id FROM ci_jobs WHERE id = $1)",
+            &params![id],
+        );
+    }
+    let release = |range: (u16, u16)| {
+        woken_ids(
+            db.wait(ci_wake::release_orphan_fork_approvals(
+                db.db(),
+                5_000,
+                6_000,
+                10,
+                Some(range),
+            ))
+            .unwrap(),
+        )
+    };
+    assert_eq!(release(Shard::of_repo(9).range()), [nine]);
+    assert_eq!(held_of(&db, seven).as_deref(), Some("fork_approval"));
+    assert_eq!(release(Shard::of_repo(7).range()), [seven]);
 }

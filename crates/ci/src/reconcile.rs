@@ -3,43 +3,52 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The reconciler, which the Cron Trigger runs every minute under a
-//! lease on `ci_reconciler` (see [`run`]). A pass does nine things, in
-//! order, and an error in one is logged and does not stop the next:
+//! lease on `ci_reconciler` (see [`run`]).
 //!
-//! 1. fires the `on: schedule` workflows of the minutes since the last
-//!    pass;
-//! 2. sends the launches that stalled again, and fails the ones that
-//!    never finished, and sends the cancel of a superseded run again;
-//! 3. fails the jobs whose runner went quiet;
-//! 4. fails the stored webhook deliveries past their claims and
-//!    resends, and sends the ones that no consumer planned, or whose
-//!    claim ran out, to the queue again;
-//! 5. terminates instances that no job needs;
-//! 6. keeps the warm pool of each runner template at the size the last
-//!    hour's claims ask for ([`crate::pool`]);
-//! 7. purges the objects of expired runs and drops their month
-//!    partitions, and deletes the cache entries nobody restored for 7
-//!    days;
-//! 8. sends metered usage to Polar;
-//! 9. re-seals secrets that an old key still seals.
+//! A pass has a global half and a sharded half. The cron pass takes the
+//! global lease and fans one message per shard out to the
+//! `hatchrun-ci-reconcile` queue: a [`Work::Pass`](crate::shard::Work)
+//! message per shard at once, and a
+//! [`Work::Schedule`](crate::shard::Work) message per shard jittered
+//! over [`JITTER_SECS`](crate::shard::JITTER_SECS). Each message's shard
+//! then runs alone: [`shard_pass`] fixes its buckets' stalled jobs and
+//! wakes its buckets' held jobs, and [`schedule_pass`](crate::scheduler::schedule_pass)
+//! fires its buckets' schedules. The cron pass itself runs only the
+//! global steps, in order, and an error in one is logged and does not
+//! stop the next:
+//!
+//! 1. fork approvals nobody decided, expired after seven days, and the
+//!    approval of deferred runs that a freed slot admits (see
+//!    [`crate::fork::sweep`]);
+//! 2. the cancel of a superseded run, sent again;
+//! 3. the stored webhook deliveries past their claims and resends;
+//! 4. instances that no job needs;
+//! 5. the warm pool of each runner template (see [`crate::pool`]);
+//! 6. the objects of expired runs and their month partitions, and the
+//!    cache entries nobody restored for 7 days;
+//! 7. metered usage to Polar;
+//! 8. re-sealed secrets that an old key still seals.
 //!
 //! Then the pass is added to the history in `ci_reconciler` and the
 //! alerts are checked (see [`crate::alerts`]).
 //!
 //! Each step decides over rows and the clock with a pure function
-//! ([`minutes`], [`fires`], [`stalled`], [`orphans`]) and then acts.
+//! ([`stalled`], [`orphans`], [`shard_errors`]) and then acts.
 //!
 //! A pass is bounded so it stays inside the Worker's CPU time and
-//! subrequest limits. It counts the outbound calls it makes (GitHub,
-//! run objects, queue, AWS, Polar) against [`BUDGET`], split by
-//! [`shares`]: 1/40 for evicting cache entries, then 5/9 of the rest
-//! (at most 500) for schedules, then of the rest 3/8 for stalled
-//! jobs, 1/8 each for orphans and the warm pool, 1/16 each for usage and
-//! re-sealing, and the remainder (100 at [`BUDGET`]) for retention. A step whose share runs out stops and resumes in the next
-//! pass. Rows and runs are bounded too: [`MAX_MINUTES`] minutes,
-//! [`MAX_FIXES`] stalled jobs,
-//! [`MAX_TERMINATIONS`] terminated instances. Scheduled runs past
-//! [`MAX_FIRES`] started in one pass are skipped and logged.
+//! subrequest limits. The cron pass counts the outbound calls it makes
+//! against [`BUDGET`], split by step: [`ORPHANS_BUDGET`] for orphans,
+//! [`POOL_BUDGET`] for the warm pool, [`RETENTION_BUDGET`] for
+//! retention, [`CACHE_BUDGET`] for evicting cache entries,
+//! [`USAGE_BUDGET`] for usage and [`RESEAL_BUDGET`] for re-sealing. A
+//! shard's pass spends [`STALLED_TOTAL`] / [`SHARDS`] on stalled jobs,
+//! [`HELD_TOTAL`] / [`SHARDS`] on held jobs, and its schedule pass
+//! [`SCHEDULE_TOTAL`] / [`SHARDS`] on schedules. A step whose share
+//! runs out stops and resumes in the next pass. Rows and runs are
+//! bounded too: [`MAX_MINUTES`](crate::scheduler::MAX_MINUTES) minutes,
+//! [`MAX_FIXES`] stalled jobs, [`MAX_TERMINATIONS`] terminated
+//! instances. Scheduled runs past [`MAX_FIRES`](crate::scheduler::MAX_FIRES)
+//! one shard's pass starts are skipped and logged.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -56,9 +65,11 @@ use hatchrun_cloud::tokens::{App, Kv, Tokens};
 use hatchrun_scaler_core::pool::{Backoff, Pool};
 use hatchrun_scaler_core::{Action, Instance, PoolInstance, PoolState};
 use hatchrun_workflow::templates::TEMPLATES;
-use hatchrun_workflow::{Cron, Event, MAX_RUNNING_JOBS, Template, UtcMinute};
-use serde_json::json;
-use worker::{Env, Method, RequestInit, console_error, console_log};
+use hatchrun_workflow::{MAX_RUNNING_JOBS, Template};
+use serde_json::Value;
+use worker::{
+    Env, MessageBatch, MessageBuilder, MessageExt, Method, RequestInit, console_error, console_log,
+};
 
 use crate::alerts;
 use crate::billing;
@@ -66,29 +77,33 @@ use crate::cache;
 use crate::concurrency;
 use crate::deliveries::{self, DeliveryMessage};
 use crate::env::{Settings, run_stub};
-use crate::intake::Repo;
 use crate::launcher::Backend;
 use crate::launches::{self, EndAction, LaunchMessage};
 use crate::pool::{self, WINDOW_MS, pool_target};
 use crate::run::{LAUNCHES, TIMEOUT_GRACE_MS};
-use crate::runs::{self, Config};
+use crate::scheduler::schedule_pass;
 use crate::secrets;
-use crate::store::{self, CiBilling, JobRow, PoolRow, ScheduleRow, StalledCursor};
+use crate::shard::{self, SHARDS, Shard, ShardMessage, Work, schedule_delay};
+use crate::store::{self, JobRow, PoolRow, ShardHealth, StalledCursor};
 
-/// How long the lease holds, in milliseconds.
-const LEASE_MS: u64 = 55_000;
-/// The most schedule minutes one pass fires.
-pub const MAX_MINUTES: usize = 5;
-/// The most scheduled runs one pass starts.
-pub const MAX_FIRES: usize = 200;
-/// The schedule rows read in one query; a pass reads as many pages as it
-/// needs.
-pub const SCHEDULE_ROWS: u32 = 1_000;
-/// The most stalled jobs one pass handles.
-pub const MAX_FIXES: u32 = 50;
-/// The subrequests the held-job backstop may spend in the passes that
-/// run it, on top of [`BUDGET`] and apart from the stalled-job share.
-pub const HELD_BUDGET: u32 = 40;
+/// How long the lease holds, in milliseconds. The cron pass and every
+/// shard's passes hold theirs this long.
+pub(crate) const LEASE_MS: u64 = 55_000;
+/// How long after it starts a shard's pass or schedule pass stops
+/// taking new work, in milliseconds, so it ends inside its lease
+/// ([`LEASE_MS`]) and the shard's next pass does not overlap it.
+pub const PASS_DEADLINE_MS: u64 = 45_000;
+/// The queue the cron pass fans the shards' messages out to, in
+/// `wrangler.toml`.
+pub const QUEUE: &str = "hatchrun-ci-reconcile";
+/// The producer binding of [`QUEUE`] in `wrangler.toml`.
+pub const BINDING: &str = "CI_RECONCILE";
+/// The most stalled jobs one shard's pass handles.
+pub const MAX_FIXES: u32 = FIXES_TOTAL / (SHARDS as u32);
+/// The subrequests one shard's held-job backstop may spend in a pass:
+/// its share of [`HELD_TOTAL`]. Apart from the stalled-job share, and
+/// inside the Worker's headroom below its limit.
+pub const HELD_BUDGET: u32 = HELD_TOTAL / (SHARDS as u32);
 /// The backstop runs in the passes of every 15th minute.
 const HELD_EVERY_MINUTES: u64 = 15;
 /// The backstop frees an approval hold nobody decided or released for
@@ -117,57 +132,49 @@ const LAUNCH_DID_NOT_FINISH: &str = "the launch did not finish";
 const RUNNER_DID_NOT_START: &str = "the runner did not start";
 const TIMED_OUT: &str = "the job ran past its timeout";
 
-/// The subrequests one pass plans to make, below the Worker's limit of
-/// 1000 so that DNS, KV and Postgres setup have room.
+/// The subrequests the cron pass plans to make, below the Worker's
+/// limit of 1000 so that DNS, KV and Postgres setup have room.
 pub const BUDGET: u32 = 900;
 
-/// What each step of a pass may spend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Shares {
-    /// Schedules.
-    pub schedules: u32,
-    /// Stalled launches and lost runners.
-    pub stalled: u32,
-    /// Orphan instances.
-    pub orphans: u32,
-    /// The warm pool.
-    pub pool: u32,
-    /// Usage sent to Polar.
-    pub usage: u32,
-    /// Re-sealing secrets under the current key.
-    pub reseal: u32,
-    /// Retention.
-    pub retention: u32,
-    /// Evicting job cache entries.
-    pub cache: u32,
-}
+/// What all the shards' stalled-job steps may spend in a pass, split
+/// evenly over the shards.
+pub const STALLED_TOTAL: u32 = 2_400;
+/// What all the shards' schedule steps may spend in a pass, split
+/// evenly over the shards.
+pub const SCHEDULE_TOTAL: u32 = 3_200;
+/// What all the shards' stalled-job fixes may handle in a pass, split
+/// evenly over the shards.
+pub const FIXES_TOTAL: u32 = 800;
+/// What all the shards' held-job backstops may spend in a pass, split
+/// evenly over the shards.
+pub const HELD_TOTAL: u32 = 640;
+/// What all the shards' schedule steps may start in a pass, split
+/// evenly over the shards.
+pub const FIRES_TOTAL: u32 = 800;
+const _: () = assert!(
+    STALLED_TOTAL.is_multiple_of(SHARDS as u32)
+        && SCHEDULE_TOTAL.is_multiple_of(SHARDS as u32)
+        && FIXES_TOTAL.is_multiple_of(SHARDS as u32)
+        && HELD_TOTAL.is_multiple_of(SHARDS as u32)
+        && FIRES_TOTAL.is_multiple_of(SHARDS as u32)
+);
 
-/// Splits `total`: cache eviction takes 1/40 of it. Of the remainder
-/// schedules take 5/9, at most 500. Of the rest stalled jobs take 3/8, orphans and the pool 1/8 each, usage and
-/// re-sealing 1/16 each, rounded down, and retention the remainder.
-/// Schedules cannot take what the other steps need.
-#[must_use]
-pub fn shares(total: u32) -> Shares {
-    let cache = total / 40;
-    let total = total - cache;
-    let schedules = (total / 9 * 5).min(500);
-    let rest = total - schedules;
-    let stalled = rest / 8 * 3 + rest % 8 * 3 / 8;
-    let orphans = rest / 8;
-    let pool = rest / 8;
-    let usage = rest / 16;
-    let reseal = rest / 16;
-    Shares {
-        schedules,
-        stalled,
-        orphans,
-        pool,
-        usage,
-        reseal,
-        retention: rest - stalled - orphans - pool - usage - reseal,
-        cache,
-    }
-}
+/// What the cron pass's orphan step may spend.
+pub const ORPHANS_BUDGET: u32 = 100;
+/// What the cron pass's warm pool step may spend.
+pub const POOL_BUDGET: u32 = 100;
+/// What the cron pass's retention step may spend.
+pub const RETENTION_BUDGET: u32 = 200;
+/// What the cron pass's cache eviction step may spend.
+pub const CACHE_BUDGET: u32 = 100;
+/// What the cron pass's usage step may spend.
+pub const USAGE_BUDGET: u32 = 100;
+/// What the cron pass's re-seal step may spend.
+pub const RESEAL_BUDGET: u32 = 100;
+const _: () = assert!(
+    ORPHANS_BUDGET + POOL_BUDGET + RETENTION_BUDGET + CACHE_BUDGET + USAGE_BUDGET + RESEAL_BUDGET
+        <= BUDGET
+);
 
 /// What a step has left to spend.
 #[derive(Debug)]
@@ -198,12 +205,6 @@ impl Budget {
     }
 }
 
-/// Subrequests of reading a repository's head and config: a token (its
-/// cache and GitHub), the commit and the file.
-const HEAD_COST: u32 = 4;
-/// Of starting a run: its object, and the two GitHub calls of a config
-/// report.
-const START_COST: u32 = 3;
 /// Of ending a job: its object.
 const FAIL_COST: u32 = 1;
 /// Of sending a launch message.
@@ -351,106 +352,14 @@ pub fn orphans(described: &[Described], rows: &[JobRow], now: u64) -> Vec<String
         .collect()
 }
 
-/// The schedule minutes to fire at `now`, as Unix milliseconds at the
-/// start of each minute, oldest first: those after `last` up to the
-/// current one, the latest [`MAX_MINUTES`] of them. Without a `last`
-/// only the current minute fires.
-#[must_use]
-pub fn minutes(last: Option<u64>, now: u64) -> Vec<u64> {
-    let current = now / 60_000 * 60_000;
-    let first = match last {
-        Some(last) => (last / 60_000 + 1) * 60_000,
-        None => current,
-    };
-    let from = first.max(current.saturating_sub(60_000 * (MAX_MINUTES as u64 - 1)));
-    (from..=current).step_by(60_000).collect()
-}
-
-/// One schedule firing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Fire {
-    /// GitHub's repository id.
-    pub repo_id: u64,
-    /// The workflow's file name.
-    pub workflow: String,
-    /// The cron expression that matched.
-    pub cron: String,
-    /// The minute, in Unix milliseconds.
-    pub minute_ms: u64,
-}
-
-impl Fire {
-    /// The delivery key of the run it starts: one run per workflow and
-    /// minute, however often the pass repeats.
-    #[must_use]
-    pub fn delivery(&self) -> String {
-        format!(
-            "schedule:{}:{}:{}:{}",
-            self.repo_id, self.workflow, self.cron, self.minute_ms
-        )
-    }
-}
-
-/// The firings of `schedules` in `minutes`, oldest minute first. A cron
-/// that does not parse never fires. The cap of [`MAX_FIRES`] is not
-/// applied here: a firing whose run already exists costs nothing, so
-/// [`FireCap`] counts the ones that start a run.
-#[must_use]
-pub fn fires(schedules: &[ScheduleRow], minutes: &[u64]) -> Vec<Fire> {
-    let parsed: Vec<(&ScheduleRow, Cron)> = schedules
-        .iter()
-        .filter_map(|row| Some((row, Cron::parse(&row.cron).ok()?)))
-        .collect();
-    let mut fired = Vec::new();
-    for &minute_ms in minutes {
-        let at = UtcMinute::from_unix(minute_ms / 1000);
-        for (row, cron) in &parsed {
-            if !cron.matches(&at) {
-                continue;
-            }
-            fired.push(Fire {
-                repo_id: row.repo_id,
-                workflow: row.workflow.clone(),
-                cron: row.cron.clone(),
-                minute_ms,
-            });
-        }
-    }
-    fired
-}
-
-/// Counts the firings of one pass that start a run, against
-/// [`MAX_FIRES`]. A firing whose run an earlier pass made, or whose
-/// repository has no head, takes no slot. A start that fails is: the
-/// attempt was made and paid for.
-#[derive(Default)]
-struct FireCap {
-    started: usize,
-    skipped: usize,
-}
-
-impl FireCap {
-    /// Counts a firing that is about to start a run.
-    fn start(&mut self) {
-        self.started += 1;
-    }
-
-    /// Counts `n` firings left unchecked because the cap is full. Some
-    /// of them may already have their run, so this is an upper bound.
-    fn skip(&mut self, n: usize) {
-        self.skipped += n;
-    }
-
-    fn full(&self) -> bool {
-        self.started >= MAX_FIRES
-    }
-}
-
 fn now_ms() -> u64 {
     worker::Date::now().as_millis()
 }
 
-/// One reconciler pass. Skipped when an earlier pass holds the lease.
+/// One reconciler pass. Takes the global lease, fans one pass message
+/// and one schedule message per shard out to the queue, runs the
+/// global steps, and checks the alerts over the pass's errors and the
+/// shards' health. Skipped when an earlier pass holds the lease.
 pub async fn run(env: Env) {
     let db = match Db::connect(&env).await {
         Ok(db) => db,
@@ -500,22 +409,11 @@ async fn steps(env: &Env, db: &Db, now: u64) -> u32 {
             return 1;
         }
     };
-    let share = shares(BUDGET);
+    if let Err(err) = fan_out(env, now).await {
+        console_error!("reconcile: fan out: {err}");
+        errors += 1;
+    }
     let github = Counted::default();
-    tally(
-        &mut errors,
-        "schedules",
-        fire_schedules(
-            env,
-            db,
-            &settings,
-            &github,
-            &Budget::new(share.schedules),
-            now,
-        )
-        .await,
-    );
-    alerts::note_rate_limits(db, &github, now).await;
     let backend = Backend::new(&settings).await;
     if let Err(err) = &backend {
         console_error!("reconcile: no launcher backend: {err}");
@@ -523,27 +421,10 @@ async fn steps(env: &Env, db: &Db, now: u64) -> u32 {
     }
     tally(
         &mut errors,
-        "stalled jobs",
-        fix_stalled(
-            env,
-            db,
-            backend.as_ref().ok(),
-            &Budget::new(share.stalled),
-            now,
-        )
-        .await,
-    );
-    if held_backstop_due(now)
-        && let Err(err) = wake_held(env, db, &Budget::new(HELD_BUDGET), now).await
-    {
-        console_error!("reconcile: held jobs: {err}");
-        errors += 1;
-    }
-    tally(
-        &mut errors,
         "fork approvals",
         fork_approvals(env, db, &settings, &github, now).await,
     );
+    alerts::note_rate_limits(db, &github, now).await;
     let cancels = Budget::new(MAX_RECANCELS);
     tally(
         &mut errors,
@@ -558,7 +439,7 @@ async fn steps(env: &Env, db: &Db, now: u64) -> u32 {
         resend_deliveries(env, db, &Budget::new(DELIVERY_RESENDS), now).await,
     );
     if let Ok(backend) = &backend
-        && let Err(err) = end_orphans(db, backend, &Budget::new(share.orphans), now).await
+        && let Err(err) = end_orphans(db, backend, &Budget::new(ORPHANS_BUDGET), now).await
     {
         console_error!("reconcile: orphans: {err}");
         errors += 1;
@@ -567,28 +448,225 @@ async fn steps(env: &Env, db: &Db, now: u64) -> u32 {
         tally(
             &mut errors,
             "warm pool",
-            keep_pool(db, backend, &Budget::new(share.pool), now).await,
+            keep_pool(db, backend, &Budget::new(POOL_BUDGET), now).await,
         );
     }
     tally(
         &mut errors,
         "retention",
-        retain(env, db, &Budget::new(share.retention), now).await,
+        retain(env, db, &Budget::new(RETENTION_BUDGET), now).await,
     );
-    if let Err(err) = evict_cache(&settings, db, &Budget::new(share.cache), now).await {
+    if let Err(err) = evict_cache(&settings, db, &Budget::new(CACHE_BUDGET), now).await {
         console_error!("reconcile: cache eviction: {err}");
         errors += 1;
     }
-    if let Err(err) = report_usage(db, &settings, &Budget::new(share.usage), now).await {
+    if let Err(err) = report_usage(db, &settings, &Budget::new(USAGE_BUDGET), now).await {
         console_error!("reconcile: usage: {err}");
         errors += 1;
     }
     tally(
         &mut errors,
         "reseal",
-        reseal_secrets(env, db, &Budget::new(share.reseal)).await,
+        reseal_secrets(env, db, &Budget::new(RESEAL_BUDGET)).await,
     );
+    match store::shard_health(db).await {
+        Ok(health) => errors += shard_errors(&health, now),
+        Err(err) => {
+            console_error!("reconcile: shard health: {err}");
+            errors += 1;
+        }
+    }
     errors
+}
+
+/// Sends the shards' work for this pass: one pass message and one
+/// schedule message per shard. The schedule messages wait their shard's
+/// share of the jitter, so the schedule passes spread over the minute.
+/// A failed send counts one error with the caller.
+async fn fan_out(env: &Env, now: u64) -> Result<(), String> {
+    let queue = env.queue(BINDING).map_err(|e| e.to_string())?;
+    let minute_ms = now / 60_000 * 60_000;
+    let mut messages = Vec::with_capacity(2 * usize::from(SHARDS));
+    for shard in Shard::all() {
+        messages.push(
+            MessageBuilder::new(ShardMessage {
+                kind: Work::Pass,
+                shard: shard.index(),
+                shards: SHARDS,
+                minute_ms,
+            })
+            .build(),
+        );
+    }
+    for shard in Shard::all() {
+        messages.push(
+            MessageBuilder::new(ShardMessage {
+                kind: Work::Schedule,
+                shard: shard.index(),
+                shards: SHARDS,
+                minute_ms,
+            })
+            .delay_seconds(schedule_delay(shard))
+            .build(),
+        );
+    }
+    queue.send_batch(messages).await.map_err(|e| e.to_string())
+}
+
+/// One shard's pass message at `now`: fixes the shard's buckets'
+/// stalled jobs and wakes its buckets' held jobs, then records the
+/// finish. Skipped when an earlier pass holds the shard's lease. A pass
+/// stops taking new stalled fixes or billing tenants after
+/// [`PASS_DEADLINE_MS`]; what is already taken finishes.
+pub async fn shard_pass(env: &Env, shard: Shard, now: u64) {
+    let db = match Db::connect(env).await {
+        Ok(db) => db,
+        Err(err) => {
+            console_error!("reconcile: database: {err}");
+            return;
+        }
+    };
+    let first = shard.first_bucket();
+    if let Err(err) = store::ensure_shard(&db, first).await {
+        console_error!("reconcile: ensure shard {}: {err}", shard.index());
+        return;
+    }
+    match store::shard_lease(&db, first, now, now + LEASE_MS).await {
+        Ok(true) => {}
+        Ok(false) => {
+            console_log!(
+                "reconcile: skipped, an earlier pass holds the lease of shard {}",
+                shard.index()
+            );
+            return;
+        }
+        Err(err) => {
+            console_error!("reconcile: lease of shard {}: {err}", shard.index());
+            return;
+        }
+    }
+    let mut errors = 0;
+    let deadline = now + PASS_DEADLINE_MS;
+    let settings = match Settings::read(env) {
+        Ok(settings) => settings,
+        Err(err) => {
+            console_error!("reconcile: {err}");
+            errors += 1;
+            if let Err(err) = store::shard_finished(&db, first, now_ms(), errors).await {
+                console_error!("reconcile: finish of shard {}: {err}", shard.index());
+            }
+            return;
+        }
+    };
+    let backend = Backend::new(&settings).await;
+    if let Err(err) = &backend {
+        console_error!("reconcile: no launcher backend: {err}");
+        errors += 1;
+    }
+    tally(
+        &mut errors,
+        "stalled jobs",
+        fix_stalled(
+            env,
+            &db,
+            backend.as_ref().ok(),
+            &Budget::new(STALLED_TOTAL / u32::from(SHARDS)),
+            now,
+            shard,
+            deadline,
+        )
+        .await,
+    );
+    if let Err(err) = wake_held(env, &db, &Budget::new(HELD_BUDGET), now, shard, deadline).await {
+        console_error!("reconcile: held jobs of shard {}: {err}", shard.index());
+        errors += 1;
+    }
+    if let Err(err) = store::shard_finished(&db, first, now_ms(), errors).await {
+        console_error!("reconcile: finish of shard {}: {err}", shard.index());
+    }
+}
+
+/// How long a shard may go without a finished pass before it counts
+/// as stopped.
+const SHARD_STALE_MS: u64 = 5 * 60_000;
+/// How recent a shard's finished pass is for its errors to count.
+const SHARD_RECENT_MS: u64 = 2 * 60_000;
+
+/// How many errors the shards' health adds to the pass. Only the
+/// current [`SHARDS`] count: rows left by an older shard count are
+/// ignored. A shard with no row counts one. Each of its two passes
+/// (stalled and held jobs, schedules) counts one when it never
+/// finished or finished over five minutes ago, and its failed items
+/// when it finished within the last two minutes.
+#[must_use]
+pub fn shard_errors(health: &[ShardHealth], now: u64) -> u32 {
+    let pass = |finished_at: Option<u64>, errors: i32| -> u32 {
+        match finished_at {
+            Some(at) if at.saturating_add(SHARD_STALE_MS) >= now => {
+                if at.saturating_add(SHARD_RECENT_MS) >= now {
+                    u32::try_from(errors).unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            _ => 1,
+        }
+    };
+    Shard::all()
+        .map(|shard| {
+            match health
+                .iter()
+                .find(|row| row.first_bucket == shard.first_bucket())
+            {
+                None => 1,
+                Some(row) => pass(row.finished_at, row.errors)
+                    .saturating_add(pass(row.schedule_finished_at, row.schedule_errors)),
+            }
+        })
+        .fold(0u32, u32::saturating_add)
+}
+
+/// The consumer of `hatchrun-ci-reconcile`: runs each message's shard
+/// and pass, acking every message regardless of outcome. A message
+/// that does not read, or that another fan-out's count or an old minute
+/// sent, is logged and acked.
+pub async fn consume(batch: MessageBatch<Value>, env: Env) {
+    let messages = match batch.messages() {
+        Ok(messages) => messages,
+        Err(err) => {
+            console_error!("reconcile queue: unreadable batch: {err}");
+            batch.ack_all();
+            return;
+        }
+    };
+    for message in &messages {
+        let shard = match serde_json::from_value::<ShardMessage>(message.body().clone()) {
+            Ok(shard) => shard,
+            Err(err) => {
+                console_error!(
+                    "reconcile queue: unreadable message {}: {err}",
+                    message.id()
+                );
+                message.ack();
+                continue;
+            }
+        };
+        if !shard::accept(&shard, now_ms()) {
+            console_error!(
+                "reconcile queue: refusing shard {} of {} from minute {}",
+                shard.shard,
+                shard.shards,
+                shard.minute_ms
+            );
+            message.ack();
+            continue;
+        }
+        match shard.kind {
+            Work::Pass => shard_pass(&env, Shard::new(shard.shard), now_ms()).await,
+            Work::Schedule => schedule_pass(&env, Shard::new(shard.shard), now_ms()).await,
+        }
+        message.ack();
+    }
 }
 
 /// Expires the fork runs nobody approved in seven days and asks for the
@@ -614,241 +692,6 @@ async fn fork_approvals(
     crate::fork::sweep(env, db, settings, &tokens, now).await
 }
 
-/// A repository ready to start scheduled runs: where it is now, the
-/// head of its default branch and the config there.
-struct Head {
-    repo: Repo,
-    tenant_id: String,
-    installation_id: u64,
-    git_ref: String,
-    sha: String,
-    config: Config,
-}
-
-/// Step 1. Returns how many repositories and fires failed. Schedules are read [`SCHEDULE_ROWS`] at a time until none are
-/// left. When `budget` runs out the pass stops before the first fire it
-/// cannot pay for; the next pass starts again from that minute (from the
-/// oldest one when schedules were left unread), and the runs already
-/// made are skipped without cost.
-async fn fire_schedules(
-    env: &Env,
-    db: &Db,
-    settings: &Settings,
-    github: &Counted,
-    budget: &Budget,
-    now: u64,
-) -> Result<u32, String> {
-    let last = store::last_minute(db).await.map_err(|e| e.to_string())?;
-    let due = minutes(last, now);
-    let Some(&newest) = due.last() else {
-        return Ok(0);
-    };
-    let mut failed = 0;
-    let tokens = Tokens::new(
-        Kv::new(env),
-        App::new(
-            settings.github_api.clone(),
-            settings.app_id.clone(),
-            settings.app_key.clone(),
-        ),
-        github,
-        now,
-    );
-    // The repository, its head and its config are read once per pass.
-    let mut heads: HashMap<u64, Option<Head>> = HashMap::new();
-    let mut stopped_at = None;
-    let mut cap = FireCap::default();
-    let mut cursor: Option<ScheduleRow> = None;
-    // Schedules are read a page at a time, in key order after the last
-    // row of the page before.
-    'pages: loop {
-        let rows = store::schedules_after(db, cursor.as_ref(), SCHEDULE_ROWS)
-            .await
-            .map_err(|e| e.to_string())?;
-        let last_page = rows.len() < SCHEDULE_ROWS as usize;
-        cursor = rows.last().cloned();
-        let page = fires(&rows, &due);
-        for (i, fire) in page.iter().enumerate() {
-            // Once the cap is full the rest of the page starts nothing,
-            // so it is counted as skipped without looking up its runs.
-            if cap.full() {
-                cap.skip(page.len() - i);
-                break;
-            }
-            let made = store::run_for_delivery(db, &fire.delivery(), &fire.workflow)
-                .await
-                .map_err(|e| e.to_string())?;
-            if made.is_some_and(|run| run.status != "queued") {
-                continue;
-            }
-            // Pages not read yet have fired no minute, so the pass
-            // resumes at the oldest one.
-            let resume = if last_page { fire.minute_ms } else { due[0] };
-            if let std::collections::hash_map::Entry::Vacant(slot) = heads.entry(fire.repo_id) {
-                if !budget.take(HEAD_COST) {
-                    stopped_at = Some(resume);
-                    break 'pages;
-                }
-                let head = match head(db, settings, &tokens, fire.repo_id).await {
-                    Ok(head) => head,
-                    Err(err) => {
-                        console_error!("reconcile: repository {}: {err}", fire.repo_id);
-                        failed += 1;
-                        None
-                    }
-                };
-                slot.insert(head);
-            }
-            let Some(Some(head)) = heads.get(&fire.repo_id) else {
-                continue;
-            };
-            if !budget.take(START_COST) {
-                stopped_at = Some(resume);
-                break 'pages;
-            }
-            // A slot is used only here, by a firing that gets to start.
-            cap.start();
-            if let Err(err) = start(env, db, settings, &tokens, head, fire, now).await {
-                console_error!(
-                    "reconcile: schedule {} of {}: {err}",
-                    fire.cron,
-                    head.repo.full_name
-                );
-                failed += 1;
-            }
-        }
-        if last_page {
-            break;
-        }
-        if cap.full() {
-            console_error!(
-                "reconcile: schedules past the limit of {MAX_FIRES} scheduled runs skipped"
-            );
-            break;
-        }
-    }
-    if cap.skipped > 0 {
-        console_error!(
-            "reconcile: up to {} scheduled runs over the limit of {MAX_FIRES} skipped",
-            cap.skipped
-        );
-    }
-    let done = match stopped_at {
-        Some(minute) => {
-            console_error!("reconcile: schedule budget spent, resuming at minute {minute}");
-            minute - 60_000
-        }
-        None => newest,
-    };
-    store::set_last_minute(db, done)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(failed)
-}
-
-/// The head of repository `repo_id`'s default branch, under the tenant
-/// that owns the repository now (a transfer leaves old schedules
-/// behind). `None` when the repository or its tenant is gone.
-async fn head(
-    db: &Db,
-    settings: &Settings,
-    tokens: &Tokens<'_, Kv, App, Counted>,
-    repo_id: u64,
-) -> Result<Option<Head>, String> {
-    let Some(row) = store::repo(db, repo_id).await.map_err(|e| e.to_string())? else {
-        return Ok(None);
-    };
-    match store::tenant(db, &row.tenant_id)
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        Some(tenant) if tenant.ci_billing == CiBilling::Active => {}
-        _ => return Ok(None),
-    }
-    // A repository that is not enabled starts no scheduled runs.
-    if !store::repo_enabled(db, &row.tenant_id, row.id)
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        return Ok(None);
-    }
-    let repo = Repo {
-        id: row.id,
-        full_name: row.full_name,
-        default_branch: row.default_branch,
-        private: row.private,
-    };
-    let Some((sha, config)) = runs::default_head(tokens, settings, row.installation_id, &repo)
-        .await
-        .map_err(|e| e.to_string())?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(Head {
-        git_ref: format!("refs/heads/{}", repo.default_branch),
-        repo,
-        tenant_id: row.tenant_id,
-        installation_id: row.installation_id,
-        sha,
-        config,
-    }))
-}
-
-/// Starts the workflow for one due schedule fire at the given head and logs the runs it created.
-async fn start(
-    env: &Env,
-    db: &Db,
-    settings: &Settings,
-    tokens: &Tokens<'_, Kv, App, Counted>,
-    head: &Head,
-    fire: &Fire,
-    now: u64,
-) -> Result<(), String> {
-    let payload = json!({
-        "schedule": fire.cron,
-        "repository": { "full_name": head.repo.full_name },
-    });
-    let trigger = Event::Schedule {
-        cron: fire.cron.clone(),
-    };
-    let delivery = fire.delivery();
-    let ids = runs::create(
-        env,
-        db,
-        settings,
-        tokens,
-        &runs::Request {
-            tenant_id: &head.tenant_id,
-            installation_id: head.installation_id,
-            repo: &head.repo,
-            delivery: &delivery,
-            event_name: "schedule",
-            event: &payload,
-            trigger: &trigger,
-            compile_ref: &head.git_ref,
-            git_ref: &head.git_ref,
-            sha: &head.sha,
-            actor: "schedule",
-            head_ref: "",
-            base_ref: "",
-            workflows: Some(std::slice::from_ref(&fire.workflow)),
-            origin: runs::Origin::own("schedule"),
-        },
-        &head.config,
-        now,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    if !ids.is_empty() {
-        console_log!(
-            "reconcile: {} {}: started runs {ids:?}",
-            head.repo.full_name,
-            fire.cron
-        );
-    }
-    Ok(())
-}
-
 /// The stalled rows one pass handles, at most `limit`: those after the
 /// last pass's cursor first, then from the start once they run short.
 /// Jobs whose object keeps failing to answer take their turn, so they
@@ -868,8 +711,9 @@ pub fn stalled_page(after: Vec<JobRow>, from_start: Vec<JobRow>, limit: usize) -
     rows
 }
 
-/// Steps 2 and 3. Stops when `budget` cannot pay for the next fix; the
-/// rest are still stalled next pass. The pass starts where the last one
+/// Fixes `shard`'s stalled jobs. Stops when `budget` cannot pay for
+/// the next fix, or the pass reaches `deadline`; the rest are still
+/// stalled next pass. The pass starts where the shard's last one
 /// stopped and records where it stops.
 async fn fix_stalled(
     env: &Env,
@@ -877,13 +721,19 @@ async fn fix_stalled(
     backend: Option<&Backend>,
     budget: &Budget,
     now: u64,
+    shard: Shard,
+    deadline: u64,
 ) -> Result<u32, String> {
-    let cursor = store::stalled_cursor(db).await.map_err(|e| e.to_string())?;
-    let after = store::stalled_jobs(db, now, cursor, MAX_FIXES)
+    let first = shard.first_bucket();
+    let range = shard.range();
+    let cursor = store::shard_stalled_cursor(db, first)
+        .await
+        .map_err(|e| e.to_string())?;
+    let after = store::stalled_jobs(db, now, Some(range), cursor, MAX_FIXES)
         .await
         .map_err(|e| e.to_string())?;
     let from_start = if after.len() < MAX_FIXES as usize && cursor != StalledCursor::default() {
-        store::stalled_jobs(db, now, StalledCursor::default(), MAX_FIXES)
+        store::stalled_jobs(db, now, Some(range), StalledCursor::default(), MAX_FIXES)
             .await
             .map_err(|e| e.to_string())?
     } else {
@@ -894,6 +744,10 @@ async fn fix_stalled(
     let mut failed = 0;
     let mut stopped = StalledCursor::default();
     for fix in stalled(&rows, now) {
+        if now_ms() >= deadline {
+            console_error!("reconcile: pass deadline reached, the rest wait");
+            break;
+        }
         let cost = match &fix {
             Fix::Requeue(_) => REQUEUE_COST,
             Fix::Fail(..) => FAIL_COST,
@@ -919,7 +773,7 @@ async fn fix_stalled(
             failed += 1;
         }
     }
-    store::set_stalled_cursor(db, stopped)
+    store::set_shard_stalled_cursor(db, first, stopped)
         .await
         .map_err(|e| e.to_string())?;
     Ok(failed)
@@ -996,10 +850,10 @@ pub fn paid_wakes(woken: &[Woken], budget: &Budget) -> Vec<Woken> {
         .collect()
 }
 
-/// The most tenants with billing holds one backstop pass checks. Only
-/// tenants an event may have freed are read, and each leaves the list
-/// once read, so the list holds the events of one pass: more than this
-/// only at a calendar month turn, which the next pass finishes.
+/// The most tenants with billing holds one reconciler pass checks, each
+/// minute. Only tenants an event may have freed are read, and each
+/// leaves the list once read, so a burst larger than this (a calendar
+/// month turn) drains at this many a minute.
 pub const BILLING_TENANTS_PER_PASS: u32 = 1_000;
 
 /// The billing holds a comma-separated list of `held` words names.
@@ -1024,7 +878,21 @@ pub fn billing_reasons(reasons: &str) -> Vec<billing::Hold> {
 /// decided or released are freed too. Every wake is paid from its own
 /// `budget`; the consumer checks the caps again and holds a job that
 /// still waits.
-async fn wake_held(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), String> {
+///
+/// The billing check runs every pass: it reads only tenants an event
+/// may have freed, so a pass with no such event costs one query, and a
+/// burst of more than [`BILLING_TENANTS_PER_PASS`] (a month turn)
+/// drains over the next minutes instead of the next quarter hours. The
+/// other legs run every 15th minute (see [`held_backstop_due`]).
+async fn wake_held(
+    env: &Env,
+    db: &Db,
+    budget: &Budget,
+    now: u64,
+    shard: Shard,
+    deadline: u64,
+) -> Result<(), String> {
+    let range = Some(shard.range());
     // Events that do not come again go first: billing holds whose
     // admission changed without waking them, then approvals nobody is
     // left to decide. A room-based wake cut by the budget is marked
@@ -1033,11 +901,20 @@ async fn wake_held(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), 
     // Only the tenants an event may have freed: a card that is back, a
     // Polar delivery or cap change since the hold, or a spend window
     // that turned. The rest wait on with no read.
-    let tenants =
-        ci_wake::billing_candidates(db, now, billing::month_start(now), BILLING_TENANTS_PER_PASS)
-            .await
-            .map_err(|e| e.to_string())?;
+    let tenants = ci_wake::billing_candidates(
+        db,
+        now,
+        billing::month_start(now),
+        BILLING_TENANTS_PER_PASS,
+        range,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     for tenant in &tenants {
+        if now_ms() >= deadline {
+            console_error!("reconcile: pass deadline reached, the rest wait");
+            break;
+        }
         let holds = billing_reasons(&tenant.reasons);
         let standing = store::tenant_standing(
             db,
@@ -1050,47 +927,51 @@ async fn wake_held(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), 
         match standing {
             Some(standing) if billing::billing_wake_lost(&standing, &holds) => {
                 stale.extend(
-                    ci_wake::standing_improved(db, &tenant.tenant_id, now)
+                    ci_wake::standing_improved(db, &tenant.tenant_id, now, range)
                         .await
                         .map_err(|e| e.to_string())?,
                 );
             }
             // The holds stand: marked checked, the tenant leaves the
             // list until its next event.
-            _ => ci_wake::billing_checked(db, &tenant.tenant_id, now)
+            _ => ci_wake::billing_checked(db, &tenant.tenant_id, now, range)
                 .await
                 .map_err(|e| e.to_string())?,
         }
     }
-    // An approval hold whose environment is gone or has approval off, or
-    // whose attempt was decided, has nobody to wait for; the change that
-    // freed it may have failed to wake it.
-    stale.extend(
-        ci_wake::release_orphan_approvals(
-            db,
-            now.saturating_sub(ORPHAN_QUIET_MS),
-            now,
-            HELD_BUDGET,
-        )
-        .await
-        .map_err(|e| e.to_string())?,
-    );
-    stale.extend(
-        ci_wake::release_orphan_fork_approvals(
-            db,
-            now.saturating_sub(ORPHAN_QUIET_MS),
-            now,
-            HELD_BUDGET,
-        )
-        .await
-        .map_err(|e| e.to_string())?,
-    );
-    // Held jobs whose condition is clear now, across every tenant.
-    stale.extend(
-        ci_wake::lost_wakes(db, None, MAX_RUNNING_JOBS, now, HELD_BUDGET)
+    if held_backstop_due(now) {
+        // An approval hold whose environment is gone or has approval off, or
+        // whose attempt was decided, has nobody to wait for; the change that
+        // freed it may have failed to wake it.
+        stale.extend(
+            ci_wake::release_orphan_approvals(
+                db,
+                now.saturating_sub(ORPHAN_QUIET_MS),
+                now,
+                HELD_BUDGET,
+                range,
+            )
             .await
             .map_err(|e| e.to_string())?,
-    );
+        );
+        stale.extend(
+            ci_wake::release_orphan_fork_approvals(
+                db,
+                now.saturating_sub(ORPHAN_QUIET_MS),
+                now,
+                HELD_BUDGET,
+                range,
+            )
+            .await
+            .map_err(|e| e.to_string())?,
+        );
+        // Held jobs whose condition is clear now, across every tenant.
+        stale.extend(
+            ci_wake::lost_wakes(db, None, MAX_RUNNING_JOBS, now, HELD_BUDGET, range)
+                .await
+                .map_err(|e| e.to_string())?,
+        );
+    }
     let wakes = paid_wakes(&stale, budget);
     if wakes.len() < stale.len() {
         console_error!("reconcile: held-job budget spent, the rest wait");
@@ -1916,8 +1797,8 @@ mod tests {
             .map(|job_id| Woken { job_id, attempt: 1 })
             .collect();
         // A stalled-job budget that ran out leaves the backstop's alone.
-        let stalled_budget = Budget::new(shares(BUDGET).stalled);
-        assert!(stalled_budget.take(shares(BUDGET).stalled));
+        let stalled_budget = Budget::new(STALLED_TOTAL / u32::from(SHARDS));
+        assert!(stalled_budget.take(STALLED_TOTAL / u32::from(SHARDS)));
         assert!(!stalled_budget.take(1));
         let held_budget = Budget::new(HELD_BUDGET);
         let paid = paid_wakes(&woken, &held_budget);
@@ -2132,71 +2013,6 @@ mod tests {
     }
 
     #[test]
-    fn fires_each_missed_minute_up_to_five() {
-        assert_eq!(minutes(Some(NOW - 2 * MIN), NOW), [NOW - MIN, NOW]);
-        assert_eq!(minutes(Some(NOW), NOW), [] as [u64; 0]);
-        assert_eq!(minutes(None, NOW + 7_000), [NOW]);
-        assert_eq!(
-            minutes(Some(NOW - 30 * MIN), NOW),
-            [NOW - 4 * MIN, NOW - 3 * MIN, NOW - 2 * MIN, NOW - MIN, NOW]
-        );
-        // A last minute that is not on the boundary counts from the next one.
-        assert_eq!(minutes(Some(NOW - MIN + 5_000), NOW), [NOW]);
-
-        let every = |cron: &str, workflow: &str| ScheduleRow {
-            repo_id: 7,
-            workflow: workflow.into(),
-            cron: cron.into(),
-        };
-        let rows = [
-            every("* * * * *", "ci"),
-            every("*/15 * * * *", "slow"),
-            every("nonsense", "bad"),
-        ];
-        let due = minutes(Some(NOW - 8 * MIN), NOW);
-        let fired = fires(&rows, &due);
-        // 13:41 to 13:45: every minute for ci, and :45 for slow.
-        assert_eq!(fired.iter().filter(|f| f.workflow == "ci").count(), 5);
-        let slow: Vec<_> = fired.iter().filter(|f| f.workflow == "slow").collect();
-        assert_eq!(slow.len(), 1);
-        assert_eq!(slow[0].minute_ms, NOW);
-        assert_eq!(
-            slow[0].delivery(),
-            format!("schedule:7:slow:*/15 * * * *:{NOW}")
-        );
-        assert!(fired.iter().all(|f| f.workflow != "bad"));
-    }
-
-    #[test]
-    fn the_cap_counts_only_runs_that_start() {
-        let mut cap = FireCap::default();
-        // Firings whose run exists never reach the cap.
-        for _ in 0..MAX_FIRES - 1 {
-            cap.start();
-        }
-        assert!(!cap.full());
-        cap.start();
-        assert!(cap.full());
-        cap.skip(2);
-        assert_eq!((cap.started, cap.skipped), (MAX_FIRES, 2));
-    }
-
-    #[test]
-    fn firings_are_not_capped_before_the_run_check() {
-        let rows: Vec<ScheduleRow> = (0..130)
-            .map(|repo_id| ScheduleRow {
-                repo_id,
-                workflow: "ci".into(),
-                cron: "* * * * *".into(),
-            })
-            .collect();
-        let due = minutes(Some(NOW - 2 * MIN), NOW);
-        let fired = fires(&rows, &due);
-        assert_eq!(fired.len(), 260);
-        assert!(fired[..130].iter().all(|f| f.minute_ms == NOW - MIN));
-    }
-
-    #[test]
     fn terminates_instances_a_later_launch_or_attempt_replaced() {
         let fresh = "2026-10-22T13:40:00Z";
         let mut running = row("running");
@@ -2221,39 +2037,89 @@ mod tests {
     }
 
     #[test]
-    fn shares_split_the_budget() {
-        let sum = |s: Shares| {
-            s.schedules
-                + s.stalled
-                + s.orphans
-                + s.pool
-                + s.usage
-                + s.reseal
-                + s.retention
-                + s.cache
-        };
-        let share = shares(BUDGET);
+    fn the_budgets_split_their_totals_over_the_shards() {
+        assert_eq!(MAX_FIXES, FIXES_TOTAL / u32::from(SHARDS));
+        assert_eq!(HELD_BUDGET, HELD_TOTAL / u32::from(SHARDS));
+        assert_eq!(crate::scheduler::MAX_FIRES, FIRES_TOTAL / u32::from(SHARDS));
+        // The totals stay fixed.
         assert_eq!(
-            share,
-            Shares {
-                schedules: 485,
-                stalled: 147,
-                orphans: 49,
-                pool: 49,
-                usage: 24,
-                reseal: 24,
-                retention: 100,
-                cache: 22,
-            }
+            (
+                STALLED_TOTAL,
+                SCHEDULE_TOTAL,
+                FIXES_TOTAL,
+                HELD_TOTAL,
+                FIRES_TOTAL
+            ),
+            (2_400, 3_200, 800, 640, 800)
         );
-        assert_eq!(sum(share), BUDGET);
-        assert!(share.reseal > 0 && share.usage > 0);
-        assert!(share.cache > cache::EVICT_LIMIT);
-        for total in [0, 1, 8, 100, 900, 5_000] {
-            let share = shares(total);
-            assert_eq!(sum(share), total, "{total}");
-            assert!(share.schedules <= 500);
-        }
+        assert_eq!(
+            (MAX_FIXES, HELD_BUDGET, crate::scheduler::MAX_FIRES),
+            (50, 40, 50)
+        );
+        const {
+            assert!(
+                ORPHANS_BUDGET
+                    + POOL_BUDGET
+                    + RETENTION_BUDGET
+                    + CACHE_BUDGET
+                    + USAGE_BUDGET
+                    + RESEAL_BUDGET
+                    <= BUDGET
+            );
+        };
+        const { assert!(RESEAL_BUDGET > 0 && USAGE_BUDGET > 0) };
+        const { assert!(CACHE_BUDGET > cache::EVICT_LIMIT) };
+    }
+
+    #[test]
+    fn stale_shards_and_recent_errors_count() {
+        let fresh = |first_bucket: u16| ShardHealth {
+            first_bucket,
+            finished_at: Some(NOW),
+            errors: 0,
+            schedule_finished_at: Some(NOW),
+            schedule_errors: 0,
+        };
+        let all: Vec<ShardHealth> = Shard::all().map(|s| fresh(s.first_bucket())).collect();
+        assert_eq!(shard_errors(&all, NOW), 0);
+        let with = |at: usize, change: &dyn Fn(&mut ShardHealth)| {
+            let mut rows = all.clone();
+            change(&mut rows[at]);
+            rows
+        };
+        // A pass that never finished, or finished over five minutes
+        // ago, counts one whatever errors it had.
+        assert_eq!(shard_errors(&with(3, &|r| r.finished_at = None), NOW), 1);
+        let old = with(3, &|r| {
+            r.schedule_finished_at = Some(NOW - SHARD_STALE_MS - 1);
+            r.schedule_errors = 7;
+        });
+        assert_eq!(shard_errors(&old, NOW), 1);
+        // A pass that just finished counts its errors.
+        assert_eq!(shard_errors(&with(0, &|r| r.errors = 3), NOW), 3);
+        let recent = with(0, &|r| {
+            r.finished_at = Some(NOW - SHARD_RECENT_MS);
+            r.errors = 3;
+        });
+        assert_eq!(shard_errors(&recent, NOW), 3);
+        // Between two and five minutes its errors were reported already.
+        let reported = with(0, &|r| {
+            r.finished_at = Some(NOW - SHARD_RECENT_MS - 1);
+            r.errors = 3;
+        });
+        assert_eq!(shard_errors(&reported, NOW), 0);
+        // A missing row counts one; a row of an older shard count is
+        // ignored.
+        let mut missing = all[1..].to_vec();
+        missing.push(ShardHealth {
+            first_bucket: 1,
+            finished_at: None,
+            errors: 9,
+            schedule_finished_at: None,
+            schedule_errors: 9,
+        });
+        assert_eq!(shard_errors(&missing, NOW), 1);
+        assert_eq!(shard_errors(&[], NOW), u32::from(SHARDS));
     }
 
     fn usage_window(
@@ -2360,7 +2226,7 @@ mod tests {
         assert_eq!(quarantined, [6]);
         assert!(calls <= 2 * 3 + 1, "{calls}");
         // A full batch with one bad row fits the usage share.
-        assert!(2 * 7 < shares(BUDGET).usage);
+        const { assert!(2 * 7 < USAGE_BUDGET) };
     }
 
     #[test]
