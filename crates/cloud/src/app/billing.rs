@@ -244,7 +244,7 @@ async fn settle(db: &Db, subscription: &Subscription, changed: u64) -> Result<Ve
             subscription.tenant
         );
     } else if subscription.licensed() {
-        return ci_wake::card_returned(db, &subscription.tenant).await;
+        return ci_wake::card_returned(db, &subscription.tenant, now_ms()).await;
     } else {
         crate::usage::close_windows(db, now_ms(), Some(&subscription.tenant)).await?;
     }
@@ -364,10 +364,10 @@ mod tests {
         );
         for plan in ["a", "b"] {
             db.run(
-                "INSERT INTO ci_jobs (run_id, tier, run_created_at, plan_id, name, status, \
+                "INSERT INTO ci_jobs (run_id, tenant_id, tier, run_created_at, plan_id, name, status, \
                  timeout_minutes, held, created_at, updated_at, template, token_permissions, \
                  secret_refs, needs) \
-                 SELECT id, 30, 1, $1, $1, 'queued', 10, 'card', 1, 1, 'hatchrun', '{}', \
+                 SELECT id, tenant_id, 30, 1, $1, $1, 'queued', 10, 'card', 1, 1, 'hatchrun', '{}', \
                  '{}', '[]' FROM ci_runs",
                 &params![plan],
             );

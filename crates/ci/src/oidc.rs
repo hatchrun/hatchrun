@@ -394,7 +394,7 @@ mod tests {
     #[allow(clippy::needless_pass_by_value)] // callers build the value inline
     fn job(environment: Option<&str>, permissions: Value) -> JobRow {
         serde_json::from_value(json!({
-            "id": 7, "run_id": 1, "plan_id": "build", "name": "build",
+            "id": 7, "run_id": 1, "tenant_id": "t1", "plan_id": "build", "name": "build",
             "status": "running", "conclusion": null, "instance_id": "i-1",
             "attempt": 2, "launch_attempts": 1, "capacity_attempts": 0, "capacity_since": null, "next_launch_at": null,
             "timeout_minutes": 10, "updated_at": 0,

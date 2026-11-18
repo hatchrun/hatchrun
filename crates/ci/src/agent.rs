@@ -935,6 +935,7 @@ mod tests {
         JobRow {
             id: 7,
             run_id: 1,
+            tenant_id: "t1".into(),
             plan_id: "build".into(),
             name: "build".into(),
             status: status.into(),

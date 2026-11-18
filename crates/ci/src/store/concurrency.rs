@@ -313,19 +313,24 @@ pub async fn blocker(db: &Db, repo_id: u64, group_key: &str) -> Result<Option<Bl
     .await
 }
 
-/// The queued jobs held for the group whose holder runs now, to send to
-/// the launch queue after a place was freed.
+/// The queued jobs held for the group whose holder runs now, marked
+/// for a wake, to send to the launch queue after a place was freed.
+/// The mark keeps the hold.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn wake_targets(db: &Db, repo_id: u64, group_key: &str) -> Result<Vec<Woken>> {
+pub async fn wake_targets(db: &Db, repo_id: u64, group_key: &str, now: u64) -> Result<Vec<Woken>> {
     db.all(
-        "SELECT j.id AS job_id, j.attempt FROM ci_concurrency c \
-         JOIN ci_jobs j ON (j.id = c.job_id OR (c.job_id IS NULL AND j.run_id = c.run_id)) \
-         WHERE c.repo_id = $1 AND c.group_key = $2 AND c.state = 'running' \
-           AND j.status = 'queued' AND j.held = 'group' ORDER BY j.id",
-        &params![repo_id, group_key],
+        "UPDATE ci_jobs SET next_launch_at = $3 WHERE id IN (\
+          SELECT j.id FROM ci_concurrency c \
+          JOIN ci_jobs j ON (j.id = c.job_id OR (c.job_id IS NULL AND j.run_id = c.run_id)) \
+          WHERE c.repo_id = $1 AND c.group_key = $2 AND c.state = 'running' \
+            AND j.status = 'queued' AND j.held = 'group' AND j.next_launch_at IS NULL \
+          ORDER BY j.id FOR UPDATE OF j SKIP LOCKED) \
+        AND status = 'queued' AND held = 'group' AND next_launch_at IS NULL \
+        RETURNING id AS job_id, attempt",
+        &params![repo_id, group_key, now],
     )
     .await
 }

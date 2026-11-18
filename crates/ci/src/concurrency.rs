@@ -157,6 +157,7 @@ pub async fn gate(
     run_id: u64,
     job_id: u64,
     attempt: u32,
+    now: u64,
 ) -> Result<Gate, String> {
     let db_err = |e: worker::Error| e.to_string();
     for slot in store::slots(db, run_id, job_id).await.map_err(db_err)? {
@@ -171,7 +172,7 @@ pub async fn gate(
             // Entering sweeps the rows of ended holders and may promote
             // a waiting row that `release` never saw. Wake what that row
             // holds; this job's own turn is the one running.
-            wake_promoted(env, db, &entered, job_id).await;
+            wake_promoted(env, db, &entered, job_id, now).await;
             entered
         } else {
             slot
@@ -197,8 +198,8 @@ pub async fn gate(
 }
 
 /// Wakes the held jobs of the group of `slot`, other than `job_id`.
-async fn wake_promoted(env: &Env, db: &Db, slot: &Slot, job_id: u64) {
-    match store::wake_targets(db, slot.repo_id, &slot.group_key).await {
+async fn wake_promoted(env: &Env, db: &Db, slot: &Slot, job_id: u64, now: u64) {
+    match store::wake_targets(db, slot.repo_id, &slot.group_key, now).await {
         Ok(woken) => {
             let woken: Vec<_> = woken.into_iter().filter(|w| w.job_id != job_id).collect();
             if let Err(err) = send_wakes(env, &woken).await {
@@ -305,11 +306,17 @@ pub async fn resend_cancels(
 ///
 /// Postgres refused a statement while the place was given up; the caller
 /// tries again.
-pub async fn release(env: &Env, db: &Db, run_id: u64, job_id: Option<u64>) -> worker::Result<()> {
+pub async fn release(
+    env: &Env,
+    db: &Db,
+    run_id: u64,
+    job_id: Option<u64>,
+    now: u64,
+) -> worker::Result<()> {
     let Some((repo_id, group_key)) = store::leave(db, run_id, job_id).await? else {
         return Ok(());
     };
-    match store::wake_targets(db, repo_id, &group_key).await {
+    match store::wake_targets(db, repo_id, &group_key, now).await {
         Ok(woken) => {
             if let Err(err) = send_wakes(env, &woken).await {
                 console_error!("group {group_key}: wake the next: {err}");

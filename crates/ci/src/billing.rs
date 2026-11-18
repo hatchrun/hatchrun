@@ -275,10 +275,6 @@ pub fn cap_micros(dollars: u64) -> Result<u64, String> {
         })
 }
 
-/// How long a held job waits before its caps are checked again, in
-/// milliseconds.
-pub const HOLD_RECHECK_MS: u64 = 30_000;
-
 /// Why a queued job does not launch yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hold {
@@ -335,6 +331,17 @@ pub fn admission(standing: &Standing) -> Option<Hold> {
     } else {
         None
     }
+}
+
+/// Whether a wake was lost for a tenant whose jobs are held for these
+/// billing reasons: the admission now differs from some held reason, so
+/// the event that cleared it woke nothing. A hold the admission still
+/// names waits on, and a tenant with no billing hold lost no billing
+/// wake.
+#[must_use]
+pub fn billing_wake_lost(standing: &Standing, held: &[Hold]) -> bool {
+    let now = admission(standing);
+    held.iter().any(|reason| Some(*reason) != now)
 }
 
 #[cfg(test)]
@@ -520,6 +527,29 @@ mod tests {
         assert_eq!(admission(&s), Some(Hold::Concurrency));
         s.running = 4;
         assert_eq!(admission(&s), None);
+    }
+
+    #[test]
+    fn a_billing_wake_is_lost_when_the_hold_no_longer_binds() {
+        let mut s = standing(&[]);
+        s.card = false;
+        assert!(!billing_wake_lost(&s, &[Hold::Card]));
+        assert!(billing_wake_lost(&s, &[Hold::SpendCap]));
+        assert!(!billing_wake_lost(&s, &[]));
+        s.card = true;
+        s.units = 750_000;
+        assert!(!billing_wake_lost(&s, &[Hold::SpendCap]));
+        assert!(billing_wake_lost(&s, &[Hold::Card]));
+        assert!(billing_wake_lost(&s, &[Hold::Concurrency]));
+        s.units = 0;
+        s.running = 5;
+        assert!(billing_wake_lost(&s, &[Hold::Card, Hold::SpendCap]));
+        assert!(!billing_wake_lost(&s, &[Hold::Concurrency]));
+        s.running = 0;
+        assert!(billing_wake_lost(&s, &[Hold::Card]));
+        assert!(billing_wake_lost(&s, &[Hold::SpendCap]));
+        assert!(billing_wake_lost(&s, &[Hold::Concurrency]));
+        assert!(!billing_wake_lost(&s, &[]));
     }
 
     #[test]

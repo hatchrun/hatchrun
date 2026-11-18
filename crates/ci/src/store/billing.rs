@@ -36,8 +36,8 @@ const STANDING: &str = "SELECT tenants.id AS tenant_id, tenants.org_login, \
          '[]'::json)::text AS seconds_by_template, \
        (SELECT COALESCE(SUM(units), 0)::bigint FROM ci_usage \
          WHERE tenant_id = tenants.id AND ended_at >= COALESCE(period.start_ms, $3)) AS units, \
-       (SELECT count(*) FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
-         WHERE ci_runs.tenant_id = tenants.id \
+       (SELECT count(*) FROM ci_jobs \
+         WHERE ci_jobs.tenant_id = tenants.id \
          AND ci_jobs.status IN ('launching', 'launched', 'running'))::bigint AS running \
      FROM tenants LEFT JOIN LATERAL (SELECT CASE WHEN one.rolled \
          THEN one.start_ms + (($2 - one.start_ms) / one.len) * one.len \

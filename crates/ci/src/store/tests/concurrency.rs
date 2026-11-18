@@ -94,14 +94,14 @@ fn leaving_lets_the_one_that_waits_run_and_wakes_its_held_jobs() {
     let (b, job_b) = queued(&db, "b");
     enter_it(&db, &note(&db, a, None, "g", false));
     enter_it(&db, &note(&db, b, None, "g", false));
-    assert!(db.wait(hold(db.db(), job_b, 1, "group", 99, 20)).unwrap());
-    assert_eq!(db.wait(wake_targets(db.db(), 7, "g")).unwrap(), []);
+    assert!(db.wait(hold(db.db(), job_b, 1, "group", 20)).unwrap());
+    assert_eq!(db.wait(wake_targets(db.db(), 7, "g", 21)).unwrap(), []);
     assert_eq!(
         db.wait(leave(db.db(), a, None)).unwrap(),
         Some((7, "g".to_owned()))
     );
     assert_eq!(db.wait(slots(db.db(), b, 0)).unwrap()[0].state, "running");
-    let woken = db.wait(wake_targets(db.db(), 7, "g")).unwrap();
+    let woken = db.wait(wake_targets(db.db(), 7, "g", 22)).unwrap();
     assert_eq!(woken.len(), 1);
     assert_eq!((woken[0].job_id, woken[0].attempt), (job_b, 1));
     // The run that left holds nothing, and leaving twice is harmless.
