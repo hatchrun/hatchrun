@@ -989,7 +989,14 @@ fn held_jobs_are_not_stalled() {
         "UPDATE ci_jobs SET next_launch_at = 1, updated_at = 1 WHERE id = $1",
         &params![plain],
     );
-    let rows = db.wait(stalled_jobs(db.db(), 10_000_000, 50)).unwrap();
+    let rows = db
+        .wait(stalled_jobs(
+            db.db(),
+            10_000_000,
+            StalledCursor::default(),
+            50,
+        ))
+        .unwrap();
     assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [plain]);
 }
 

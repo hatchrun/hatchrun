@@ -76,19 +76,19 @@ pub use self::installation::{
 };
 pub use self::jobs::{
     ApprovalJob, Claim, JobCounts, JobRow, MatrixRows, NewJob, all_jobs_for_run, approval_jobs,
-    assign_matrix_rows, capacity_wait, claim_launch, finish_job, fork_approval_held, fork_running,
-    heartbeat, held_fork_jobs, held_siblings, hold, insert_jobs, job, job_counts, job_scopes,
-    jobs_by_ids, jobs_for_run, launch_failed, launched, note_queued_error, open_jobs,
-    parse_cache_scopes, queue_job, refresh_job, reset_job, retarget_job, set_cache_scopes, set_job,
-    set_needs, start_job, supersede_job,
+    assign_matrix_rows, capacity_wait, claim_launch, fail_unchanged_job, finish_job,
+    fork_approval_held, fork_running, held_fork_jobs, held_siblings, hold, insert_jobs, job,
+    job_counts, job_scopes, jobs_by_ids, jobs_for_run, launch_failed, launched, note_queued_error,
+    open_jobs, parse_cache_scopes, queue_job, refresh_job, reset_job, retarget_job,
+    set_cache_scopes, set_job, set_needs, start_job, supersede_job,
 };
 pub use self::pool::{
     PoolRow, claims_by_bucket, drop_pool, move_pool, pool_rows, save_pool, take_pool,
 };
 pub use self::reconciler::{
-    ScheduleRow, drop_expired_partitions, ensure_partitions, expired_run_partitions, last_minute,
-    lease, mark_purged, replace_schedules, runs_needing_purge, schedules, schedules_after,
-    set_last_minute, stalled_jobs,
+    ScheduleRow, StalledCursor, drop_expired_partitions, ensure_partitions, expired_run_partitions,
+    last_minute, lease, mark_purged, replace_schedules, runs_needing_purge, schedules,
+    schedules_after, set_last_minute, set_stalled_cursor, stalled_cursor, stalled_jobs,
 };
 pub use self::repos::{RepoRow, repo, repo_by_name, upsert_repo};
 pub use self::runs::{

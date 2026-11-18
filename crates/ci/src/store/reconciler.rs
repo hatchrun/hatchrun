@@ -9,8 +9,9 @@ use hatchrun_cloud::db::{Db, Param, params};
 use serde::Deserialize;
 use worker::Result;
 
-use super::jobs::{JOB_COLUMNS, JobRow};
-use super::with_columns;
+use crate::run::TIMEOUT_GRACE_MS;
+use crate::store::jobs::{JOB_COLUMNS, JobRow};
+use crate::store::with_columns;
 
 /// How long webhook deliveries are kept, in milliseconds. Like runs,
 /// jobs, usage and audit rows, they go with the month partition they
@@ -60,23 +61,90 @@ const SCHEDULES_AFTER: &str = "SELECT repo_id, workflow, cron FROM ci_schedules 
 
 /// The jobs a reconciler pass may have to act on, at most `limit`:
 /// queued, launching, launched and running jobs that are overdue
-/// against the limits of `now`. See [`crate::reconcile::stalled`].
+/// against the limits of `now`, after `after` in the order of
+/// `(updated_at, id)`. `(0, 0)` reads from the start. See
+/// [`crate::reconcile::stalled`].
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn stalled_jobs(db: &Db, now: u64, limit: u32) -> Result<Vec<JobRow>> {
+pub async fn stalled_jobs(
+    db: &Db,
+    now: u64,
+    after: StalledCursor,
+    limit: u32,
+) -> Result<Vec<JobRow>> {
     db.all(
         &with_columns(STALLED_JOBS, JOB_COLUMNS),
         &params![
             now,
             now.saturating_sub(crate::reconcile::QUEUED_QUIET_MS),
             now.saturating_sub(crate::reconcile::LAUNCH_QUIET_MS),
-            now.saturating_sub(crate::reconcile::RUNNER_QUIET_MS),
+            now.saturating_sub(TIMEOUT_GRACE_MS + crate::reconcile::WEDGED_GRACE_MS),
+            now.saturating_sub(
+                crate::reconcile::LAUNCH_QUIET_MS + crate::reconcile::WEDGED_GRACE_MS
+            ),
+            after.updated_at,
+            after.id,
             limit
         ],
     )
     .await
+}
+
+/// Where a reconciler pass stopped in the stalled jobs: the
+/// `(updated_at, id)` of the last one it handled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct StalledCursor {
+    /// The row's last change.
+    #[serde(rename = "stalled_after_at")]
+    pub updated_at: u64,
+    /// The row's id.
+    #[serde(rename = "stalled_after_id")]
+    pub id: u64,
+}
+
+impl StalledCursor {
+    /// The cursor just past `row`.
+    #[must_use]
+    pub fn at(row: &JobRow) -> Self {
+        Self {
+            updated_at: row.updated_at,
+            id: row.id,
+        }
+    }
+}
+
+/// Where the last pass stopped in the stalled jobs.
+const STALLED_CURSOR: &str =
+    "SELECT stalled_after_at, stalled_after_id FROM ci_reconciler WHERE id = 1";
+
+/// Sets where the last pass stopped in the stalled jobs to `$1`, `$2`.
+const SET_STALLED_CURSOR: &str =
+    "UPDATE ci_reconciler SET stalled_after_at = $1, stalled_after_id = $2 WHERE id = 1";
+
+/// Where the last pass stopped in the stalled jobs; the start when none
+/// did.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn stalled_cursor(db: &Db) -> Result<StalledCursor> {
+    Ok(db
+        .first::<StalledCursor>(STALLED_CURSOR, &[])
+        .await?
+        .unwrap_or_default())
+}
+
+/// Records where this pass stopped in the stalled jobs.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn set_stalled_cursor(db: &Db, cursor: StalledCursor) -> Result<()> {
+    db.run(SET_STALLED_CURSOR, &params![cursor.updated_at, cursor.id])
+        .await?;
+    Ok(())
 }
 
 /// Takes the reconciler's lease until `$2` when it ran out before `$1`.
@@ -88,18 +156,21 @@ const LAST_MINUTE: &str = "SELECT last_minute FROM ci_reconciler WHERE id = 1";
 /// Sets the last schedule minute fired to `$1`.
 const SET_LAST_MINUTE: &str = "UPDATE ci_reconciler SET last_minute = $1 WHERE id = 1";
 
-/// Jobs a reconciler pass looks at, the least recently changed first, at
-/// most `$5`: queued ones due for a launch (`$1` now) or quiet since
-/// `$2` (a job held for capacity only when due), launching or launched ones quiet since `$3`, and running ones
-/// without a heartbeat since `$4`, or without a start or any change when
-/// the heartbeat is missing. [`crate::reconcile::stalled`] makes the
+/// Jobs a reconciler pass looks at, the least recently changed first,
+/// after `($6, $7)` in the order of `(updated_at, id)`, at most `$8`:
+/// queued ones due for a launch (`$1` now) or quiet since `$2` (a job
+/// held for capacity only when due), launching ones quiet since `$3`,
+/// launched ones quiet since `$5`, and running ones past their timeout
+/// and every grace since `$4`. [`crate::reconcile::stalled`] makes the
 /// same decisions over the rows.
 const STALLED_JOBS: &str = "SELECT {columns} FROM ci_jobs WHERE \
-     (status = 'queued' AND held IS NULL AND (next_launch_at <= $1 OR updated_at < $2)) \
+     ((status = 'queued' AND held IS NULL AND (next_launch_at <= $1 OR updated_at < $2)) \
      OR (status = 'queued' AND held = 'capacity' AND next_launch_at <= $1) \
-     OR (status IN ('launching', 'launched') AND updated_at < $3) \
-     OR (status = 'running' AND COALESCE(heartbeat_at, started_at, updated_at) < $4) \
-     ORDER BY updated_at, id LIMIT $5";
+     OR (status = 'launching' AND updated_at < $3) \
+     OR (status = 'launched' AND updated_at < $5) \
+     OR (status = 'running' AND COALESCE(started_at, updated_at) + timeout_minutes::bigint * 60000 < $4)) \
+     AND (updated_at, id) > ($6, $7) \
+     ORDER BY updated_at, id LIMIT $8";
 
 /// The month partitions of parent `$1` in this schema, oldest first.
 const PARTITIONS: &str = "SELECT c.relname AS name FROM pg_class c      JOIN pg_inherits i ON i.inhrelid = c.oid      JOIN pg_class p ON p.oid = i.inhparent      JOIN pg_namespace n ON n.oid = c.relnamespace      WHERE p.relname = $1 AND n.nspname = current_schema() ORDER BY 1";

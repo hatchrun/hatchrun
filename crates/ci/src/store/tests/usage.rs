@@ -145,7 +145,6 @@ fn late_calls_leave_a_completed_job_alone() {
         !db.wait(launch_failed(db.db(), job_id, "late", None, 34))
             .unwrap()
     );
-    db.wait(heartbeat(db.db(), job_id, 40)).unwrap();
     let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
     assert_eq!(row.status, "completed");
     assert_eq!(row.conclusion.as_deref(), Some("success"));
@@ -153,7 +152,7 @@ fn late_calls_leave_a_completed_job_alone() {
     assert_eq!(row.log_key.as_deref(), Some("k1"));
     assert_eq!(row.instance_id.as_deref(), Some("i-1"));
     assert_eq!(
-        (row.completed_at, row.heartbeat_at, row.next_launch_at),
+        (row.completed_at, row.started_at, row.next_launch_at),
         (Some(20), Some(12), None)
     );
     assert_eq!(db.wait(open_jobs(db.db(), 10)).unwrap().len(), 0);
@@ -253,8 +252,10 @@ fn upkeep_drops_expired_run_months_and_old_deliveries() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One fixture, read top to bottom.
 fn stalled_jobs_match_the_reconcilers_decisions() {
-    use crate::reconcile::{Fix, stalled};
+    use crate::reconcile::{Fix, LAUNCH_QUIET_MS, WEDGED_GRACE_MS, stalled};
+    use crate::run::TIMEOUT_GRACE_MS;
     let db = setup();
     let run = db
         .wait(make_run(db.db(), &new_run("d", "ci", 1)))
@@ -266,8 +267,9 @@ fn stalled_jobs_match_the_reconcilers_decisions() {
         "due-queued",
         "old-launching",
         "old-launched",
-        "silent-running",
-        "beating-running",
+        "fresh-launched",
+        "past-running",
+        "fresh-running",
         "old-waiting",
         "old-completed",
         "capacity-due",
@@ -276,31 +278,39 @@ fn stalled_jobs_match_the_reconcilers_decisions() {
     let jobs: Vec<NewJob> = names.iter().map(|name| new_job(name)).collect();
     let ids = db.wait(insert_jobs(db.db(), run.id, &jobs, 1)).unwrap();
     let now = 10_000_000u64;
-    let set = |name: &str, status: &str, updated: u64, heartbeat: Option<u64>, due: Option<u64>| {
+    let set = |name: &str, status: &str, updated: u64, started: Option<u64>, due: Option<u64>| {
         let id = ids.iter().find(|(plan, _)| plan == name).unwrap().1;
         db.run(
-            "UPDATE ci_jobs SET status = $2, updated_at = $3, heartbeat_at = $4, \
-             started_at = $3, next_launch_at = $5 WHERE id = $1",
-            &params![id, status, updated, heartbeat, due],
+            "UPDATE ci_jobs SET status = $2, updated_at = $3, timeout_minutes = 10, \
+             started_at = $4, next_launch_at = $5 WHERE id = $1",
+            &params![id, status, updated, started, due],
         );
     };
     set("fresh-queued", "queued", now - 1_000, None, None);
     set("quiet-queued", "queued", now - 61_000, None, None);
     set("due-queued", "queued", now - 1_000, None, Some(now - 1));
     set("old-launching", "launching", now - 601_000, None, None);
-    set("old-launched", "launched", now - 601_000, None, None);
     set(
-        "silent-running",
+        "old-launched",
+        "launched",
+        now - LAUNCH_QUIET_MS - WEDGED_GRACE_MS - 1,
+        None,
+        None,
+    );
+    set("fresh-launched", "launched", now - 1_000, None, None);
+    // Ten minutes of timeout with the default job, past every grace.
+    set(
+        "past-running",
         "running",
         now - 1_000,
-        Some(now - 121_000),
+        Some(now - 10 * 60_000 - TIMEOUT_GRACE_MS - WEDGED_GRACE_MS - 1),
         None,
     );
     set(
-        "beating-running",
+        "fresh-running",
         "running",
         now - 1_000,
-        Some(now - 5_000),
+        Some(now - 1_000),
         None,
     );
     set("capacity-due", "queued", now - 1_000, None, Some(now - 1));
@@ -320,7 +330,9 @@ fn stalled_jobs_match_the_reconcilers_decisions() {
     }
     set("old-waiting", "waiting", 0, None, None);
     set("old-completed", "completed", 0, None, None);
-    let rows = db.wait(stalled_jobs(db.db(), now, 50)).unwrap();
+    let rows = db
+        .wait(stalled_jobs(db.db(), now, StalledCursor::default(), 50))
+        .unwrap();
     let mut from_sql: Vec<String> = rows.iter().map(|row| row.plan_id.clone()).collect();
     from_sql.sort();
     assert_eq!(
@@ -330,8 +342,8 @@ fn stalled_jobs_match_the_reconcilers_decisions() {
             "due-queued",
             "old-launched",
             "old-launching",
-            "quiet-queued",
-            "silent-running"
+            "past-running",
+            "quiet-queued"
         ]
     );
     let all = db.wait(jobs_for_run(db.db(), run.id)).unwrap();
@@ -345,7 +357,44 @@ fn stalled_jobs_match_the_reconcilers_decisions() {
     let mut sql_ids: Vec<u64> = rows.iter().map(|row| row.id).collect();
     sql_ids.sort_unstable();
     assert_eq!(from_rust, sql_ids);
-    assert_eq!(db.wait(stalled_jobs(db.db(), now, 2)).unwrap().len(), 2);
+    assert_eq!(
+        db.wait(stalled_jobs(db.db(), now, StalledCursor::default(), 2))
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn stalled_jobs_page_after_the_cursor_it_keeps() {
+    let db = setup();
+    let run = db
+        .wait(make_run(db.db(), &new_run("d", "ci", 1)))
+        .unwrap()
+        .unwrap();
+    let jobs: Vec<NewJob> = ["a", "b", "c"].iter().map(|name| new_job(name)).collect();
+    let ids = db.wait(insert_jobs(db.db(), run.id, &jobs, 1)).unwrap();
+    let now = 10_000_000u64;
+    for (i, (_, id)) in ids.iter().enumerate() {
+        db.run(
+            "UPDATE ci_jobs SET status = 'launching', updated_at = $2 WHERE id = $1",
+            &params![*id, 1_000 + i as u64],
+        );
+    }
+    assert_eq!(
+        db.wait(stalled_cursor(db.db())).unwrap(),
+        StalledCursor::default()
+    );
+    let first = db
+        .wait(stalled_jobs(db.db(), now, StalledCursor::default(), 2))
+        .unwrap();
+    assert_eq!(first.len(), 2);
+    let cursor = StalledCursor::at(&first[1]);
+    db.wait(set_stalled_cursor(db.db(), cursor)).unwrap();
+    assert_eq!(db.wait(stalled_cursor(db.db())).unwrap(), cursor);
+    let rest = db.wait(stalled_jobs(db.db(), now, cursor, 2)).unwrap();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].id, ids[2].1);
 }
 
 #[test]
@@ -377,7 +426,6 @@ fn reset_job_clears_the_attempt() {
     assert_eq!(reset.conclusion, None);
     assert_eq!(reset.instance_id, None);
     assert_eq!(reset.next_launch_at, None);
-    assert_eq!(reset.heartbeat_at, None);
     assert_eq!(reset.started_at, None);
     assert_eq!(reset.completed_at, None);
     assert_eq!(reset.log_key, None);
@@ -386,17 +434,38 @@ fn reset_job_clears_the_attempt() {
 }
 
 #[test]
-fn start_job_sets_the_heartbeat() {
+fn a_stalled_job_fails_only_while_the_row_is_as_read() {
+    let db = setup();
+    let (_, job_id) = run_with_job(&db, "launched");
+    let seen = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    // The agent claims it after the reconciler read the row.
+    db.wait(start_job(db.db(), job_id, 2_000)).unwrap();
+    assert!(!db.wait(fail_unchanged_job(db.db(), &seen, 3_000)).unwrap());
+    let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    assert_eq!(row.status, "running");
+    // Read again, it is still running when the safety net ends it.
+    let seen = row;
+    assert!(db.wait(fail_unchanged_job(db.db(), &seen, 4_000)).unwrap());
+    let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    assert_eq!(
+        (
+            row.status.as_str(),
+            row.conclusion.as_deref(),
+            row.completed_at
+        ),
+        ("completed", Some("failure"), Some(4_000))
+    );
+    assert!(!db.wait(fail_unchanged_job(db.db(), &seen, 5_000)).unwrap());
+}
+
+#[test]
+fn start_job_sets_started_at() {
     let db = setup();
     let (_, job_id) = run_with_job(&db, "launched");
     db.wait(start_job(db.db(), job_id, 77)).unwrap();
     let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
     assert_eq!(row.status, "running");
-    assert_eq!(row.heartbeat_at, Some(77));
     assert_eq!(row.started_at, Some(77));
-    db.wait(heartbeat(db.db(), job_id, 90)).unwrap();
-    let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
-    assert_eq!((row.heartbeat_at, row.started_at), (Some(90), Some(77)));
 }
 
 #[test]

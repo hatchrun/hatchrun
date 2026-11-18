@@ -12,7 +12,8 @@
 //! out what they say.
 //!
 //! The object has one alarm. It keeps a set of deadlines (the outbox,
-//! cancel escalation, upload retries and the purge, see [`Deadlines`])
+//! cancel escalation, upload retries, job deadlines kept in `live:<id>`
+//! and the purge, see [`Deadlines`])
 //! and every handler ends by setting the alarm to the earliest. When it
 //! fires, the object runs every part that is due and sets it again.
 //!
@@ -23,6 +24,7 @@
 //! | --- | --- | --- |
 //! | `POST /start` | [`Start`] | `204` |
 //! | `POST /claim?job=ID` | `{ "token": "<scoped GitHub token>" }` | `200` job document, `409` ended |
+//! | `POST /launched?job=ID&attempt=N` | none | `204`, `409` not queued |
 //! | `POST /events?job=ID` | `Batch` | `200` batch reply, `409` ended |
 //! | `POST /result?job=ID` | `JobResult` | `204` |
 //! | `POST /failed?job=ID` | `{ "message": "..." }` | `204` |
@@ -60,8 +62,18 @@ use crate::logs::LogIndex;
 pub(crate) const LAUNCHES: &str = "CI_LAUNCHES";
 /// The R2 bucket of logs, which also keeps the state of ended runs.
 const BUCKET: &str = "LOGS";
-/// How often a job's heartbeat reaches Postgres, in milliseconds.
-const HEARTBEAT_WRITE_MS: u64 = 30_000;
+/// How often a beat reaches the object's live record, in milliseconds.
+pub(crate) const BEAT_WRITE_MS: u64 = 30_000;
+/// How long a running job may go without a beat before it is lost, in
+/// milliseconds.
+pub(crate) const LOST_AFTER_MS: u64 = 120_000;
+/// How long a launched job may go without an agent before it is stuck,
+/// in milliseconds.
+pub(crate) const STUCK_LAUNCH_MS: u64 = 600_000;
+/// How long past its timeout a running job may go before the object
+/// ends it, in milliseconds. The agent ends the job at its timeout; this
+/// covers one that cannot report.
+pub(crate) const TIMEOUT_GRACE_MS: u64 = 5 * 60_000;
 /// How long a cancelled job has to stop before it is told to stop hard,
 /// in milliseconds.
 const ESCALATE_AFTER_MS: u64 = 5 * 60 * 1000;
@@ -105,6 +117,11 @@ const TODO: &str = "todo";
 
 fn job_key(job: u64) -> String {
     format!("job:{job}")
+}
+
+/// Where the object keeps what a job is doing, under `live:<id>`.
+fn live_key(job: u64) -> String {
+    format!("live:{job}")
 }
 
 /// Where the state of an ended run is kept in R2. `days` is the
@@ -246,8 +263,6 @@ pub struct JobState {
     pub last_seq: u64,
     /// The GitHub token the agent holds, until it is revoked.
     pub github_token: Option<String>,
-    /// When the heartbeat last reached Postgres, in Unix milliseconds.
-    pub heartbeat_written_at: u64,
     /// Check run requests for this attempt that failed in a row.
     pub send_failures: u32,
     /// The finished log is not in R2 yet. Its chunks and [`Sealed`] stay
@@ -257,6 +272,33 @@ pub struct JobState {
     pub held: Option<String>,
     /// The token scopes the App holds less of than the job asked.
     pub capped: Vec<Capped>,
+}
+
+/// What the object keeps to tell whether a job is alive, under `live:<id>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Live {
+    /// The attempt the record is for.
+    pub attempt: u32,
+    /// When the launch consumer started the instance, in Unix
+    /// milliseconds. `None` until it posts back.
+    pub launched_at: Option<u64>,
+    /// When the agent claimed the job, in Unix milliseconds.
+    pub started_at: Option<u64>,
+    /// When the last beat was stored, in Unix milliseconds.
+    pub beat_at: Option<u64>,
+    /// The most milliseconds the job may run.
+    pub timeout_ms: u64,
+}
+
+/// Why a job with a live record ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Expiry {
+    /// A launched job never started.
+    Stuck,
+    /// A running job stopped sending beats.
+    Lost,
+    /// A running job ran past its timeout.
+    TimedOut,
 }
 
 /// A finished job's log as it waits for the upload.
@@ -278,6 +320,8 @@ pub struct Sealed {
 pub struct Deadlines {
     /// When cancelled jobs that have not stopped are told to stop hard.
     pub escalate_at: Option<u64>,
+    /// When the earliest live job deadline ends.
+    pub jobs_at: Option<u64>,
     /// When uploads that failed are tried again.
     pub upload_retry_at: Option<u64>,
     /// When the ended run's state is written to R2.
@@ -563,7 +607,7 @@ mod tests {
 
     #[test]
     fn deadlines_stored_before_the_flush_retry_still_load() {
-        let old = r#"{"escalate_at":null,"upload_retry_at":5,"snapshot_at":null,"purge_at":null,"todo_retry_at":null,"failures":1}"#;
+        let old = r#"{"escalate_at":null,"jobs_at":null,"upload_retry_at":5,"snapshot_at":null,"purge_at":null,"todo_retry_at":null,"failures":1}"#;
         let deadlines: Deadlines = serde_json::from_str(old).unwrap();
         assert_eq!(deadlines.upload_retry_at, Some(5));
         assert_eq!(deadlines.flush_retry_at, None);
@@ -656,7 +700,7 @@ mod tests {
         let todo: Todo = serde_json::from_str(r#"{"next":2,"items":[]}"#).unwrap();
         assert_eq!(todo.chains.len(), 0);
         let deadlines: Deadlines = serde_json::from_str(
-            r#"{"escalate_at":null,"upload_retry_at":null,"snapshot_at":null,"purge_at":null,"todo_retry_at":null,"failures":0}"#,
+            r#"{"escalate_at":null,"jobs_at":null,"upload_retry_at":null,"snapshot_at":null,"purge_at":null,"todo_retry_at":null,"failures":0}"#,
         )
         .unwrap();
         assert_eq!(deadlines.chain_retry_at, None);

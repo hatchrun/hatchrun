@@ -74,8 +74,6 @@ pub struct JobRow {
     pub timeout_minutes: u32,
     /// When the row last changed.
     pub updated_at: u64,
-    /// The agent's last sign of life.
-    pub heartbeat_at: Option<u64>,
     /// When the agent started it.
     pub started_at: Option<u64>,
     /// When it finished.
@@ -126,7 +124,7 @@ fn json_text<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<serde_json:
 
 /// The columns of a [`JobRow`].
 pub(super) const JOB_COLUMNS: &str = "id, run_id, plan_id, name, status, conclusion, instance_id, attempt, \
-     launch_attempts, capacity_attempts, capacity_since, next_launch_at, timeout_minutes, updated_at, heartbeat_at, started_at, \
+     launch_attempts, capacity_attempts, capacity_since, next_launch_at, timeout_minutes, updated_at, started_at, \
      completed_at, steps::text AS steps, log_key, template, \
      token_permissions::text AS token_permissions, secret_refs::text AS secret_refs, held, \
      environment, environment_url, approval_attempt, approval_decision, approval_by, \
@@ -167,9 +165,10 @@ const JOB: &str = "SELECT {columns} FROM ci_jobs WHERE id = $1";
 const SET_CACHE_SCOPES: &str = "UPDATE ci_jobs SET cache_scopes = COALESCE(cache_scopes, $3) \
      WHERE id = $1 AND attempt = $2 RETURNING cache_scopes";
 
-/// Starts running job `$1` at `$2`, which is also its first heartbeat.
+/// Starts running job `$1` at `$2`. Only a job that is launching or
+/// launched starts; returns whether it did.
 const START_JOB: &str = "UPDATE ci_jobs SET status = 'running', started_at = $2, \
-     heartbeat_at = $2, updated_at = $2 \
+     updated_at = $2 \
      WHERE id = $1 AND status IN ('launching', 'launched')";
 
 /// Sets job `$1` up for attempt `$2` at `$3`: nothing of the earlier
@@ -177,7 +176,7 @@ const START_JOB: &str = "UPDATE ci_jobs SET status = 'running', started_at = $2,
 /// alone, so a late repeat does nothing.
 const RESET_JOB: &str = "UPDATE ci_jobs SET status = 'waiting', attempt = $2, launch_attempts = 0, \
      capacity_attempts = 0, capacity_since = NULL, conclusion = NULL, instance_id = NULL, launch_error = NULL, next_launch_at = NULL, \
-     heartbeat_at = NULL, started_at = NULL, completed_at = NULL, log_key = NULL, \
+     started_at = NULL, completed_at = NULL, log_key = NULL, \
      held = NULL, steps = '[]', environment_url = NULL, superseded = false, cache_scopes = NULL, \
      updated_at = $3 \
      WHERE id = $1 AND attempt < $2";
@@ -341,16 +340,20 @@ const LAUNCH_GAVE_UP: &str = "UPDATE ci_jobs SET status = 'completed', conclusio
      launch_error = $2, next_launch_at = NULL, completed_at = $3, updated_at = $3 \
      WHERE id = $1 AND status = 'launching'";
 
-/// Records the agent's heartbeat for job `$1` at `$2`.
-const HEARTBEAT: &str = "UPDATE ci_jobs SET heartbeat_at = $2, updated_at = $2 \
-     WHERE id = $1 AND status <> 'completed'";
-
 /// Completes attempt `$6` of job `$1` with conclusion `$2`, steps `$3`
 /// (JSON text) and log key `$4` at `$5`.
 const FINISH_JOB: &str = "UPDATE ci_jobs SET status = 'completed', conclusion = $2, \
      steps = $3::jsonb, log_key = $4, completed_at = $5, updated_at = $5, \
      environment_url = $7::text \
      WHERE id = $1 AND status <> 'completed' AND attempt = $6";
+
+/// Completes attempt `$2` of job `$1` as failed at `$3`, only while the
+/// row still has status `$4` and was last changed at `$5`: what the
+/// reconciler saw when it chose to end it. Steps, log and deployment are
+/// left as they are.
+const FAIL_UNCHANGED_JOB: &str = "UPDATE ci_jobs SET status = 'completed', conclusion = 'failure', \
+     completed_at = $3, updated_at = $3 \
+     WHERE id = $1 AND attempt = $2 AND status = $4 AND updated_at = $5";
 
 /// Records the usage of attempt `$3` of job `$1`, completed at `$2`,
 /// from the row as the update before it left it: nothing is written
@@ -686,9 +689,8 @@ pub async fn job(db: &Db, job_id: u64) -> Result<Option<JobRow>> {
         .await
 }
 
-/// Starts job `job_id`: running, with `now` as its start and first
-/// heartbeat. Only a job that is launching or launched starts; returns
-/// whether it did.
+/// Starts job `job_id`: running, with `now` as its start. Only a job
+/// that is launching or launched starts; returns whether it did.
 ///
 /// # Errors
 ///
@@ -1027,16 +1029,6 @@ pub async fn capacity_wait(
         == 1)
 }
 
-/// Records the agent's heartbeat for job `job_id`.
-///
-/// # Errors
-///
-/// Postgres refused the statement.
-pub async fn heartbeat(db: &Db, job_id: u64, now: u64) -> Result<()> {
-    db.run(HEARTBEAT, &params![job_id, now]).await?;
-    Ok(())
-}
-
 /// Completes attempt `attempt` of job `job_id` with its `conclusion`,
 /// `steps`, the key of its finished log and the URL of its deployment. A completed job, and a job
 /// of another attempt, keep what they have; returns whether this call
@@ -1077,6 +1069,38 @@ pub async fn finish_job(
                     job_id,
                     now,
                     attempt,
+                    template_prices(),
+                    templates::UNIT_PRICE_MICROS_PER_MINUTE
+                ],
+            ),
+        ])
+        .await?;
+    Ok(changes.first() == Some(&1))
+}
+
+/// Completes attempt `row.attempt` of job `row.id` as failed at `now`,
+/// only while the row is as `row` read it: same status and last change.
+/// A job that moved on since (a launch that reached the agent, a job
+/// that started) keeps what it has. Returns whether this call completed
+/// it; a job that was claimed gets its seconds recorded, as
+/// [`finish_job`] does.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn fail_unchanged_job(db: &Db, row: &JobRow, now: u64) -> Result<bool> {
+    let changes = db
+        .batch(&[
+            (
+                FAIL_UNCHANGED_JOB,
+                params![row.id, row.attempt, now, &row.status, row.updated_at],
+            ),
+            (
+                RECORD_USAGE,
+                params![
+                    row.id,
+                    now,
+                    row.attempt,
                     template_prices(),
                     templates::UNIT_PRICE_MICROS_PER_MINUTE
                 ],
