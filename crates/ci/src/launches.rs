@@ -636,6 +636,7 @@ async fn recheck_tenant(env: &Env, db: &Db, tenant_id: &str, now: u64) {
         hatchrun_workflow::MAX_RUNNING_JOBS,
         now,
         ci_wake::WAKE_LIMIT,
+        None,
     )
     .await
     {

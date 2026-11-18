@@ -589,7 +589,7 @@ fn the_lost_wake_query_wakes_room_under_the_repositorys_fork_cap() {
         .unwrap();
     // Two of two places run: nothing is free.
     let none = db
-        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40))
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 100, 40, None))
         .unwrap();
     assert_eq!(none, Vec::new());
     // A job ends: the held one is the one to wake.
@@ -602,7 +602,7 @@ fn the_lost_wake_query_wakes_room_under_the_repositorys_fork_cap() {
     ))
     .unwrap();
     let woken = db
-        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 102, 40))
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 102, 40, None))
         .unwrap();
     assert_eq!(
         woken.iter().map(|w| w.job_id).collect::<Vec<_>>(),
@@ -610,7 +610,7 @@ fn the_lost_wake_query_wakes_room_under_the_repositorys_fork_cap() {
     );
     // Marked already: a second pass wakes nothing.
     let none = db
-        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 103, 40))
+        .wait(ci_wake::lost_wakes(db.db(), Some("t1"), 5, 103, 40, None))
         .unwrap();
     assert_eq!(none, Vec::new());
 }

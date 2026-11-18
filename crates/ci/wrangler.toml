@@ -112,6 +112,23 @@ max_batch_size = 10
 max_batch_timeout = 5
 max_retries = 3
 
+# The reconciler's own shards. The Cron Trigger's pass sends one pass
+# message and one schedule message per shard here (see
+# crates/ci/src/shard.rs), and this Worker's consumer runs each
+# message's shard alone. Single-message batches, so a slow shard never
+# holds another one's work; nothing is retried, since the next minute's
+# pass repeats what a failed one left undone.
+[[queues.producers]]
+binding = "CI_RECONCILE"
+queue = "hatchrun-ci-reconcile"
+
+[[queues.consumers]]
+queue = "hatchrun-ci-reconcile"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 0
+max_concurrency = 32
+
 # Alert emails, sent through Cloudflare Email Service from
 # alerts@notify.hatchrun.io, a subdomain onboarded to Email Sending so
 # hatchrun.io's own mail records stay as they are. The binding sends
