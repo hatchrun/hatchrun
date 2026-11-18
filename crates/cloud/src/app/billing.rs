@@ -366,9 +366,9 @@ mod tests {
             db.run(
                 "INSERT INTO ci_jobs (run_id, tenant_id, tier, run_created_at, plan_id, name, status, \
                  timeout_minutes, held, created_at, updated_at, template, token_permissions, \
-                 secret_refs, needs) \
+                 secret_refs, needs, bucket) \
                  SELECT id, tenant_id, 30, 1, $1, $1, 'queued', 10, 'card', 1, 1, 'hatchrun', '{}', \
-                 '{}', '[]' FROM ci_runs",
+                 '{}', '[]', ci_shard_bucket(repo_id) FROM ci_runs",
                 &params![plan],
             );
         }
