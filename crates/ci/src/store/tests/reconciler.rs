@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
+use hatchrun_cloud::testdb::Db as TestDb;
 
 #[test]
 fn schedules_are_read_a_page_at_a_time() {
@@ -36,7 +37,7 @@ fn schedules_are_read_a_page_at_a_time() {
     let mut pages = 0;
     loop {
         let page = db
-            .wait(schedules_after(db.db(), after.as_ref(), 2))
+            .wait(schedules_after(db.db(), after.as_ref(), 2, None))
             .unwrap();
         pages += 1;
         assert!(page.len() <= 2);
@@ -484,4 +485,254 @@ fn an_audit_month_drops_once_it_is_older_than_four_hundred_days() {
         .column("SELECT COUNT(*) AS n FROM ci_audit", &[], "n")
         .unwrap();
     assert_eq!(audits, 0);
+}
+
+#[test]
+fn sql_ci_shard_bucket_matches_shard_bucket() {
+    use crate::shard::bucket;
+    let db = setup();
+    for repo_id in [
+        0,
+        1,
+        7,
+        8,
+        123_456_789,
+        1_000_000_000,
+        4_000_000_000,
+        9_000_000_000_000,
+    ] {
+        let sql: u16 = db
+            .column("SELECT ci_shard_bucket($1) AS n", &params![repo_id], "n")
+            .unwrap();
+        assert_eq!(sql, bucket(repo_id), "{repo_id}");
+    }
+}
+
+/// A second repository of the tenant, whose shard differs from repo 7.
+fn other_repo(db: &TestDb) {
+    db.run(
+        "INSERT INTO ci_repos (id, tenant_id, installation_id, full_name, default_branch, \
+         private, updated_at) VALUES (8, 't1', 99, 'acme/lib', 'main', false, 1)",
+        &[],
+    );
+}
+
+#[test]
+fn stalled_jobs_with_a_range_return_only_that_shards_jobs() {
+    use crate::shard::Shard;
+    let db = setup();
+    other_repo(&db);
+    let seven = db
+        .wait(make_run(db.db(), &new_run("seven", "ci", 1_000)))
+        .unwrap()
+        .unwrap();
+    let eight = db
+        .wait(make_run(
+            db.db(),
+            &NewRun {
+                repo_id: 8,
+                ..new_run("eight", "ci", 1_000)
+            },
+        ))
+        .unwrap()
+        .unwrap();
+    for run in [&seven, &eight] {
+        let ids = db
+            .wait(insert_jobs(db.db(), run.id, &[new_job("build")], 1_000))
+            .unwrap();
+        db.wait(set_job(db.db(), ids[0].1, "queued", None, 1_001))
+            .unwrap();
+    }
+    let a = Shard::of_repo(7);
+    let b = Shard::of_repo(8);
+    assert_ne!(a, b);
+    let now = 10_000_000;
+    let in_a = db
+        .wait(stalled_jobs(
+            db.db(),
+            now,
+            Some(a.range()),
+            StalledCursor::default(),
+            50,
+        ))
+        .unwrap();
+    let in_b = db
+        .wait(stalled_jobs(
+            db.db(),
+            now,
+            Some(b.range()),
+            StalledCursor::default(),
+            50,
+        ))
+        .unwrap();
+    let all = db
+        .wait(stalled_jobs(
+            db.db(),
+            now,
+            None,
+            StalledCursor::default(),
+            50,
+        ))
+        .unwrap();
+    assert_eq!(
+        in_a.iter().map(|row| row.run_id).collect::<Vec<_>>(),
+        [seven.id]
+    );
+    assert_eq!(
+        in_b.iter().map(|row| row.run_id).collect::<Vec<_>>(),
+        [eight.id]
+    );
+    let mut unioned: Vec<u64> = in_a.iter().chain(&in_b).map(|row| row.id).collect();
+    unioned.sort_unstable();
+    let mut every: Vec<u64> = all.iter().map(|row| row.id).collect();
+    every.sort_unstable();
+    assert_eq!(unioned, every);
+}
+
+#[test]
+fn schedules_after_with_a_range_partitions_the_schedules() {
+    use crate::shard::Shard;
+    let db = setup();
+    other_repo(&db);
+    db.wait(replace_schedules(
+        db.db(),
+        7,
+        &[("ci".to_owned(), "* * * * *".to_owned())],
+    ))
+    .unwrap();
+    db.wait(replace_schedules(
+        db.db(),
+        8,
+        &[("ci".to_owned(), "*/5 * * * *".to_owned())],
+    ))
+    .unwrap();
+    let a = Shard::of_repo(7);
+    let b = Shard::of_repo(8);
+    assert_ne!(a, b);
+    let in_a = db
+        .wait(schedules_after(db.db(), None, 10, Some(a.range())))
+        .unwrap();
+    let in_b = db
+        .wait(schedules_after(db.db(), None, 10, Some(b.range())))
+        .unwrap();
+    let all = db.wait(schedules_after(db.db(), None, 10, None)).unwrap();
+    assert_eq!(in_a.iter().map(|row| row.repo_id).collect::<Vec<_>>(), [7]);
+    assert_eq!(in_b.iter().map(|row| row.repo_id).collect::<Vec<_>>(), [8]);
+    assert_eq!(all.len(), 2);
+}
+
+#[test]
+fn shard_leases_are_per_shard() {
+    let db = setup();
+    assert!(db.wait(shard_lease(db.db(), 0, 256, 100, 200)).unwrap());
+    assert!(
+        db.wait(shard_lease(db.db(), 256, 512, 100, 200)).unwrap(),
+        "another shard leases alone"
+    );
+    assert!(
+        !db.wait(shard_lease(db.db(), 0, 256, 150, 300)).unwrap(),
+        "the same shard twice is refused"
+    );
+    assert!(
+        db.wait(shard_lease(db.db(), 0, 256, 201, 300)).unwrap(),
+        "an expired lease is taken"
+    );
+    assert!(db.wait(schedule_lease(db.db(), 0, 256, 100, 200)).unwrap());
+    assert!(
+        !db.wait(schedule_lease(db.db(), 0, 256, 150, 300)).unwrap(),
+        "the schedule lease twice is refused"
+    );
+    assert!(
+        db.wait(schedule_lease(db.db(), 256, 512, 150, 300))
+            .unwrap(),
+        "another shard schedules alone"
+    );
+}
+
+#[test]
+fn an_overlapping_range_is_refused_until_its_lease_runs_out() {
+    let db = setup();
+    assert!(db.wait(shard_lease(db.db(), 0, 256, 100, 200)).unwrap());
+    db.wait(ensure_shard(db.db(), 128, 256, 150)).unwrap();
+    assert!(
+        !db.wait(shard_lease(db.db(), 128, 256, 150, 300)).unwrap(),
+        "a range inside a held one is refused"
+    );
+    assert!(
+        db.wait(schedule_lease(db.db(), 128, 256, 150, 300))
+            .unwrap(),
+        "the other kind leases alone"
+    );
+    assert!(
+        db.wait(shard_lease(db.db(), 256, 512, 150, 300)).unwrap(),
+        "a disjoint range still leases"
+    );
+    assert!(
+        db.wait(shard_lease(db.db(), 128, 256, 201, 300)).unwrap(),
+        "an expired overlap leases again"
+    );
+}
+
+#[test]
+fn a_new_shard_count_takes_over_a_row_once_its_leases_run_out() {
+    let db = setup();
+    let end = |db: &TestDb| -> Option<u64> {
+        db.column(
+            "SELECT end_bucket AS n FROM ci_shards WHERE first_bucket = 0",
+            &[],
+            "n",
+        )
+        .unwrap()
+    };
+    assert!(db.wait(shard_lease(db.db(), 0, 256, 100, 200)).unwrap());
+    db.wait(ensure_shard(db.db(), 0, 128, 150)).unwrap();
+    assert_eq!(end(&db), Some(256), "a held row keeps its old range");
+    assert!(
+        !db.wait(shard_lease(db.db(), 0, 128, 150, 300)).unwrap(),
+        "the new range does not lease the old row"
+    );
+    db.wait(ensure_shard(db.db(), 0, 128, 201)).unwrap();
+    assert_eq!(end(&db), Some(128), "an expired row takes the new range");
+    db.wait(ensure_shard(db.db(), 128, 256, 201)).unwrap();
+    assert!(db.wait(shard_lease(db.db(), 0, 128, 201, 300)).unwrap());
+    assert!(
+        db.wait(shard_lease(db.db(), 128, 256, 201, 300)).unwrap(),
+        "the two halves lease alone once the old range is gone"
+    );
+}
+
+#[test]
+fn ensure_shard_seeds_last_minute_behind_the_oldest_and_keeps_rows() {
+    let db = setup();
+    db.run(
+        "UPDATE ci_shards SET last_minute = 2000000 WHERE first_bucket = 0",
+        &[],
+    );
+    db.run(
+        "UPDATE ci_shards SET last_minute = 1000000 WHERE first_bucket = 256",
+        &[],
+    );
+    db.run("DELETE FROM ci_shards WHERE first_bucket = 512", &[]);
+    db.wait(ensure_shard(db.db(), 512, 768, 0)).unwrap();
+    let seeded: Option<u64> = db
+        .column(
+            "SELECT last_minute AS n FROM ci_shards WHERE first_bucket = 512",
+            &[],
+            "n",
+        )
+        .unwrap();
+    assert_eq!(
+        seeded,
+        Some(700_000),
+        "five minutes behind the oldest shard"
+    );
+    db.wait(ensure_shard(db.db(), 0, 256, 0)).unwrap();
+    let kept: Option<u64> = db
+        .column(
+            "SELECT last_minute AS n FROM ci_shards WHERE first_bucket = 0",
+            &[],
+            "n",
+        )
+        .unwrap();
+    assert_eq!(kept, Some(2_000_000), "an existing row is not overwritten");
 }

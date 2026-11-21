@@ -30,9 +30,10 @@
 //!   binding's host reaches it; `hatchrun-cloud`'s `/healthz` asks it
 //!   (see [`alerts`]).
 //!
-//! A Cron Trigger runs the reconciler every minute (stuck jobs,
-//! schedules, expiry, deliveries), and the `hatchrun-ci-launches` queue
-//! starts the instances. The webhook stores each verified delivery and
+//! A Cron Trigger runs the reconciler every minute (fork approvals,
+//! cancels, expiry, deliveries), which fans one pass and one schedule
+//! message per shard out to the `hatchrun-ci-reconcile` queue, and the
+//! `hatchrun-ci-launches` queue starts the instances. The webhook stores each verified delivery and
 //! the `hatchrun-ci-deliveries` queue plans it. Alerts about the reconciler, failed launches, GitHub's
 //! rate limit and the database go out by email (see [`alerts`]). Every
 //! other path answers 404.
@@ -69,8 +70,10 @@ pub mod reconcile;
 pub mod remote;
 pub mod run;
 pub mod runs;
+pub mod scheduler;
 pub mod secrets;
 pub mod settings_api;
+pub mod shard;
 pub mod store;
 pub mod token;
 pub mod trust;
@@ -135,10 +138,11 @@ async fn healthz(env: &Env) -> Result<Response> {
     Ok(response)
 }
 
-/// The launch and delivery queues and their dead-letter queues (see
-/// [`launches`] and [`deliveries`]). Each queue's messages read as its
-/// own type: the batch arrives untyped and is decoded per queue, so a
-/// batch of one queue never reads as the other's.
+/// The launch, delivery and reconcile queues and the launch queue's
+/// dead-letter queue (see [`launches`], [`deliveries`] and
+/// [`reconcile`]). Each queue's messages read as its own type: the
+/// batch arrives untyped and is decoded per queue, so a batch of one
+/// queue never reads as the other's.
 #[event(queue)]
 async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) -> Result<()> {
     match batch.queue().as_str() {
@@ -146,6 +150,7 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
         launches::DEAD_LETTERS => launches::dead_letters(batch, env).await,
         deliveries::QUEUE => deliveries::consume(batch, env).await,
         deliveries::DEAD_LETTERS => deliveries::dead_letters(&batch),
+        reconcile::QUEUE => reconcile::consume(batch, env).await,
         other => {
             // No consumer reads this queue: retrying would loop
             // forever, so the batch is logged and acked.

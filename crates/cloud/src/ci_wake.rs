@@ -49,39 +49,57 @@ const HELD: &str = "UPDATE ci_jobs SET next_launch_at = $4 WHERE id IN (\
     AND status = 'queued' AND held = $2 AND next_launch_at IS NULL \
     RETURNING id AS job_id, attempt";
 
-/// Turns the card and spend-cap holds of tenant `$1` into concurrency
-/// holds, which a finishing job wakes one by one in order. Rows keep
-/// their `next_launch_at`.
+/// Turns the card and spend-cap holds of tenant `$1` in buckets `$2`
+/// to `$3` into concurrency holds, which a finishing job wakes one by
+/// one in order. Rows keep their `next_launch_at`.
 const RELEASE_TENANT: &str = "UPDATE ci_jobs SET held = 'concurrency' \
-      WHERE tenant_id = $1 AND status = 'queued' AND held IN ('card', 'spend_cap')";
+      WHERE tenant_id = $1 AND status = 'queued' AND held IN ('card', 'spend_cap') \
+      AND bucket >= $2 AND bucket < $3";
 
 /// Frees up to `$3` approval holds nobody looked at since `$1` whose
 /// environment no longer exists or no longer asks for approval, or whose
-/// attempt has a decision already (an approval that raced the hold), due
-/// at `$2`, and returns them. The consumer checks such a job again: it
-/// runs, or fails when the environment is gone.
+/// attempt has a decision already (an approval that raced the hold), in
+/// buckets `$4` to `$5`, due at `$2`, and returns them. A row freed
+/// by an overlapping pass meanwhile is skipped. The consumer checks
+/// such a job again: it runs, or fails when the environment is gone.
 const RELEASE_ORPHAN_APPROVALS: &str = "UPDATE ci_jobs SET held = NULL, next_launch_at = $2, \
         updated_at = $2 WHERE id IN (\
         SELECT ci_jobs.id FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
         WHERE ci_jobs.status = 'queued' \
         AND ci_jobs.held = 'approval' AND ci_jobs.updated_at < $1 \
+        AND ci_jobs.bucket >= $4 AND ci_jobs.bucket < $5 \
         AND ((ci_jobs.approval_attempt = ci_jobs.attempt AND ci_jobs.approval_decision IS NOT NULL) \
           OR NOT EXISTS (SELECT 1 FROM ci_environments e WHERE e.repo_id = ci_runs.repo_id \
             AND e.tenant_id = ci_runs.tenant_id AND lower(e.name) = lower(ci_jobs.environment) AND e.approval)) \
         ORDER BY ci_jobs.id LIMIT $3) \
+      AND held = 'approval' \
       RETURNING ci_jobs.id AS job_id, ci_jobs.attempt";
 
 /// Frees up to `$3` fork approval holds nobody looked at since `$1`
-/// whose run no longer waits (a decision whose wake was lost), due at
-/// `$2`, and returns them. The consumer checks such a job again: it
-/// runs, or is left to its run's object when the run was cancelled.
+/// whose run no longer waits (a decision whose wake was lost), in
+/// buckets `$4` to `$5`, due at `$2`, and returns them. A row freed
+/// by an overlapping pass meanwhile is skipped. The consumer checks
+/// such a job again: it runs, or is left to its run's object when the
+/// run was cancelled.
 const RELEASE_ORPHAN_FORK_APPROVALS: &str = "UPDATE ci_jobs SET held = NULL, \
         next_launch_at = $2, updated_at = $2 WHERE id IN (\
         SELECT ci_jobs.id FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
         WHERE ci_jobs.status = 'queued' AND ci_jobs.held = 'fork_approval' \
         AND ci_jobs.updated_at < $1 AND ci_runs.gate_status NOT IN ('pending', 'deferred') \
+        AND ci_jobs.bucket >= $4 AND ci_jobs.bucket < $5 \
         ORDER BY ci_jobs.id LIMIT $3) \
+      AND held = 'fork_approval' \
       RETURNING ci_jobs.id AS job_id, ci_jobs.attempt";
+
+/// How many buckets repositories hash into (see `ci_shard_bucket` in
+/// migration 0032). A wake that reads no range reads every bucket.
+pub const BUCKETS: u16 = 4096;
+
+/// The bucket bounds of `range`: every bucket when it is `None`, as
+/// the event paths read.
+fn bounds(range: Option<(u16, u16)>) -> (u16, u16) {
+    range.unwrap_or((0, BUCKETS))
+}
 
 /// The oldest queued jobs held for `reason` of tenant `tenant` that no
 /// wake picked yet, marked and returned.
@@ -101,18 +119,25 @@ pub async fn held(
 
 /// The jobs to wake when the standing of `tenant` improved (the card is
 /// back or the cap is higher): its remaining card and spend-cap holds
-/// become concurrency holds, so the end of each job wakes the next in
-/// order, and the oldest of them the tenant has free places for, at
-/// most [`WAKE_LIMIT`], are marked and returned to wake now.
+/// in `range` become concurrency holds, so the end of each job wakes
+/// the next in order, and the oldest of them the tenant has free places
+/// for, at most [`WAKE_LIMIT`], are marked and returned to wake now.
+/// `None` reads every bucket, as the event paths do.
 ///
 /// # Errors
 ///
 /// Postgres refused a statement.
-pub async fn standing_improved(db: &Db, tenant: &str, now: u64) -> worker::Result<Vec<Woken>> {
-    db.run(RELEASE_TENANT, &params![tenant]).await?;
+pub async fn standing_improved(
+    db: &Db,
+    tenant: &str,
+    now: u64,
+    range: Option<(u16, u16)>,
+) -> worker::Result<Vec<Woken>> {
+    let (lo, hi) = bounds(range);
+    db.run(RELEASE_TENANT, &params![tenant, lo, hi]).await?;
     // Only as many as the tenant has places for: a tenant that still
     // runs its most jobs wakes nothing, and each end wakes the next.
-    lost_wakes(db, Some(tenant), WAKE_LIMIT, now, WAKE_LIMIT).await
+    lost_wakes(db, Some(tenant), WAKE_LIMIT, now, WAKE_LIMIT, range).await
 }
 
 /// The jobs to wake when tenant `tenant`'s card is back.
@@ -121,7 +146,7 @@ pub async fn standing_improved(db: &Db, tenant: &str, now: u64) -> worker::Resul
 ///
 /// Postgres refused a statement.
 pub async fn card_returned(db: &Db, tenant: &str, now: u64) -> worker::Result<Vec<Woken>> {
-    standing_improved(db, tenant, now).await
+    standing_improved(db, tenant, now, None).await
 }
 
 /// A tenant with queued card or spend-cap holds, and the reasons.
@@ -156,6 +181,7 @@ const BILLING_CANDIDATES: &str = "SELECT h.tenant_id, \
        string_agg(DISTINCT h.held, ',' ORDER BY h.held) AS reasons \
      FROM ci_jobs h JOIN tenants t ON t.id = h.tenant_id \
      WHERE h.status = 'queued' AND h.held IN ('card', 'spend_cap') \
+     AND h.bucket >= $4 AND h.bucket < $5 \
      GROUP BY h.tenant_id, t.beta \
      HAVING (bool_or(h.held = 'card') AND (t.beta OR EXISTS (SELECT 1 FROM subscriptions s \
          WHERE s.tenant_id = h.tenant_id AND s.status IN ('active', 'trialing')))) \
@@ -179,14 +205,18 @@ const BILLING_CANDIDATES: &str = "SELECT h.tenant_id, \
              ELSE p.start_ms END > min(h.updated_at)))) \
      ORDER BY min(h.updated_at), h.tenant_id LIMIT $3";
 
-/// Marks the card and spend-cap holds of tenant `$1` checked at `$2`:
-/// the backstop read the standing and the holds stand.
+/// Marks the card and spend-cap holds of tenant `$1` in buckets `$3`
+/// to `$4` checked at `$2`: the backstop read the standing and the
+/// holds stand.
 const BILLING_CHECKED: &str = "UPDATE ci_jobs SET updated_at = $2 \
-     WHERE tenant_id = $1 AND status = 'queued' AND held IN ('card', 'spend_cap')";
+     WHERE tenant_id = $1 AND status = 'queued' AND held IN ('card', 'spend_cap') \
+     AND bucket >= $3 AND bucket < $4";
 
 /// The tenants whose billing holds an event may have freed without
-/// waking them, at most `limit`: see [`BILLING_CANDIDATES`]. A tenant
-/// with no such event is not read, however long its jobs wait.
+/// waking them, holding jobs in `range`, at most `limit`: see
+/// [`BILLING_CANDIDATES`]. A tenant with no such event is not read,
+/// however long its jobs wait. `None` reads every bucket, as the event
+/// paths do.
 ///
 /// # Errors
 ///
@@ -196,26 +226,43 @@ pub async fn billing_candidates(
     now: u64,
     month_start: u64,
     limit: u32,
+    range: Option<(u16, u16)>,
 ) -> worker::Result<Vec<BillingHolds>> {
-    db.all(BILLING_CANDIDATES, &params![now, month_start, limit])
-        .await
+    let (lo, hi) = bounds(range);
+    db.all(
+        BILLING_CANDIDATES,
+        &params![now, month_start, limit, lo, hi],
+    )
+    .await
 }
 
-/// Marks the billing holds of `tenant` checked at `now`, so it leaves
-/// [`billing_candidates`] until the next event.
+/// Marks the billing holds of `tenant` in `range` checked at `now`, so
+/// it leaves [`billing_candidates`] until the next event. `None` marks
+/// every bucket, as the event paths do.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn billing_checked(db: &Db, tenant: &str, now: u64) -> worker::Result<()> {
-    db.run(BILLING_CHECKED, &params![tenant, now]).await?;
+pub async fn billing_checked(
+    db: &Db,
+    tenant: &str,
+    now: u64,
+    range: Option<(u16, u16)>,
+) -> worker::Result<()> {
+    let (lo, hi) = bounds(range);
+    db.run(BILLING_CHECKED, &params![tenant, now, lo, hi])
+        .await?;
     Ok(())
 }
 
 /// Marks up to `$4` unwoken held jobs of tenant `$1` (every tenant when
-/// `$1` is NULL) whose condition is clear now, and returns them: the
-/// post-hold recheck and the backstop use the same query. Each reason
-/// wakes at most the places free for it, oldest first:
+/// `$1` is NULL) in buckets `$5` to `$6` whose condition is clear now,
+/// and returns them: the post-hold recheck and the backstop use the same
+/// query. Each reason wakes at most the places free for it, oldest
+/// first. Only the picked rows are in the range: the room reads count
+/// every bucket of the tenant. Two shards that wake one tenant at the
+/// same moment can wake more jobs than it has places for; the consumer
+/// checks the caps again and holds the extra ones.
 ///
 /// - `concurrency`: at most `$3` minus the tenant's live jobs
 ///   (launching, launched, running) minus its marked concurrency holds;
@@ -241,9 +288,14 @@ pub async fn lost_wakes(
     max_running: u32,
     now: u64,
     limit: u32,
+    range: Option<(u16, u16)>,
 ) -> worker::Result<Vec<Woken>> {
-    db.all(LOST_WAKES, &params![tenant, now, max_running, limit])
-        .await
+    let (lo, hi) = bounds(range);
+    db.all(
+        LOST_WAKES,
+        &params![tenant, now, max_running, limit, lo, hi],
+    )
+    .await
 }
 
 const LOST_WAKES: &str = "WITH candidates AS (\
@@ -258,7 +310,8 @@ const LOST_WAKES: &str = "WITH candidates AS (\
               AND m.next_launch_at IS NOT NULL) AS room \
         FROM ci_jobs j \
         WHERE j.status = 'queued' AND j.held = 'concurrency' AND j.next_launch_at IS NULL \
-          AND ($1::text IS NULL OR j.tenant_id = $1)) ranked \
+          AND ($1::text IS NULL OR j.tenant_id = $1) \
+          AND j.bucket >= $5 AND j.bucket < $6) ranked \
       WHERE place <= room \
     UNION ALL \
       SELECT id FROM (\
@@ -274,6 +327,7 @@ const LOST_WAKES: &str = "WITH candidates AS (\
         FROM ci_jobs j \
         WHERE j.status = 'queued' AND j.held = 'max_parallel' AND j.next_launch_at IS NULL \
           AND j.strategy_group IS NOT NULL AND j.max_parallel IS NOT NULL \
+          AND j.bucket >= $5 AND j.bucket < $6 \
           AND ($1::text IS NULL OR j.tenant_id = $1)) ranked \
       WHERE place <= room \
     UNION ALL \
@@ -294,11 +348,13 @@ const LOST_WAKES: &str = "WITH candidates AS (\
         FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id \
         WHERE j.status = 'queued' AND j.held = 'fork_limit' AND j.next_launch_at IS NULL \
           AND r.trust = 'fork' \
+          AND j.bucket >= $5 AND j.bucket < $6 \
           AND ($1::text IS NULL OR j.tenant_id = $1)) ranked \
       WHERE place <= room \
     UNION ALL \
       SELECT j.id FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id \
       WHERE j.status = 'queued' AND j.held = 'group' AND j.next_launch_at IS NULL \
+        AND j.bucket >= $5 AND j.bucket < $6 \
         AND ($1::text IS NULL OR j.tenant_id = $1) \
         AND EXISTS (SELECT 1 FROM ci_concurrency c WHERE c.repo_id = r.repo_id \
           AND ((c.job_id = j.id AND c.attempt = j.attempt) \
@@ -315,9 +371,10 @@ const LOST_WAKES: &str = "WITH candidates AS (\
     RETURNING id AS job_id, attempt";
 
 /// Frees the approval holds whose environment is gone or has approval
-/// off and that nobody looked at since `quiet_before`, so a release
-/// that failed when the environment changed never strands a job. The
-/// jobs come back to be sent to the launch queue.
+/// off and that nobody looked at since `quiet_before`, in buckets
+/// `range`, so a release that failed when the environment changed never
+/// strands a job. The jobs come back to be sent to the launch queue.
+/// `None` reads every bucket, as the event paths do.
 ///
 /// # Errors
 ///
@@ -327,15 +384,21 @@ pub async fn release_orphan_approvals(
     quiet_before: u64,
     now: u64,
     limit: u32,
+    range: Option<(u16, u16)>,
 ) -> worker::Result<Vec<Woken>> {
-    db.all(RELEASE_ORPHAN_APPROVALS, &params![quiet_before, now, limit])
-        .await
+    let (lo, hi) = bounds(range);
+    db.all(
+        RELEASE_ORPHAN_APPROVALS,
+        &params![quiet_before, now, limit, lo, hi],
+    )
+    .await
 }
 
 /// Frees the fork approval holds whose run was decided and that nobody
-/// looked at since `quiet_before`, so a wake that failed after an
-/// approval never strands a job. The jobs come back to be sent to the
-/// launch queue.
+/// looked at since `quiet_before`, in buckets `range`, so a wake that
+/// failed after an approval never strands a job. The jobs come back to
+/// be sent to the launch queue. `None` reads every bucket, as the
+/// event paths do.
 ///
 /// # Errors
 ///
@@ -345,10 +408,12 @@ pub async fn release_orphan_fork_approvals(
     quiet_before: u64,
     now: u64,
     limit: u32,
+    range: Option<(u16, u16)>,
 ) -> worker::Result<Vec<Woken>> {
+    let (lo, hi) = bounds(range);
     db.all(
         RELEASE_ORPHAN_FORK_APPROVALS,
-        &params![quiet_before, now, limit],
+        &params![quiet_before, now, limit, lo, hi],
     )
     .await
 }

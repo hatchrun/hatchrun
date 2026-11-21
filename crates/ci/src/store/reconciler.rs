@@ -49,20 +49,22 @@ const DELETE_SCHEDULES: &str = "DELETE FROM ci_schedules WHERE repo_id = $1";
 const INSERT_SCHEDULE: &str = "INSERT INTO ci_schedules (repo_id, workflow, cron) \
      VALUES ($1, $2, $3) ON CONFLICT DO NOTHING";
 
-/// Schedules, at most `$1`.
+/// Schedules of buckets `$2` to `$3`, at most `$1`.
 const SCHEDULES: &str = "SELECT repo_id, workflow, cron FROM ci_schedules \
+     WHERE bucket >= $2 AND bucket < $3 \
      ORDER BY repo_id, workflow, cron LIMIT $1";
 
-/// Schedules after repository `$1`, workflow `$2` and cron `$3`, at
-/// most `$4`.
+/// Schedules of buckets `$5` to `$6` after repository `$2`, workflow
+/// `$3` and cron `$4`, at most `$1`.
 const SCHEDULES_AFTER: &str = "SELECT repo_id, workflow, cron FROM ci_schedules \
-     WHERE (repo_id, workflow, cron) > ($1, $2, $3) \
-     ORDER BY repo_id, workflow, cron LIMIT $4";
+     WHERE (repo_id, workflow, cron) > ($2, $3, $4) AND bucket >= $5 AND bucket < $6 \
+     ORDER BY repo_id, workflow, cron LIMIT $1";
 
-/// The jobs a reconciler pass may have to act on, at most `limit`:
-/// queued, launching, launched and running jobs that are overdue
-/// against the limits of `now`, after `after` in the order of
-/// `(updated_at, id)`. `(0, 0)` reads from the start. See
+/// The jobs of `range` a reconciler pass may have to act on, at most
+/// `limit`: queued, launching, launched and running jobs that are
+/// overdue against the limits of `now`, in buckets `range` (`None` is
+/// every bucket), after `after` in the order of `(updated_at, id)`.
+/// `(0, 0)` reads from the start. See
 /// [`crate::reconcile::stalled`].
 ///
 /// # Errors
@@ -71,9 +73,11 @@ const SCHEDULES_AFTER: &str = "SELECT repo_id, workflow, cron FROM ci_schedules 
 pub async fn stalled_jobs(
     db: &Db,
     now: u64,
+    range: Option<(u16, u16)>,
     after: StalledCursor,
     limit: u32,
 ) -> Result<Vec<JobRow>> {
+    let (lo, hi) = range.unwrap_or((0, crate::shard::BUCKETS));
     db.all(
         &with_columns(STALLED_JOBS, JOB_COLUMNS),
         &params![
@@ -88,6 +92,8 @@ pub async fn stalled_jobs(
             after.id,
             limit,
             now.saturating_sub(crate::reconcile::QUEUED_QUIET_MS),
+            lo,
+            hi,
         ],
     )
     .await
@@ -116,55 +122,18 @@ impl StalledCursor {
     }
 }
 
-/// Where the last pass stopped in the stalled jobs.
-const STALLED_CURSOR: &str =
-    "SELECT stalled_after_at, stalled_after_id FROM ci_reconciler WHERE id = 1";
-
-/// Sets where the last pass stopped in the stalled jobs to `$1`, `$2`.
-const SET_STALLED_CURSOR: &str =
-    "UPDATE ci_reconciler SET stalled_after_at = $1, stalled_after_id = $2 WHERE id = 1";
-
-/// Where the last pass stopped in the stalled jobs; the start when none
-/// did.
-///
-/// # Errors
-///
-/// Postgres refused the statement.
-pub async fn stalled_cursor(db: &Db) -> Result<StalledCursor> {
-    Ok(db
-        .first::<StalledCursor>(STALLED_CURSOR, &[])
-        .await?
-        .unwrap_or_default())
-}
-
-/// Records where this pass stopped in the stalled jobs.
-///
-/// # Errors
-///
-/// Postgres refused the statement.
-pub async fn set_stalled_cursor(db: &Db, cursor: StalledCursor) -> Result<()> {
-    db.run(SET_STALLED_CURSOR, &params![cursor.updated_at, cursor.id])
-        .await?;
-    Ok(())
-}
-
 /// Takes the reconciler's lease until `$2` when it ran out before `$1`.
 const LEASE: &str = "UPDATE ci_reconciler SET lease_until = $2 WHERE id = 1 AND lease_until < $1";
 
-/// The last schedule minute fired.
-const LAST_MINUTE: &str = "SELECT last_minute FROM ci_reconciler WHERE id = 1";
-
-/// Sets the last schedule minute fired to `$1`.
-const SET_LAST_MINUTE: &str = "UPDATE ci_reconciler SET last_minute = $1 WHERE id = 1";
-
 /// Jobs a reconciler pass looks at, the least recently changed first,
-/// after `($6, $7)` in the order of `(updated_at, id)`, at most `$8`:
-/// queued ones due for a launch (`$1` now) or quiet since `$2` (a job
-/// held for capacity only when due, a woken held job only once its mark
-/// is quiet since `$9`), launching ones quiet since `$3`,
-/// launched ones quiet since `$5`, and running ones past their timeout
-/// and every grace since `$4`. [`crate::reconcile::stalled`] makes the
-/// same decisions over the rows.
+/// after `($6, $7)` in the order of `(updated_at, id)`, at most `$8`,
+/// in buckets `$10` to `$11`: queued ones due for a launch (`$1` now)
+/// or quiet since `$2` (a job held for capacity only when due, a woken
+/// held job only once its mark is quiet since `$9`), launching ones
+/// quiet since `$3`, launched ones quiet since `$5`, and running ones
+/// past their timeout and every grace since `$4`.
+/// [`crate::reconcile::stalled`] makes the same decisions over the
+/// rows.
 const STALLED_JOBS: &str = "SELECT {columns} FROM ci_jobs WHERE \
      ((status = 'queued' AND held IS NULL AND (next_launch_at <= $1 OR updated_at < $2)) \
      OR (status = 'queued' AND held = 'capacity' AND next_launch_at <= $1) \
@@ -172,6 +141,7 @@ const STALLED_JOBS: &str = "SELECT {columns} FROM ci_jobs WHERE \
      OR (status = 'launching' AND updated_at < $3) \
      OR (status = 'launched' AND updated_at < $5) \
      OR (status = 'running' AND COALESCE(started_at, updated_at) + timeout_minutes::bigint * 60000 < $4)) \
+     AND bucket >= $10 AND bucket < $11 \
      AND (updated_at, id) > ($6, $7) \
      ORDER BY updated_at, id LIMIT $8";
 
@@ -197,18 +167,20 @@ pub async fn replace_schedules(
     Ok(())
 }
 
-/// Schedules, at most `limit`.
+/// Schedules in buckets `range` (`None` is every bucket), at most
+/// `limit`.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
 pub async fn schedules(db: &Db, limit: u32) -> Result<Vec<ScheduleRow>> {
-    schedules_after(db, None, limit).await
+    schedules_after(db, None, limit, None).await
 }
 
-/// Schedules after `after` in the order of repository, workflow and
-/// cron, at most `limit`; from the first one when `after` is `None`.
-/// Passing the last row of a page reads the next page.
+/// Schedules in buckets `range` (`None` is every bucket) after `after`
+/// in the order of repository, workflow and cron, at most `limit`;
+/// from the first one when `after` is `None`. Passing the last row of
+/// a page reads the next page.
 ///
 /// # Errors
 ///
@@ -217,13 +189,15 @@ pub async fn schedules_after(
     db: &Db,
     after: Option<&ScheduleRow>,
     limit: u32,
+    range: Option<(u16, u16)>,
 ) -> Result<Vec<ScheduleRow>> {
+    let (lo, hi) = range.unwrap_or((0, crate::shard::BUCKETS));
     match after {
-        None => db.all(SCHEDULES, &params![limit]).await,
+        None => db.all(SCHEDULES, &params![limit, lo, hi]).await,
         Some(row) => {
             db.all(
                 SCHEDULES_AFTER,
-                &params![row.repo_id, &row.workflow, &row.cron, limit],
+                &params![limit, row.repo_id, &row.workflow, &row.cron, lo, hi],
             )
             .await
         }
@@ -238,32 +212,6 @@ pub async fn schedules_after(
 /// Postgres refused the statement.
 pub async fn lease(db: &Db, now: u64, until: u64) -> Result<bool> {
     Ok(db.run(LEASE, &params![now, until]).await? == 1)
-}
-
-/// The last schedule minute fired, in Unix milliseconds.
-///
-/// # Errors
-///
-/// Postgres refused the statement.
-pub async fn last_minute(db: &Db) -> Result<Option<u64>> {
-    #[derive(Deserialize)]
-    struct Minute {
-        last_minute: Option<u64>,
-    }
-    Ok(db
-        .first::<Minute>(LAST_MINUTE, &[])
-        .await?
-        .and_then(|row| row.last_minute))
-}
-
-/// Records the last schedule minute fired.
-///
-/// # Errors
-///
-/// Postgres refused the statement.
-pub async fn set_last_minute(db: &Db, minute_ms: u64) -> Result<()> {
-    db.run(SET_LAST_MINUTE, &params![minute_ms]).await?;
-    Ok(())
 }
 
 /// Makes sure the partitions of this month and the next two months

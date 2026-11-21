@@ -331,7 +331,13 @@ fn stalled_jobs_match_the_reconcilers_decisions() {
     set("old-waiting", "waiting", 0, None, None);
     set("old-completed", "completed", 0, None, None);
     let rows = db
-        .wait(stalled_jobs(db.db(), now, StalledCursor::default(), 50))
+        .wait(stalled_jobs(
+            db.db(),
+            now,
+            None,
+            StalledCursor::default(),
+            50,
+        ))
         .unwrap();
     let mut from_sql: Vec<String> = rows.iter().map(|row| row.plan_id.clone()).collect();
     from_sql.sort();
@@ -358,9 +364,15 @@ fn stalled_jobs_match_the_reconcilers_decisions() {
     sql_ids.sort_unstable();
     assert_eq!(from_rust, sql_ids);
     assert_eq!(
-        db.wait(stalled_jobs(db.db(), now, StalledCursor::default(), 2))
-            .unwrap()
-            .len(),
+        db.wait(stalled_jobs(
+            db.db(),
+            now,
+            None,
+            StalledCursor::default(),
+            2
+        ))
+        .unwrap()
+        .len(),
         2
     );
 }
@@ -382,17 +394,26 @@ fn stalled_jobs_page_after_the_cursor_it_keeps() {
         );
     }
     assert_eq!(
-        db.wait(stalled_cursor(db.db())).unwrap(),
+        db.wait(shard_stalled_cursor(db.db(), 0)).unwrap(),
         StalledCursor::default()
     );
     let first = db
-        .wait(stalled_jobs(db.db(), now, StalledCursor::default(), 2))
+        .wait(stalled_jobs(
+            db.db(),
+            now,
+            None,
+            StalledCursor::default(),
+            2,
+        ))
         .unwrap();
     assert_eq!(first.len(), 2);
     let cursor = StalledCursor::at(&first[1]);
-    db.wait(set_stalled_cursor(db.db(), cursor)).unwrap();
-    assert_eq!(db.wait(stalled_cursor(db.db())).unwrap(), cursor);
-    let rest = db.wait(stalled_jobs(db.db(), now, cursor, 2)).unwrap();
+    db.wait(set_shard_stalled_cursor(db.db(), 0, cursor))
+        .unwrap();
+    assert_eq!(db.wait(shard_stalled_cursor(db.db(), 0)).unwrap(), cursor);
+    let rest = db
+        .wait(stalled_jobs(db.db(), now, None, cursor, 2))
+        .unwrap();
     assert_eq!(rest.len(), 1);
     assert_eq!(rest[0].id, ids[2].1);
 }
@@ -624,9 +645,12 @@ fn lease_is_taken_once() {
 #[test]
 fn the_last_minute_is_kept() {
     let db = setup();
-    assert_eq!(db.wait(last_minute(db.db())).unwrap(), None);
-    db.wait(set_last_minute(db.db(), 60_000)).unwrap();
-    assert_eq!(db.wait(last_minute(db.db())).unwrap(), Some(60_000));
+    assert_eq!(db.wait(shard_last_minute(db.db(), 0)).unwrap(), None);
+    db.wait(set_shard_last_minute(db.db(), 0, 60_000)).unwrap();
+    assert_eq!(
+        db.wait(shard_last_minute(db.db(), 0)).unwrap(),
+        Some(60_000)
+    );
 }
 
 #[test]

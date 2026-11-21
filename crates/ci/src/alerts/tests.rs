@@ -861,10 +861,11 @@ fn failed_job(db: &Db) {
         "INSERT INTO ci_jobs (id, run_id, tenant_id, tier, run_created_at, plan_id, name, status, \
          conclusion, timeout_minutes, \
          launch_attempts, launch_error, steps, created_at, updated_at, token_permissions, \
-         secret_refs, needs) \
+         secret_refs, needs, bucket) \
          SELECT 5, id, tenant_id, 30, 0, 'build', 'build', 'completed', 'failure', 30, 4, \
          'RunInstances: InsufficientInstanceCapacity', '[]', 0, 0, \
-         '{\"metadata\":\"read\"}', '{\"all\":false,\"names\":[]}', '[]' FROM ci_runs",
+         '{\"metadata\":\"read\"}', '{\"all\":false,\"names\":[]}', '[]', \
+         ci_shard_bucket(repo_id) FROM ci_runs",
         &[],
     );
 }
