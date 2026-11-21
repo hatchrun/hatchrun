@@ -2305,6 +2305,11 @@ fn billing_wakes_with_a_range_stay_inside_it() {
     set_held(&db, seven, "card", MID_OCT);
     let eight = held_concurrency_job(&db, "t2", 8, "eight");
     set_held(&db, eight, "card", MID_OCT);
+    // The same tenant holds a billing job in another shard, so the
+    // bucket filter is what leaves it unstamped, not the tenant.
+    second_repo_of_t1(&db);
+    let nine = held_concurrency_job(&db, "t1", 9, "nine");
+    set_held(&db, nine, "card", MID_OCT);
     let a = Shard::of_repo(7);
     let b = Shard::of_repo(8);
     assert_ne!(a, b);
@@ -2347,6 +2352,17 @@ fn billing_wakes_with_a_range_stay_inside_it() {
         )
         .unwrap();
     assert_eq!(updated, MID_OCT, "the other shard's row is unstamped");
+    let same_tenant: u64 = db
+        .column(
+            "SELECT updated_at AS n FROM ci_jobs WHERE id = $1",
+            &params![nine],
+            "n",
+        )
+        .unwrap();
+    assert_eq!(
+        same_tenant, MID_OCT,
+        "the same tenant's other shard is unstamped"
+    );
     // A beta tenant's card hold stays listed after the check: only a
     // wake turns it into a concurrency hold. The untouched shard still
     // lists its own tenant.

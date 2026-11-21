@@ -93,6 +93,10 @@ pub(crate) const LEASE_MS: u64 = 55_000;
 /// taking new work, in milliseconds, so it ends inside its lease
 /// ([`LEASE_MS`]) and the shard's next pass does not overlap it.
 pub const PASS_DEADLINE_MS: u64 = 45_000;
+// A fix admitted just before the deadline still ends inside the
+// lease: the worst case single fix, a terminate plus its fail, fits
+// in the ten seconds left to LEASE_MS.
+const _: () = assert!(PASS_DEADLINE_MS + 10_000 <= LEASE_MS);
 /// The queue the cron pass fans the shards' messages out to, in
 /// `wrangler.toml`.
 pub const QUEUE: &str = "hatchrun-ci-reconcile";
@@ -513,12 +517,12 @@ async fn fan_out(env: &Env, now: u64) -> Result<(), String> {
     queue.send_batch(messages).await.map_err(|e| e.to_string())
 }
 
-/// One shard's pass message at `now`: fixes the shard's buckets'
-/// stalled jobs and wakes its buckets' held jobs, then records the
-/// finish. Skipped when an earlier pass holds the shard's lease. A pass
-/// stops taking new stalled fixes or billing tenants after
-/// [`PASS_DEADLINE_MS`]; what is already taken finishes.
-pub async fn shard_pass(env: &Env, shard: Shard, now: u64) {
+/// One shard's pass for the message's minute at `now`: fixes the
+/// shard's buckets' stalled jobs and wakes its buckets' held jobs,
+/// then records the finish. Skipped when an earlier pass holds the
+/// shard's lease. A pass stops taking new stalled fixes or billing
+/// tenants after [`PASS_DEADLINE_MS`]; what is already taken finishes.
+pub async fn shard_pass(env: &Env, shard: Shard, now: u64, minute_ms: u64) {
     let db = match Db::connect(env).await {
         Ok(db) => db,
         Err(err) => {
@@ -526,12 +530,12 @@ pub async fn shard_pass(env: &Env, shard: Shard, now: u64) {
             return;
         }
     };
-    let first = shard.first_bucket();
-    if let Err(err) = store::ensure_shard(&db, first).await {
+    let (first, end) = shard.range();
+    if let Err(err) = store::ensure_shard(&db, first, end, now).await {
         console_error!("reconcile: ensure shard {}: {err}", shard.index());
         return;
     }
-    match store::shard_lease(&db, first, now, now + LEASE_MS).await {
+    match store::shard_lease(&db, first, end, now, now + LEASE_MS).await {
         Ok(true) => {}
         Ok(false) => {
             console_log!(
@@ -577,7 +581,17 @@ pub async fn shard_pass(env: &Env, shard: Shard, now: u64) {
         )
         .await,
     );
-    if let Err(err) = wake_held(env, &db, &Budget::new(HELD_BUDGET), now, shard, deadline).await {
+    if let Err(err) = wake_held(
+        env,
+        &db,
+        &Budget::new(HELD_BUDGET),
+        now,
+        minute_ms,
+        shard,
+        deadline,
+    )
+    .await
+    {
         console_error!("reconcile: held jobs of shard {}: {err}", shard.index());
         errors += 1;
     }
@@ -592,12 +606,13 @@ const SHARD_STALE_MS: u64 = 5 * 60_000;
 /// How recent a shard's finished pass is for its errors to count.
 const SHARD_RECENT_MS: u64 = 2 * 60_000;
 
-/// How many errors the shards' health adds to the pass. Only the
-/// current [`SHARDS`] count: rows left by an older shard count are
-/// ignored. A shard with no row counts one. Each of its two passes
-/// (stalled and held jobs, schedules) counts one when it never
-/// finished or finished over five minutes ago, and its failed items
-/// when it finished within the last two minutes.
+/// How many errors the shards' health adds to the pass. Only rows of
+/// the current shard layout count: a row matches when its first and
+/// end buckets are the shard's range, so rows an older shard count
+/// left behind are ignored. A shard with no row counts one. Each of
+/// its two passes (stalled and held jobs, schedules) counts one when
+/// it never finished or finished over five minutes ago, and its failed
+/// items when it finished within the last two minutes.
 #[must_use]
 pub fn shard_errors(health: &[ShardHealth], now: u64) -> u32 {
     let pass = |finished_at: Option<u64>, errors: i32| -> u32 {
@@ -614,9 +629,10 @@ pub fn shard_errors(health: &[ShardHealth], now: u64) -> u32 {
     };
     Shard::all()
         .map(|shard| {
+            let (lo, hi) = shard.range();
             match health
                 .iter()
-                .find(|row| row.first_bucket == shard.first_bucket())
+                .find(|row| row.first_bucket == lo && row.end_bucket == hi)
             {
                 None => 1,
                 Some(row) => pass(row.finished_at, row.errors)
@@ -662,7 +678,9 @@ pub async fn consume(batch: MessageBatch<Value>, env: Env) {
             continue;
         }
         match shard.kind {
-            Work::Pass => shard_pass(&env, Shard::new(shard.shard), now_ms()).await,
+            Work::Pass => {
+                shard_pass(&env, Shard::new(shard.shard), now_ms(), shard.minute_ms).await;
+            }
             Work::Schedule => schedule_pass(&env, Shard::new(shard.shard), now_ms()).await,
         }
         message.ack();
@@ -743,6 +761,7 @@ async fn fix_stalled(
     let by_id: HashMap<u64, &JobRow> = rows.iter().map(|row| (row.id, row)).collect();
     let mut failed = 0;
     let mut stopped = StalledCursor::default();
+    let mut attempted = false;
     for fix in stalled(&rows, now) {
         if now_ms() >= deadline {
             console_error!("reconcile: pass deadline reached, the rest wait");
@@ -767,15 +786,18 @@ async fn fix_stalled(
                 (id, fail_job(env, db, by_id[&id], message, now).await)
             }
         };
+        attempted = true;
         stopped = StalledCursor::at(by_id[&id]);
         if let Err(err) = result {
             console_error!("reconcile: job {id}: {err}");
             failed += 1;
         }
     }
-    store::set_shard_stalled_cursor(db, first, stopped)
-        .await
-        .map_err(|e| e.to_string())?;
+    if attempted {
+        store::set_shard_stalled_cursor(db, first, stopped)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     Ok(failed)
 }
 
@@ -834,10 +856,10 @@ async fn resend_deliveries(env: &Env, db: &Db, budget: &Budget, now: u64) -> Res
     Ok(failed)
 }
 
-/// Whether the pass at `now_ms` runs the held-job backstop.
+/// Whether the pass for `minute_ms` runs the held-job backstop.
 #[must_use]
-pub fn held_backstop_due(now_ms: u64) -> bool {
-    (now_ms / 60_000).is_multiple_of(HELD_EVERY_MINUTES)
+pub fn held_backstop_due(minute_ms: u64) -> bool {
+    (minute_ms / 60_000).is_multiple_of(HELD_EVERY_MINUTES)
 }
 
 /// The jobs of `woken` that `budget` pays a message for, in order.
@@ -850,10 +872,9 @@ pub fn paid_wakes(woken: &[Woken], budget: &Budget) -> Vec<Woken> {
         .collect()
 }
 
-/// The most tenants with billing holds one reconciler pass checks, each
-/// minute. Only tenants an event may have freed are read, and each
-/// leaves the list once read, so a burst larger than this (a calendar
-/// month turn) drains at this many a minute.
+/// The most tenants with billing holds one shard's pass selects,
+/// each pass. Only tenants an event may have freed are read, and each
+/// leaves the list once read.
 pub const BILLING_TENANTS_PER_PASS: u32 = 1_000;
 
 /// The billing holds a comma-separated list of `held` words names.
@@ -889,6 +910,7 @@ async fn wake_held(
     db: &Db,
     budget: &Budget,
     now: u64,
+    minute_ms: u64,
     shard: Shard,
     deadline: u64,
 ) -> Result<(), String> {
@@ -939,38 +961,51 @@ async fn wake_held(
                 .map_err(|e| e.to_string())?,
         }
     }
-    if held_backstop_due(now) {
+    if held_backstop_due(minute_ms) {
         // An approval hold whose environment is gone or has approval off, or
         // whose attempt was decided, has nobody to wait for; the change that
-        // freed it may have failed to wake it.
-        stale.extend(
-            ci_wake::release_orphan_approvals(
-                db,
-                now.saturating_sub(ORPHAN_QUIET_MS),
-                now,
-                HELD_BUDGET,
-                range,
-            )
-            .await
-            .map_err(|e| e.to_string())?,
-        );
-        stale.extend(
-            ci_wake::release_orphan_fork_approvals(
-                db,
-                now.saturating_sub(ORPHAN_QUIET_MS),
-                now,
-                HELD_BUDGET,
-                range,
-            )
-            .await
-            .map_err(|e| e.to_string())?,
-        );
-        // Held jobs whose condition is clear now, across every tenant.
-        stale.extend(
-            ci_wake::lost_wakes(db, None, MAX_RUNNING_JOBS, now, HELD_BUDGET, range)
+        // freed it may have failed to wake it. Each leg checks the deadline
+        // first; wakes already changed are still sent below.
+        if now_ms() >= deadline {
+            console_error!("reconcile: pass deadline reached, the rest wait");
+        } else {
+            stale.extend(
+                ci_wake::release_orphan_approvals(
+                    db,
+                    now.saturating_sub(ORPHAN_QUIET_MS),
+                    now,
+                    HELD_BUDGET,
+                    range,
+                )
                 .await
                 .map_err(|e| e.to_string())?,
-        );
+            );
+        }
+        if now_ms() >= deadline {
+            console_error!("reconcile: pass deadline reached, the rest wait");
+        } else {
+            stale.extend(
+                ci_wake::release_orphan_fork_approvals(
+                    db,
+                    now.saturating_sub(ORPHAN_QUIET_MS),
+                    now,
+                    HELD_BUDGET,
+                    range,
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+            );
+        }
+        // Held jobs whose condition is clear now, across every tenant.
+        if now_ms() >= deadline {
+            console_error!("reconcile: pass deadline reached, the rest wait");
+        } else {
+            stale.extend(
+                ci_wake::lost_wakes(db, None, MAX_RUNNING_JOBS, now, HELD_BUDGET, range)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            );
+        }
     }
     let wakes = paid_wakes(&stale, budget);
     if wakes.len() < stale.len() {
@@ -2073,14 +2108,15 @@ mod tests {
 
     #[test]
     fn stale_shards_and_recent_errors_count() {
-        let fresh = |first_bucket: u16| ShardHealth {
-            first_bucket,
+        let fresh = |shard: Shard| ShardHealth {
+            first_bucket: shard.first_bucket(),
+            end_bucket: shard.range().1,
             finished_at: Some(NOW),
             errors: 0,
             schedule_finished_at: Some(NOW),
             schedule_errors: 0,
         };
-        let all: Vec<ShardHealth> = Shard::all().map(|s| fresh(s.first_bucket())).collect();
+        let all: Vec<ShardHealth> = Shard::all().map(fresh).collect();
         assert_eq!(shard_errors(&all, NOW), 0);
         let with = |at: usize, change: &dyn Fn(&mut ShardHealth)| {
             let mut rows = all.clone();
@@ -2113,12 +2149,21 @@ mod tests {
         let mut missing = all[1..].to_vec();
         missing.push(ShardHealth {
             first_bucket: 1,
+            end_bucket: 2,
             finished_at: None,
             errors: 9,
             schedule_finished_at: None,
             schedule_errors: 9,
         });
         assert_eq!(shard_errors(&missing, NOW), 1);
+        // An old layout's row that shares the shard's first bucket but
+        // not its end is ignored too: its errors do not count, and the
+        // shard counts as missing.
+        let mut relaid = all.clone();
+        relaid[3].end_bucket = relaid[3].first_bucket + 128;
+        relaid[3].errors = 9;
+        relaid[3].finished_at = Some(NOW);
+        assert_eq!(shard_errors(&relaid, NOW), 1);
         assert_eq!(shard_errors(&[], NOW), u32::from(SHARDS));
     }
 

@@ -60,11 +60,12 @@ pub async fn schedule_pass(env: &Env, shard: Shard, now: u64) {
         }
     };
     let first = shard.first_bucket();
-    if let Err(err) = store::ensure_shard(&db, first).await {
+    let end = shard.range().1;
+    if let Err(err) = store::ensure_shard(&db, first, end, now).await {
         console_error!("schedule: ensure shard {}: {err}", shard.index());
         return;
     }
-    match store::schedule_lease(&db, first, now, now + crate::reconcile::LEASE_MS).await {
+    match store::schedule_lease(&db, first, end, now, now + crate::reconcile::LEASE_MS).await {
         Ok(true) => {}
         Ok(false) => {
             console_log!(
@@ -154,6 +155,12 @@ async fn fire_schedules(
     // Schedules are read a page at a time, in key order after the last
     // row of the page before.
     'pages: loop {
+        // A pass past its deadline stops before reading more, so its
+        // last minute stays pending and the next pass resumes here.
+        if worker::Date::now().as_millis() >= deadline {
+            stopped_at = Some(due[0]);
+            break;
+        }
         let rows = store::schedules_after(db, cursor.as_ref(), SCHEDULE_ROWS, Some(range))
             .await
             .map_err(|e| e.to_string())?;
@@ -167,15 +174,21 @@ async fn fire_schedules(
                 cap.skip(page.len() - i);
                 break;
             }
+            // Pages not read yet have fired no minute, so the pass
+            // resumes at the oldest one.
+            let resume = if last_page { fire.minute_ms } else { due[0] };
+            // A pass past its deadline stops before the lookup, so it
+            // ends inside its lease and the next pass resumes here.
+            if worker::Date::now().as_millis() >= deadline {
+                stopped_at = Some(resume);
+                break 'pages;
+            }
             let made = store::run_for_delivery(db, &fire.delivery(), &fire.workflow)
                 .await
                 .map_err(|e| e.to_string())?;
             if made.is_some_and(|run| run.status != "queued") {
                 continue;
             }
-            // Pages not read yet have fired no minute, so the pass
-            // resumes at the oldest one.
-            let resume = if last_page { fire.minute_ms } else { due[0] };
             // A pass past its deadline stops, so it ends inside its
             // lease and the next pass resumes here.
             if worker::Date::now().as_millis() >= deadline {
@@ -200,6 +213,12 @@ async fn fire_schedules(
             let Some(Some(head)) = heads.get(&fire.repo_id) else {
                 continue;
             };
+            // A head read may have taken the pass past its deadline;
+            // recheck before paying for a start, without taking a slot.
+            if worker::Date::now().as_millis() >= deadline {
+                stopped_at = Some(resume);
+                break 'pages;
+            }
             if !budget.take(START_COST) {
                 stopped_at = Some(resume);
                 break 'pages;

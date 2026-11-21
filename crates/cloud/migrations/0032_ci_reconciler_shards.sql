@@ -36,6 +36,7 @@ CREATE INDEX ci_jobs_open_bucket ON ci_jobs (bucket, updated_at, id)
 
 CREATE TABLE ci_shards (
   first_bucket smallint PRIMARY KEY,
+  end_bucket smallint NOT NULL,
   lease_until bigint NOT NULL DEFAULT 0,
   stalled_after_at bigint NOT NULL DEFAULT 0,
   stalled_after_id bigint NOT NULL DEFAULT 0,
@@ -47,8 +48,8 @@ CREATE TABLE ci_shards (
   schedule_errors integer NOT NULL DEFAULT 0
 );
 
-INSERT INTO ci_shards (first_bucket, last_minute)
-  SELECT s::smallint, (SELECT min(last_minute) FROM ci_reconciler)
+INSERT INTO ci_shards (first_bucket, end_bucket, last_minute)
+  SELECT s::smallint, (s + 256)::smallint, (SELECT min(last_minute) FROM ci_reconciler)
   FROM generate_series(0, 3840, 256) AS s;
 
 ALTER TABLE ci_reconciler

@@ -624,27 +624,80 @@ fn schedules_after_with_a_range_partitions_the_schedules() {
 #[test]
 fn shard_leases_are_per_shard() {
     let db = setup();
-    assert!(db.wait(shard_lease(db.db(), 0, 100, 200)).unwrap());
+    assert!(db.wait(shard_lease(db.db(), 0, 256, 100, 200)).unwrap());
     assert!(
-        db.wait(shard_lease(db.db(), 256, 100, 200)).unwrap(),
+        db.wait(shard_lease(db.db(), 256, 512, 100, 200)).unwrap(),
         "another shard leases alone"
     );
     assert!(
-        !db.wait(shard_lease(db.db(), 0, 150, 300)).unwrap(),
+        !db.wait(shard_lease(db.db(), 0, 256, 150, 300)).unwrap(),
         "the same shard twice is refused"
     );
     assert!(
-        db.wait(shard_lease(db.db(), 0, 201, 300)).unwrap(),
+        db.wait(shard_lease(db.db(), 0, 256, 201, 300)).unwrap(),
         "an expired lease is taken"
     );
-    assert!(db.wait(schedule_lease(db.db(), 0, 100, 200)).unwrap());
+    assert!(db.wait(schedule_lease(db.db(), 0, 256, 100, 200)).unwrap());
     assert!(
-        !db.wait(schedule_lease(db.db(), 0, 150, 300)).unwrap(),
+        !db.wait(schedule_lease(db.db(), 0, 256, 150, 300)).unwrap(),
         "the schedule lease twice is refused"
     );
     assert!(
-        db.wait(schedule_lease(db.db(), 256, 150, 300)).unwrap(),
+        db.wait(schedule_lease(db.db(), 256, 512, 150, 300))
+            .unwrap(),
         "another shard schedules alone"
+    );
+}
+
+#[test]
+fn an_overlapping_range_is_refused_until_its_lease_runs_out() {
+    let db = setup();
+    assert!(db.wait(shard_lease(db.db(), 0, 256, 100, 200)).unwrap());
+    db.wait(ensure_shard(db.db(), 128, 256, 150)).unwrap();
+    assert!(
+        !db.wait(shard_lease(db.db(), 128, 256, 150, 300)).unwrap(),
+        "a range inside a held one is refused"
+    );
+    assert!(
+        db.wait(schedule_lease(db.db(), 128, 256, 150, 300))
+            .unwrap(),
+        "the other kind leases alone"
+    );
+    assert!(
+        db.wait(shard_lease(db.db(), 256, 512, 150, 300)).unwrap(),
+        "a disjoint range still leases"
+    );
+    assert!(
+        db.wait(shard_lease(db.db(), 128, 256, 201, 300)).unwrap(),
+        "an expired overlap leases again"
+    );
+}
+
+#[test]
+fn a_new_shard_count_takes_over_a_row_once_its_leases_run_out() {
+    let db = setup();
+    let end = |db: &TestDb| -> Option<u64> {
+        db.column(
+            "SELECT end_bucket AS n FROM ci_shards WHERE first_bucket = 0",
+            &[],
+            "n",
+        )
+        .unwrap()
+    };
+    assert!(db.wait(shard_lease(db.db(), 0, 256, 100, 200)).unwrap());
+    db.wait(ensure_shard(db.db(), 0, 128, 150)).unwrap();
+    assert_eq!(end(&db), Some(256), "a held row keeps its old range");
+    assert!(
+        !db.wait(shard_lease(db.db(), 0, 128, 150, 300)).unwrap(),
+        "the new range does not lease the old row"
+    );
+    db.wait(ensure_shard(db.db(), 0, 128, 201)).unwrap();
+    assert_eq!(end(&db), Some(128), "an expired row takes the new range");
+    db.wait(ensure_shard(db.db(), 128, 256, 201)).unwrap();
+    assert!(db.wait(shard_lease(db.db(), 0, 128, 201, 300)).unwrap());
+    assert!(
+        db.wait(shard_lease(db.db(), 128, 256, 201, 300)).unwrap(),
+        "the two halves lease alone once the old range is gone"
     );
 }
 
@@ -660,7 +713,7 @@ fn ensure_shard_seeds_last_minute_from_the_oldest_and_keeps_rows() {
         &[],
     );
     db.run("DELETE FROM ci_shards WHERE first_bucket = 512", &[]);
-    db.wait(ensure_shard(db.db(), 512)).unwrap();
+    db.wait(ensure_shard(db.db(), 512, 768, 0)).unwrap();
     let seeded: Option<u64> = db
         .column(
             "SELECT last_minute AS n FROM ci_shards WHERE first_bucket = 512",
@@ -669,7 +722,7 @@ fn ensure_shard_seeds_last_minute_from_the_oldest_and_keeps_rows() {
         )
         .unwrap();
     assert_eq!(seeded, Some(1000));
-    db.wait(ensure_shard(db.db(), 0)).unwrap();
+    db.wait(ensure_shard(db.db(), 0, 256, 0)).unwrap();
     let kept: Option<u64> = db
         .column(
             "SELECT last_minute AS n FROM ci_shards WHERE first_bucket = 0",
