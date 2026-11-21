@@ -13,36 +13,44 @@ use worker::Result;
 use super::reconciler::StalledCursor;
 
 /// Makes sure the row of the shard from bucket `$1` to `$2` exists. A
-/// new row starts its schedule scan where the oldest shard is. A row
+/// new row starts its schedule scan five minutes, the replay bound of
+/// `minutes()`, behind the oldest shard: when a shard count splits a
+/// range, the half that keeps the old row may already have moved past a
+/// minute the new half still owes, and the delivery keys skip minutes
+/// that already fired. A row
 /// an older shard count left with another end takes this end once both
 /// its leases ran out before `$3`, so a pass of the old layout still
 /// holding it keeps its range until it ends.
 const ENSURE_SHARD: &str = "INSERT INTO ci_shards (first_bucket, end_bucket, last_minute) \
-     SELECT $1, $2, (SELECT min(last_minute) FROM ci_shards) \
+     SELECT $1, $2, (SELECT greatest(min(last_minute) - 300000, 0) FROM ci_shards) \
      ON CONFLICT (first_bucket) DO UPDATE SET end_bucket = EXCLUDED.end_bucket \
      WHERE ci_shards.end_bucket <> EXCLUDED.end_bucket \
      AND ci_shards.lease_until < $3 AND ci_shards.schedule_lease_until < $3";
 
 /// Takes the pass lease of the shard from `$1` to `$4` until `$3`
 /// when it ran out before `$2` and the row has this range. Another
-/// range that overlaps this one
-/// and still holds its pass lease refuses it, so two passes of
-/// different shard counts never fix the same buckets at once. Ranges
-/// that do not overlap lease alone.
-const SHARD_LEASE: &str = "UPDATE ci_shards SET lease_until = $3 \
-     WHERE first_bucket = $1 AND end_bucket = $4 AND lease_until < $2 AND NOT EXISTS (SELECT 1 FROM ci_shards o \
-     WHERE o.first_bucket <> $1 AND o.first_bucket < $4 AND o.end_bucket > $1 \
-     AND o.lease_until >= $2)";
+/// range that overlaps this one and still holds its pass lease refuses
+/// it, so two passes of different shard counts never fix the same
+/// buckets at once. Every overlapping row is locked first, in key
+/// order, so two overlapping takes run one after the other and the
+/// second reads the first's lease; ranges that do not overlap lease
+/// alone.
+const SHARD_LEASE: &str = "WITH o AS (SELECT first_bucket, lease_until FROM ci_shards \
+     WHERE first_bucket < $4 AND end_bucket > $1 ORDER BY first_bucket FOR UPDATE) \
+     UPDATE ci_shards SET lease_until = $3 \
+     WHERE first_bucket = $1 AND end_bucket = $4 AND lease_until < $2 \
+     AND NOT EXISTS (SELECT 1 FROM o WHERE o.first_bucket <> $1 AND o.lease_until >= $2)";
 
 /// Takes the schedule lease of the shard from `$1` to `$4` until `$3`
-/// when it ran out before `$2` and the row has this range. Another
-/// overlapping range that still
-/// holds its schedule lease refuses it; ranges that do not overlap
-/// lease alone.
-const SCHEDULE_LEASE: &str = "UPDATE ci_shards SET schedule_lease_until = $3 \
-     WHERE first_bucket = $1 AND end_bucket = $4 AND schedule_lease_until < $2 AND NOT EXISTS (SELECT 1 \
-     FROM ci_shards o WHERE o.first_bucket <> $1 AND o.first_bucket < $4 \
-     AND o.end_bucket > $1 AND o.schedule_lease_until >= $2)";
+/// when it ran out before `$2` and the row has this range, locking
+/// and checking overlapping rows as [`SHARD_LEASE`] does.
+const SCHEDULE_LEASE: &str = "WITH o AS (SELECT first_bucket, schedule_lease_until \
+     FROM ci_shards WHERE first_bucket < $4 AND end_bucket > $1 \
+     ORDER BY first_bucket FOR UPDATE) \
+     UPDATE ci_shards SET schedule_lease_until = $3 \
+     WHERE first_bucket = $1 AND end_bucket = $4 AND schedule_lease_until < $2 \
+     AND NOT EXISTS (SELECT 1 FROM o WHERE o.first_bucket <> $1 \
+     AND o.schedule_lease_until >= $2)";
 
 /// Where the shard starting at `$1` stopped in the stalled jobs.
 const SHARD_STALLED_CURSOR: &str = "SELECT stalled_after_at, stalled_after_id \

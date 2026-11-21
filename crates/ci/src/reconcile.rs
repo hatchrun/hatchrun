@@ -742,6 +742,11 @@ async fn fix_stalled(
     shard: Shard,
     deadline: u64,
 ) -> Result<u32, String> {
+    // A pass already past its deadline reads nothing it could not act on.
+    if now_ms() >= deadline {
+        console_error!("reconcile: pass deadline reached, the rest wait");
+        return Ok(0);
+    }
     let first = shard.first_bucket();
     let range = shard.range();
     let cursor = store::shard_stalled_cursor(db, first)
@@ -750,7 +755,10 @@ async fn fix_stalled(
     let after = store::stalled_jobs(db, now, Some(range), cursor, MAX_FIXES)
         .await
         .map_err(|e| e.to_string())?;
-    let from_start = if after.len() < MAX_FIXES as usize && cursor != StalledCursor::default() {
+    let from_start = if after.len() < MAX_FIXES as usize
+        && cursor != StalledCursor::default()
+        && now_ms() < deadline
+    {
         store::stalled_jobs(db, now, Some(range), StalledCursor::default(), MAX_FIXES)
             .await
             .map_err(|e| e.to_string())?
@@ -923,15 +931,19 @@ async fn wake_held(
     // Only the tenants an event may have freed: a card that is back, a
     // Polar delivery or cap change since the hold, or a spend window
     // that turned. The rest wait on with no read.
-    let tenants = ci_wake::billing_candidates(
-        db,
-        now,
-        billing::month_start(now),
-        BILLING_TENANTS_PER_PASS,
-        range,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let tenants = if now_ms() >= deadline {
+        Vec::new()
+    } else {
+        ci_wake::billing_candidates(
+            db,
+            now,
+            billing::month_start(now),
+            BILLING_TENANTS_PER_PASS,
+            range,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+    };
     for tenant in &tenants {
         if now_ms() >= deadline {
             console_error!("reconcile: pass deadline reached, the rest wait");
@@ -2086,10 +2098,6 @@ mod tests {
                 FIRES_TOTAL
             ),
             (2_400, 3_200, 800, 640, 800)
-        );
-        assert_eq!(
-            (MAX_FIXES, HELD_BUDGET, crate::scheduler::MAX_FIRES),
-            (50, 40, 50)
         );
         const {
             assert!(

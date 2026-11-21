@@ -702,14 +702,14 @@ fn a_new_shard_count_takes_over_a_row_once_its_leases_run_out() {
 }
 
 #[test]
-fn ensure_shard_seeds_last_minute_from_the_oldest_and_keeps_rows() {
+fn ensure_shard_seeds_last_minute_behind_the_oldest_and_keeps_rows() {
     let db = setup();
     db.run(
-        "UPDATE ci_shards SET last_minute = 2000 WHERE first_bucket = 0",
+        "UPDATE ci_shards SET last_minute = 2000000 WHERE first_bucket = 0",
         &[],
     );
     db.run(
-        "UPDATE ci_shards SET last_minute = 1000 WHERE first_bucket = 256",
+        "UPDATE ci_shards SET last_minute = 1000000 WHERE first_bucket = 256",
         &[],
     );
     db.run("DELETE FROM ci_shards WHERE first_bucket = 512", &[]);
@@ -721,7 +721,11 @@ fn ensure_shard_seeds_last_minute_from_the_oldest_and_keeps_rows() {
             "n",
         )
         .unwrap();
-    assert_eq!(seeded, Some(1000));
+    assert_eq!(
+        seeded,
+        Some(700_000),
+        "five minutes behind the oldest shard"
+    );
     db.wait(ensure_shard(db.db(), 0, 256, 0)).unwrap();
     let kept: Option<u64> = db
         .column(
@@ -730,5 +734,5 @@ fn ensure_shard_seeds_last_minute_from_the_oldest_and_keeps_rows() {
             "n",
         )
         .unwrap();
-    assert_eq!(kept, Some(2000), "an existing row is not overwritten");
+    assert_eq!(kept, Some(2_000_000), "an existing row is not overwritten");
 }
