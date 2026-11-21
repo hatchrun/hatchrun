@@ -86,8 +86,8 @@ pub const MAX_FIRES: usize = 200;
 pub const SCHEDULE_ROWS: u32 = 1_000;
 /// The most stalled jobs one pass handles.
 pub const MAX_FIXES: u32 = 50;
-/// The subrequests the held-job backstop may spend in the passes that
-/// run it, on top of [`BUDGET`] and apart from the stalled-job share.
+/// The subrequests the held-job backstop may spend in a pass, on top
+/// of [`BUDGET`] and apart from the stalled-job share.
 pub const HELD_BUDGET: u32 = 40;
 /// The backstop runs in the passes of every 15th minute.
 const HELD_EVERY_MINUTES: u64 = 15;
@@ -533,9 +533,7 @@ async fn steps(env: &Env, db: &Db, now: u64) -> u32 {
         )
         .await,
     );
-    if held_backstop_due(now)
-        && let Err(err) = wake_held(env, db, &Budget::new(HELD_BUDGET), now).await
-    {
+    if let Err(err) = wake_held(env, db, &Budget::new(HELD_BUDGET), now).await {
         console_error!("reconcile: held jobs: {err}");
         errors += 1;
     }
@@ -996,10 +994,10 @@ pub fn paid_wakes(woken: &[Woken], budget: &Budget) -> Vec<Woken> {
         .collect()
 }
 
-/// The most tenants with billing holds one backstop pass checks. Only
-/// tenants an event may have freed are read, and each leaves the list
-/// once read, so the list holds the events of one pass: more than this
-/// only at a calendar month turn, which the next pass finishes.
+/// The most tenants with billing holds one reconciler pass checks, each
+/// minute. Only tenants an event may have freed are read, and each
+/// leaves the list once read, so a burst larger than this (a calendar
+/// month turn) drains at this many a minute.
 pub const BILLING_TENANTS_PER_PASS: u32 = 1_000;
 
 /// The billing holds a comma-separated list of `held` words names.
@@ -1024,6 +1022,12 @@ pub fn billing_reasons(reasons: &str) -> Vec<billing::Hold> {
 /// decided or released are freed too. Every wake is paid from its own
 /// `budget`; the consumer checks the caps again and holds a job that
 /// still waits.
+///
+/// The billing check runs every pass: it reads only tenants an event
+/// may have freed, so a pass with no such event costs one query, and a
+/// burst of more than [`BILLING_TENANTS_PER_PASS`] (a month turn)
+/// drains over the next minutes instead of the next quarter hours. The
+/// other legs run every 15th minute (see [`held_backstop_due`]).
 async fn wake_held(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), String> {
     // Events that do not come again go first: billing holds whose
     // admission changed without waking them, then approvals nobody is
@@ -1062,35 +1066,37 @@ async fn wake_held(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), 
                 .map_err(|e| e.to_string())?,
         }
     }
-    // An approval hold whose environment is gone or has approval off, or
-    // whose attempt was decided, has nobody to wait for; the change that
-    // freed it may have failed to wake it.
-    stale.extend(
-        ci_wake::release_orphan_approvals(
-            db,
-            now.saturating_sub(ORPHAN_QUIET_MS),
-            now,
-            HELD_BUDGET,
-        )
-        .await
-        .map_err(|e| e.to_string())?,
-    );
-    stale.extend(
-        ci_wake::release_orphan_fork_approvals(
-            db,
-            now.saturating_sub(ORPHAN_QUIET_MS),
-            now,
-            HELD_BUDGET,
-        )
-        .await
-        .map_err(|e| e.to_string())?,
-    );
-    // Held jobs whose condition is clear now, across every tenant.
-    stale.extend(
-        ci_wake::lost_wakes(db, None, MAX_RUNNING_JOBS, now, HELD_BUDGET)
+    if held_backstop_due(now) {
+        // An approval hold whose environment is gone or has approval off, or
+        // whose attempt was decided, has nobody to wait for; the change that
+        // freed it may have failed to wake it.
+        stale.extend(
+            ci_wake::release_orphan_approvals(
+                db,
+                now.saturating_sub(ORPHAN_QUIET_MS),
+                now,
+                HELD_BUDGET,
+            )
             .await
             .map_err(|e| e.to_string())?,
-    );
+        );
+        stale.extend(
+            ci_wake::release_orphan_fork_approvals(
+                db,
+                now.saturating_sub(ORPHAN_QUIET_MS),
+                now,
+                HELD_BUDGET,
+            )
+            .await
+            .map_err(|e| e.to_string())?,
+        );
+        // Held jobs whose condition is clear now, across every tenant.
+        stale.extend(
+            ci_wake::lost_wakes(db, None, MAX_RUNNING_JOBS, now, HELD_BUDGET)
+                .await
+                .map_err(|e| e.to_string())?,
+        );
+    }
     let wakes = paid_wakes(&stale, budget);
     if wakes.len() < stale.len() {
         console_error!("reconcile: held-job budget spent, the rest wait");

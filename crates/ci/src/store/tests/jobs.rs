@@ -905,6 +905,60 @@ fn a_polar_delivery_after_the_hold_makes_its_tenant_a_candidate() {
 }
 
 #[test]
+fn candidates_past_one_pass_are_read_by_the_next() {
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    let (run, job) = run_with_job_named(&db, "first", "queued");
+    // 1001 tenants whose card came back, each with a job still held for
+    // one: one more than a pass reads.
+    db.run(
+        "INSERT INTO tenants (id, org_id, org_login, created_at, updated_at, beta) \
+         SELECT 'b' || lpad(n::text, 4, '0'), 900000 + n, 'org' || n, 0, 0, true \
+         FROM generate_series(1, 1001) n",
+        &[],
+    );
+    db.run(
+        "INSERT INTO ci_jobs (run_id, tenant_id, tier, run_created_at, plan_id, name, status, \
+           timeout_minutes, token_permissions, secret_refs, needs, held, created_at, \
+           updated_at) \
+         SELECT j.run_id, 'b' || lpad(n::text, 4, '0'), j.tier, j.run_created_at, \
+           'p' || n, 'p' || n, 'queued', 10, j.token_permissions, j.secret_refs, j.needs, \
+           'card', 0, n \
+         FROM generate_series(1, 1001) n, ci_jobs j WHERE j.id = $1",
+        &params![job],
+    );
+    let _ = run;
+    let page = |now: u64| {
+        db.wait(ci_wake::billing_candidates(
+            db.db(),
+            now,
+            OCT_1,
+            crate::reconcile::BILLING_TENANTS_PER_PASS,
+        ))
+        .unwrap()
+    };
+    let first = page(MID_OCT);
+    assert_eq!(first.len(), 1_000);
+    // The longest waiting go first, so the last tenant is left over.
+    assert!(first.iter().all(|row| row.tenant_id != "b1001"));
+    // This pass reads them: a card is back, so each would be woken and
+    // its holds turned into concurrency holds.
+    for row in &first {
+        db.wait(ci_wake::standing_improved(db.db(), &row.tenant_id, MID_OCT))
+            .unwrap();
+    }
+    // The next pass, a minute later, reads the one left over.
+    let second = page(MID_OCT + 60_000);
+    assert_eq!(
+        second
+            .into_iter()
+            .map(|row| row.tenant_id)
+            .collect::<Vec<_>>(),
+        ["b1001"]
+    );
+}
+
+#[test]
 fn a_spend_window_that_turned_makes_its_tenant_a_candidate() {
     let db = setup();
     let (_, capped) = run_with_job_named(&db, "capped", "queued");
