@@ -116,7 +116,9 @@ pub async fn schedule_pass(env: &Env, shard: Shard, now: u64) {
 /// [`crate::reconcile::PASS_DEADLINE_MS`], the pass stops before the
 /// next fire; the next pass starts again from that minute (from the
 /// oldest one when schedules were left unread), and the runs already
-/// made are skipped without cost.
+/// made are skipped without cost. A head lookup that fails leaves its
+/// minute pending in the same way, without stopping the pass, so a
+/// later pass fires it again.
 #[allow(clippy::too_many_lines)] // One page loop, read top to bottom.
 async fn fire_schedules(
     env: &Env,
@@ -148,7 +150,7 @@ async fn fire_schedules(
     );
     // The repository, its head and its config are read once per pass.
     let mut heads: HashMap<u64, Option<Head>> = HashMap::new();
-    let mut stopped_at = None;
+    let mut pending = Pending::default();
     let mut cap = FireCap::default();
     let mut cursor: Option<ScheduleRow> = None;
     let range = shard.range();
@@ -158,7 +160,7 @@ async fn fire_schedules(
         // A pass past its deadline stops before reading more, so its
         // last minute stays pending and the next pass resumes here.
         if worker::Date::now().as_millis() >= deadline {
-            stopped_at = Some(due[0]);
+            pending.at(due[0]);
             break;
         }
         let rows = store::schedules_after(db, cursor.as_ref(), SCHEDULE_ROWS, Some(range))
@@ -180,7 +182,7 @@ async fn fire_schedules(
             // A pass past its deadline stops before the lookup, so it
             // ends inside its lease and the next pass resumes here.
             if worker::Date::now().as_millis() >= deadline {
-                stopped_at = Some(resume);
+                pending.at(resume);
                 break 'pages;
             }
             let made = store::run_for_delivery(db, &fire.delivery(), &fire.workflow)
@@ -192,12 +194,12 @@ async fn fire_schedules(
             // A pass past its deadline stops, so it ends inside its
             // lease and the next pass resumes here.
             if worker::Date::now().as_millis() >= deadline {
-                stopped_at = Some(resume);
+                pending.at(resume);
                 break 'pages;
             }
             if let std::collections::hash_map::Entry::Vacant(slot) = heads.entry(fire.repo_id) {
                 if !budget.take(HEAD_COST) {
-                    stopped_at = Some(resume);
+                    pending.at(resume);
                     break 'pages;
                 }
                 let head = match head(db, settings, &tokens, fire.repo_id).await {
@@ -205,6 +207,10 @@ async fn fire_schedules(
                     Err(err) => {
                         console_error!("reconcile: repository {}: {err}", fire.repo_id);
                         failed += 1;
+                        // The firing stays due, so the next pass reads
+                        // this minute again. Runs already made are
+                        // skipped without cost.
+                        pending.at(resume);
                         None
                     }
                 };
@@ -216,11 +222,11 @@ async fn fire_schedules(
             // A head read may have taken the pass past its deadline;
             // recheck before paying for a start, without taking a slot.
             if worker::Date::now().as_millis() >= deadline {
-                stopped_at = Some(resume);
+                pending.at(resume);
                 break 'pages;
             }
             if !budget.take(START_COST) {
-                stopped_at = Some(resume);
+                pending.at(resume);
                 break 'pages;
             }
             // A slot is used only here, by a firing that gets to start.
@@ -250,13 +256,10 @@ async fn fire_schedules(
             cap.skipped
         );
     }
-    let done = match stopped_at {
-        Some(minute) => {
-            console_error!("schedule: budget or deadline reached, resuming at minute {minute}");
-            minute - 60_000
-        }
-        None => newest,
-    };
+    if let Some(minute) = pending.0 {
+        console_error!("schedule: budget, deadline or a failed head, resuming at minute {minute}");
+    }
+    let done = pending.last_minute(newest);
     store::set_shard_last_minute(db, shard.first_bucket(), done)
         .await
         .map_err(|e| e.to_string())?;
@@ -355,6 +358,28 @@ impl FireCap {
 
     fn full(&self) -> bool {
         self.started >= MAX_FIRES as usize
+    }
+}
+
+/// The earliest minute one pass left pending, which the next pass
+/// resumes from. A stop leaves one and ends the pass; a failed head
+/// lookup leaves one and the pass carries on. Runs already made in a
+/// repeated minute are skipped without cost, and [`minutes`] caps the
+/// lag at [`MAX_MINUTES`], so a repository that keeps failing cannot
+/// hold its shard back for longer.
+#[derive(Default)]
+struct Pending(Option<u64>);
+
+impl Pending {
+    /// Leaves `minute` pending, unless an earlier one is.
+    fn at(&mut self, minute: u64) {
+        self.0 = Some(self.0.map_or(minute, |at| at.min(minute)));
+    }
+
+    /// The shard's last minute after the pass: the one before the
+    /// earliest pending minute, or `newest` when none is pending.
+    fn last_minute(&self, newest: u64) -> u64 {
+        self.0.map_or(newest, |minute| minute - 60_000)
     }
 }
 
@@ -513,6 +538,24 @@ mod tests {
             format!("schedule:7:slow:*/15 * * * *:{NOW}")
         );
         assert!(fired.iter().all(|f| f.workflow != "bad"));
+    }
+
+    #[test]
+    fn the_earliest_pending_minute_is_fired_again() {
+        // Nothing pending: the pass covered every minute.
+        assert_eq!(Pending::default().last_minute(NOW), NOW);
+        // A failed head at the minute before: that minute fires again.
+        let mut pending = Pending::default();
+        pending.at(NOW - MIN);
+        assert_eq!(pending.last_minute(NOW), NOW - 2 * MIN);
+        // A later stop does not skip the failed minute, in either order.
+        pending.at(NOW);
+        assert_eq!(pending.last_minute(NOW), NOW - 2 * MIN);
+        let mut stop_first = Pending::default();
+        stop_first.at(NOW);
+        assert_eq!(stop_first.last_minute(NOW), NOW - MIN);
+        stop_first.at(NOW - MIN);
+        assert_eq!(stop_first.last_minute(NOW), NOW - 2 * MIN);
     }
 
     #[test]
