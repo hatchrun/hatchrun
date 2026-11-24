@@ -1025,6 +1025,63 @@ fn the_lost_wake_query_wakes_room_in_the_tenant() {
 }
 
 #[test]
+fn two_shards_waking_one_tenant_wake_only_its_room() {
+    use hatchrun_cloud::ci_wake;
+    let db = setup();
+    for n in 0..3 {
+        run_with_job_named(&db, &format!("r{n}"), "running");
+    }
+    let mut held = Vec::new();
+    for n in 0..4 {
+        let (_, id) = run_with_job_named(&db, &format!("h{n}"), "queued");
+        set_held(&db, id, "concurrency", 1);
+        held.push(id);
+    }
+    db.run(
+        "UPDATE ci_jobs SET bucket = 10 WHERE id = $1 OR id = $2",
+        &params![held[0], held[1]],
+    );
+    db.run(
+        "UPDATE ci_jobs SET bucket = 300 WHERE id = $1 OR id = $2",
+        &params![held[2], held[3]],
+    );
+    let config: tokio_postgres::Config = hatchrun_cloud::testdb::url().parse().unwrap();
+    let other = db.connect(&config);
+    let third = db.connect(&config);
+    let waited = std::time::Duration::from_millis(150);
+    // Room is two, split across the two ranges. Both shards run while the
+    // tenant row is held: they queue on it and take turns.
+    db.run("BEGIN", &[]);
+    db.run("SELECT id FROM tenants WHERE id = 't1' FOR UPDATE", &[]);
+    let (((first, first_took), (second, second_took)), _) = overlapped(&db, async {
+        let start = std::time::Instant::now();
+        futures_util::join!(
+            async {
+                let out = ci_wake::lost_wakes(&other, None, 5, 100, 40, Some((0, 256))).await;
+                (out, start.elapsed())
+            },
+            async {
+                let out = ci_wake::lost_wakes(&third, None, 5, 101, 40, Some((256, 512))).await;
+                (out, start.elapsed())
+            },
+        )
+    });
+    assert!(first_took >= waited, "{first_took:?}");
+    assert!(second_took >= waited, "{second_took:?}");
+    let total = first.unwrap().len() + second.unwrap().len();
+    assert_eq!(total, 2, "never above the room");
+    let marked: i64 = db
+        .column(
+            "SELECT COUNT(*) AS n FROM ci_jobs WHERE held = 'concurrency' \
+             AND next_launch_at IS NOT NULL",
+            &[],
+            "n",
+        )
+        .unwrap();
+    assert_eq!(marked, 2);
+}
+
+#[test]
 fn the_lost_wake_query_wakes_nothing_when_the_tenant_is_full() {
     use hatchrun_cloud::ci_wake;
     let db = setup();
