@@ -317,6 +317,33 @@ impl Db {
         rows.iter().map(|row| json(row).map_err(error)).collect()
     }
 
+    /// Every row of `sql` deserialized into `T`, run in a transaction
+    /// after `lock`, a statement that locks rows (`SELECT ... FOR
+    /// UPDATE`). Statements that read rows to decide what they write,
+    /// such as a count against a limit, then see what an earlier holder
+    /// of the lock wrote: each statement in a transaction reads as of
+    /// its own start, after the lock is held. Hyperdrive does not pass
+    /// advisory locks through, so the lock is on a row.
+    ///
+    /// # Errors
+    ///
+    /// As [`Db::all`]; the transaction rolls back.
+    pub async fn all_locked<T: DeserializeOwned>(
+        &self,
+        lock: (&str, &[Param]),
+        sql: &str,
+        params: &[Param],
+    ) -> worker::Result<Vec<T>> {
+        let statements = [lock, (sql, params)];
+        let mut results = self.transaction(&statements).await?;
+        results
+            .pop()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| decode(row, sql))
+            .collect()
+    }
+
     /// The first row of `sql`, run in a transaction after `lock`, a
     /// statement that locks rows (`SELECT ... FOR UPDATE`). Statements
     /// that read rows to decide what they write, such as a count against

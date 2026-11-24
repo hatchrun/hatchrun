@@ -14,9 +14,10 @@
 //!
 //! A wake marks the rows it picks (`next_launch_at` is set, the hold
 //! stays) and returns them, so two wakers never pick the same job: the
-//! mark is what tells a picked job from one still waiting. A marked job
-//! whose message was lost is requeued by the stalled scan (see
-//! [`hatchrun_ci::reconcile`]).
+//! mark is what tells a picked job from one still waiting. A wake holds
+//! its tenants' row locks while it counts and marks, so wakers of one
+//! tenant take turns. A marked job whose message was lost is requeued
+//! by the stalled scan (see [`hatchrun_ci::reconcile`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -260,9 +261,10 @@ pub async fn billing_checked(
 /// and returns them: the post-hold recheck and the backstop use the same
 /// query. Each reason wakes at most the places free for it, oldest
 /// first. Only the picked rows are in the range: the room reads count
-/// every bucket of the tenant. Two shards that wake one tenant at the
-/// same moment can wake more jobs than it has places for; the consumer
-/// checks the caps again and holds the extra ones.
+/// every bucket of the tenant. A wake holds the row locks of the tenants
+/// with candidates in the range while it counts and marks, so wakers of
+/// one tenant take turns and never wake more than it has places for. The
+/// consumer checks the caps again and holds a job that still waits.
 ///
 /// - `concurrency`: at most `$3` minus the tenant's live jobs
 ///   (launching, launched, running) minus its marked concurrency holds;
@@ -291,12 +293,25 @@ pub async fn lost_wakes(
     range: Option<(u16, u16)>,
 ) -> worker::Result<Vec<Woken>> {
     let (lo, hi) = bounds(range);
-    db.all(
+    let lock = params![tenant, lo, hi];
+    db.all_locked(
+        (LOST_WAKES_LOCK, &lock),
         LOST_WAKES,
         &params![tenant, now, max_running, limit, lo, hi],
     )
     .await
 }
+
+/// Locks the tenants with unwoken held jobs in buckets `$2` to `$3`
+/// (only tenant `$1` when it is set), in id order, so two wakers of one
+/// tenant take turns and two shards never lock the same tenants in
+/// opposite order. The mode is the launch gate's (`LOCK_TENANT` in the
+/// CI store), so wakes and launches take turns on the same row.
+const LOST_WAKES_LOCK: &str = "SELECT id FROM tenants WHERE id IN (\
+      SELECT tenant_id FROM ci_jobs WHERE status = 'queued' \
+      AND held IN ('concurrency', 'max_parallel', 'fork_limit', 'group') \
+      AND next_launch_at IS NULL AND ($1::text IS NULL OR tenant_id = $1) \
+      AND bucket >= $2 AND bucket < $3) ORDER BY id FOR UPDATE";
 
 const LOST_WAKES: &str = "WITH candidates AS (\
       SELECT id FROM (\

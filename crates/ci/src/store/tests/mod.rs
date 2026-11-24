@@ -173,3 +173,26 @@ pub(super) fn save(db: &TestDb, template: &str, rows: &[PoolRow], launched: &[Po
     db.wait(save_pool(db.db(), template, rows, launched))
         .unwrap();
 }
+
+/// Runs `second` while `db` holds an open transaction, which commits
+/// after 200 ms. Returns what `second` gave and how long it took: at
+/// least the 200 ms when it waited on the transaction's row.
+pub(super) fn overlapped<T>(
+    db: &TestDb,
+    second: impl std::future::Future<Output = T>,
+) -> (T, std::time::Duration) {
+    db.wait(async {
+        let started = std::time::Instant::now();
+        let (out, ()) = futures_util::join!(
+            async {
+                let out = second.await;
+                (out, started.elapsed())
+            },
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                db.db().run("COMMIT", &[]).await.unwrap();
+            }
+        );
+        out
+    })
+}
